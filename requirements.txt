@@ -1,0 +1,10 @@
+multipledispatch==0.6.0
+flatdict==4.0.1
+future==0.18.2
+iso8601==1.1.0
+paho-mqtt==1.6.1
+pyparsing==3.0.9
+PyYAML==6.0
+requests==2.29.0
+Flask==2.0.3
+Werkzeug==2.2.2

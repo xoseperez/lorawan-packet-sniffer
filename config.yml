@@ -1,0 +1,20 @@
+logging:
+  level: 10
+
+udp:
+  port: 1700
+
+mqtt:
+  enabled: False
+  server: localhost
+  port: 1883
+  username:
+  password:
+  topic: gts/example
+
+web:
+  enabled: True
+  port: 8888
+
+general:
+  buffer: 500

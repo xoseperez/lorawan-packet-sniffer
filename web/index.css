@@ -1,0 +1,20 @@
+body {
+    background-color: rgb(0 106 198/1);
+}
+
+h1 {
+    color: white;
+    font-size: 48px;
+    padding: 3px;
+    margin-bottom: 10px;
+}
+
+.tabulator {
+    font-family: "Courier New";
+}
+
+p.attribute, p.attribute a {
+    color: lightgray;
+    font-size: 12px;
+    text-decoration: none;
+}
