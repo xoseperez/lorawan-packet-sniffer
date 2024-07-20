@@ -5,6 +5,8 @@ The LoRaWAN Packet Sniffer service connects to a UDP Packet Forwarder to extract
 
 This folder contains a python script that receives the data from the packet forwarder and reports it using a websocket.
 
+![Screenshot](./assets/screenshot_01.png)
+
 ## Configuration
 
 The script gets the configuration information from a `config.yml` file in the same folder. This configuration file has the following options:
