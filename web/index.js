@@ -9,6 +9,8 @@ var LORAWAN_MESSAGE_TYPES = [
     "Propietary"
 ];
 
+var CLICK_TO_FILTER_STRING = "Click to filter/unfilter";
+
 var uplinks_table = new Tabulator("#uplinks-table", {
     ajaxURL: "/uplinks",
     layout: "fitColumns",
@@ -19,12 +21,12 @@ var uplinks_table = new Tabulator("#uplinks-table", {
                 return date.toLocaleTimeString();
             }
         },
-        {title:"DEVADDR", field:"devaddr", sorter:"string", hozAlign:"left", headerFilter:"input", width: 150},
+        {title:"DEVADDR", field:"devaddr", sorter:"string", hozAlign:"left", headerFilter:"input", width: 150, tooltip: CLICK_TO_FILTER_STRING},
         {title:"FNCT", field:"fcnt", sorter:"number", hozAlign:"left"},
         {title:"FPORT", field:"fport", sorter:"number", hozAlign:"left", width: 100},
-        {title:"FREQ", field:"frequency", sorter:"number", hozAlign:"left", headerFilter:"input", width: 150},
-        {title:"SF", field:"sf", sorter:"number", hozAlign:"left", headerFilter:"input"},
-        {title:"BW", field:"bw", sorter:"number", hozAlign:"left", headerFilter:"input"},
+        {title:"FREQ", field:"frequency", sorter:"number", hozAlign:"left", headerFilter:"input", width: 150, tooltip: CLICK_TO_FILTER_STRING},
+        {title:"SF", field:"sf", sorter:"number", hozAlign:"left", headerFilter:"input", tooltip: CLICK_TO_FILTER_STRING},
+        {title:"BW", field:"bw", sorter:"number", hozAlign:"left", headerFilter:"input", tooltip: CLICK_TO_FILTER_STRING},
         {title:"RSSI", field:"rssi", sorter:"number", hozAlign:"left"},
         {title:"SNR", field:"snr", sorter:"number", hozAlign:"left", 
             formatter: function(cell, formatterParams, onRendered) {
@@ -39,7 +41,7 @@ var uplinks_table = new Tabulator("#uplinks-table", {
                 return snr;
             }
         },
-        {title:"TYPE", field:"mtype", sorter:"string", hozAlign:"left", width:300, headerFilter:"input", 
+        {title:"TYPE", field:"mtype", sorter:"string", hozAlign:"left", width:300, headerFilter:"input", tooltip: CLICK_TO_FILTER_STRING, 
             formatter: function(cell, formatterParams, onRendered) {
                 return LORAWAN_MESSAGE_TYPES[parseInt(cell.getValue(), 10)];
             }
