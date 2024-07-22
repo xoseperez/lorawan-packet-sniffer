@@ -24,6 +24,8 @@ var uplinks_table = new Tabulator("#uplinks-table", {
         {title:"DEVADDR", field:"devaddr", sorter:"string", hozAlign:"left", headerFilter:"input", width: 150, tooltip: CLICK_TO_FILTER_STRING},
         {title:"FNCT", field:"fcnt", sorter:"number", hozAlign:"left"},
         {title:"FPORT", field:"fport", sorter:"number", hozAlign:"left", width: 100},
+        {title:"SIZE", field:"size", sorter:"number", hozAlign:"left"},
+        {title:"TOA", field:"toa", sorter:"number", hozAlign:"left"},
         {title:"FREQ", field:"frequency", sorter:"number", hozAlign:"left", headerFilter:"input", width: 150, tooltip: CLICK_TO_FILTER_STRING},
         {title:"SF", field:"sf", sorter:"number", hozAlign:"left", headerFilter:"input", tooltip: CLICK_TO_FILTER_STRING},
         {title:"BW", field:"bw", sorter:"number", hozAlign:"left", headerFilter:"input", tooltip: CLICK_TO_FILTER_STRING},
