@@ -26,6 +26,7 @@ services:
       dockerfile: Dockerfile
     container_name: lorawan-packet-sniffer
     restart: unless-stopped
+    privileged: true
     ports:
       - 1700:1700
       - 8888:8888

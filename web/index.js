@@ -65,6 +65,12 @@ function toggleFullScreen() {
     }
 }    
 
+function toggleScreen() {
+    var xhttp = new XMLHttpRequest();
+    xhttp.open("GET", "/screen", true);
+    xhttp.send();
+}    
+
 function toggleMode() {
     mode = 1 - mode;
     if (mode == 0) {
@@ -218,6 +224,7 @@ setInterval( function() {
 window.onload = function() {
     document.getElementById('toggle').addEventListener("click", toggleFullScreen);
     document.getElementById('mode').addEventListener("click", toggleMode);
+    document.getElementById('screen').addEventListener("click", toggleScreen);
     document.getElementById('joinreqs_table').style.display = "none";
 }
 

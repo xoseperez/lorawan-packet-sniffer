@@ -255,6 +255,33 @@ def process(data, config):
     logging.info("[DATA] %s" % json.dumps(output))
     return output
 
+
+def write_sysfs(filepath:str, payload:int):
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'w') as fl:
+                fl.write(str(payload))
+        except IOError as e:
+            raise RuntimeError(e)
+    else:
+        raise RuntimeError(f"No driver found at {filepath}, check if module is properly loaded")
+
+def read_sysfs(filepath:str):
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'r') as fl:
+                return fl.read()
+        except IOError as e:
+            raise RuntimeError(e)
+    else:
+        raise RuntimeError(f"No driver found at {filepath}, check if module is properly loaded")
+
+def toggle_screen():
+    value = int(read_sysfs("/sys/class/leds/screen/brightness"))
+    value = 255 - value
+    write_sysfs("/sys/class/leds/screen/brightness", value)
+    return value
+
 app = flask.Flask(__name__)
 app.config["DEBUG"] = True
 
@@ -274,6 +301,11 @@ def send_uplinks():
 @app.route('/joinreqs')
 def send_joinreqs():
     return jsonify(_global_joinreqs)
+
+@app.route('/screen')
+def send_screen():
+    status = toggle_screen()
+    return jsonify({'status': status})
 
 def main():
 
