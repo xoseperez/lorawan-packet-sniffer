@@ -12,6 +12,11 @@ mqtt:
   password:
   topic: gts/example
 
+file:
+  enabled: False
+  uplinks: /app/data/uplinks.log
+  joinreqs: /app/data/joinreqs.log
+
 web:
   enabled: True
   port: 8888

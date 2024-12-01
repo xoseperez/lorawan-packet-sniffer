@@ -30,8 +30,10 @@ services:
       - 1700:1700
       - 8888:8888
 
+    volumes:
+       - ./data:/app/data
+
     # Either mount the configuration file
-    #volumes:
     #  - ./config.yml:/app/config.yml
 
     # Or use environment variables to configure the service
@@ -49,6 +51,10 @@ services:
       MQTT_USERNAME: 
       MQTT_PASSWORD:
       MQTT_TOPIC: gts/message
+
+      FILE_ENABLED: True
+      FILE_UPLINKS: /app/data/uplinks.log
+      FILE_JOINREQS: /app/data/joinreqs.log
       
       WEB_ENABLED: True
       WEB_PORT: 8888
