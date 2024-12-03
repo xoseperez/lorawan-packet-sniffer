@@ -5,6 +5,7 @@
 import os
 import sys
 import re
+import csv
 import time
 import flatdict
 import datetime
@@ -193,6 +194,21 @@ def get_toa(n_size, n_sf, n_bw=125, enable_auto_ldro=True, enable_ldro=False,
 
     return ret
 
+def filesave(data, config):
+    
+    if data['mtype'] == 0:
+        filepath = config.get('file.joinreqs', '/app/data/joinreqs.log')
+    else:
+        filepath = config.get('file.uplinks', '/app/data/uplinks.log')
+
+    exists = os.path.exists(filepath)
+    fieldnames = data.keys()
+    with open(filepath, 'a' if exists else 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(data)
+        
 def process(data, config):
 
     global _global_uplinks, _global_joinreqs
@@ -252,6 +268,9 @@ def process(data, config):
         _global_joinreqs.append(output)
         _global_joinreqs = _global_joinreqs[-int(config.get('general.buffer', 500)):]
 
+    if config.get('file.enabled', False):
+        filesave(output, config)
+    
     logging.info("[DATA] %s" % json.dumps(output))
     return output
 
