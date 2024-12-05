@@ -45,8 +45,8 @@ done
 # -----------------------------------------------------------------------------
 
 TAG=$( git rev-parse --short HEAD )
-VERSION=$( git describe --abbrev=0 --tags 2&>/dev/null )
-MAJOR=$( git describe --abbrev=0 --tags 2&>/dev/null | cut -d '.' -f1 )
+VERSION=$( git describe --abbrev=0 --tags )
+MAJOR=$( git describe --abbrev=0 --tags | cut -d '.' -f1 )
 BUILD_DATE=$( date -u +"%Y-%m-%dT%H:%M:%SZ" )
 REGISTRY=${REGISTRY:-"xoseperez/lorawan-packet-sniffer"}
 
