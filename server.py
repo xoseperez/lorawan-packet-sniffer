@@ -1,7 +1,3 @@
-# --------------------------------------------------------------------
-# Implementation of Paul's (@disk91) field tester server in Python3
-# --------------------------------------------------------------------
-
 import os
 import sys
 import re
