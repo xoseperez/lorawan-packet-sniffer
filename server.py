@@ -46,7 +46,6 @@ class Config():
             return value
         return self._data.get(name, default)
   
-
 class UDPListener():
 
     _socket = False
@@ -322,11 +321,23 @@ def send_screen():
     status = toggle_screen()
     return jsonify({'status': status})
 
+@app.route('/config')
+def send_tags():
+    global config
+    return jsonify({
+        'buttons': {
+            'mode': config.get('client.buttons.mode', True),
+            'screen': config.get('client.buttons.screen', False),
+            'fullscreen': config.get('client.buttons.fullscreen', False),
+        }
+    })
+
+config = Config()
+
 def main():
 
-    # load configuration file
-    config = Config()
-
+    global config
+    
     # set logging level based on settings (10=DEBUG, 20=INFO, ...)
     level=int(config.get("logging.level", logging.DEBUG))
     logging.basicConfig(format='[%(asctime)s] %(message)s', level=level)

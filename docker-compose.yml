@@ -58,3 +58,7 @@ services:
       
       WEB_ENABLED: True
       WEB_PORT: 8888
+
+      CLIENT_BUTTONS_MODE: True
+      CLIENT_BUTTONS_SCREEN: True
+      CLIENT_BUTTONS_FULLSCREEN: False

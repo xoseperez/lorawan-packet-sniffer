@@ -23,3 +23,10 @@ web:
 
 general:
   buffer: 500
+
+client:
+  buttons:
+    mode: True
+    screen: False
+    fullscreen: False
+  
