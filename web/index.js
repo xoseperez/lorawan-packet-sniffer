@@ -239,7 +239,6 @@ window.onload = function() {
     document.getElementById('fullscreen').addEventListener("click", toggleFullScreen);
     document.getElementById('mode').addEventListener("click", toggleMode);
     document.getElementById('screen').addEventListener("click", toggleScreen);
-    document.getElementById('joinreqs_table').style.display = "none";
     configure();
 }
 
