@@ -1,5 +1,3 @@
-version: '2.0'
-
 services:
 
   #mosquitto:
@@ -21,9 +19,10 @@ services:
   
   lorawan-packet-sniffer:
     
-    build:
-      context: .
-      dockerfile: Dockerfile
+    #build:
+    #  context: .
+    #  dockerfile: Dockerfile
+    image: xoseperez/lorawan-packet-sniffer:latest
     container_name: lorawan-packet-sniffer
     restart: unless-stopped
     privileged: true
