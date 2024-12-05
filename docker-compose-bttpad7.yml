@@ -14,6 +14,7 @@ services:
     privileged: true
     environment:
       MODEL: RAK5146
+      INTERFACE: USB
       SERVER_HOST: lorawan-packet-sniffer
       SERVER_PORT: 1700
   
@@ -60,5 +61,5 @@ services:
       WEB_PORT: 8888
 
       CLIENT_BUTTONS_MODE: True
-      CLIENT_BUTTONS_SCREEN: False
-      CLIENT_BUTTONS_FULLSCREEN: True
+      CLIENT_BUTTONS_SCREEN: True
+      CLIENT_BUTTONS_FULLSCREEN: False
