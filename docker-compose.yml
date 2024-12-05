@@ -15,7 +15,7 @@ services:
     restart: unless-stopped
     privileged: true
     environment:
-      MODEL: RAK7271
+      MODEL: RAK5146
       SERVER_HOST: lorawan-packet-sniffer
       SERVER_PORT: 1700
   
@@ -26,6 +26,7 @@ services:
       dockerfile: Dockerfile
     container_name: lorawan-packet-sniffer
     restart: unless-stopped
+    privileged: true
     ports:
       - 1700:1700
       - 8888:8888
@@ -52,7 +53,7 @@ services:
       MQTT_PASSWORD:
       MQTT_TOPIC: gts/message
 
-      FILE_ENABLED: True
+      FILE_ENABLED: False
       FILE_UPLINKS: /app/data/uplinks.log
       FILE_JOINREQS: /app/data/joinreqs.log
       
