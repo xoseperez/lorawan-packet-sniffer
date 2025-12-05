@@ -7,15 +7,15 @@ services:
   #  ports:
   #    - 1883:1883
 
-  udp-packet-forwarder:
-    image: rakwireless/udp-packet-forwarder:latest
-    container_name: udp-packet-forwarder
-    restart: unless-stopped
-    privileged: true
-    environment:
-      MODEL: RAK5146
-      SERVER_HOST: lorawan-packet-sniffer
-      SERVER_PORT: 1700
+  #udp-packet-forwarder:
+  #  image: rakwireless/udp-packet-forwarder:latest
+  #  container_name: udp-packet-forwarder
+  #  restart: unless-stopped
+  #  privileged: true
+  #  environment:
+  #    MODEL: RAK5146
+  #    SERVER_HOST: lorawan-packet-sniffer
+  #    SERVER_PORT: 1700
   
   lorawan-packet-sniffer:
     
