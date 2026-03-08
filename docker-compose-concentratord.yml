@@ -13,15 +13,19 @@ services:
       # WebUI and HTTP API
       - "8888:8888"
 
-    volumes:
+    environment:
+      GATEWAY_PROTOCOL: "concentratord"
+      GATEWAY_CONCENTRATORD_DOWNSTREAM_EVENT_URL: "ipc:///tmp/concentratord_event"
+      GATEWAY_CONCENTRATORD_DOWNSTREAM_COMMAND_URL: "ipc:///tmp/concentratord_command"
+      GATEWAY_CONCENTRATORD_UPSTREAM_EVENT_BIND: "ipc:///tmp/sniffer_event"
+      GATEWAY_CONCENTRATORD_UPSTREAM_COMMAND_BIND: "ipc:///tmp/sniffer_command"
 
-      # Mount your configuration file (see sniffer.toml for an example).
-      - ./sniffer.toml:/etc/lorawan-sniffer/sniffer.toml:ro
+    volumes:
 
       # Persistent SQLite database.
       - sniffer-data:/var/lib/lorawan-sniffer
 
-      # IPC sockets for messaging    
+      # IPC sockets for messaging
       - ipc-sockets:/tmp
 
     healthcheck:

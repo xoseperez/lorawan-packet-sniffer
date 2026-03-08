@@ -48,8 +48,11 @@ FROM alpine:3.20
 # no extra packages are needed at runtime.
 
 COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/lorawan-sniffer /usr/bin/lorawan-sniffer
+COPY docker/sniffer.toml /etc/lorawan-sniffer/sniffer.toml
+COPY docker/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
+RUN chmod +x /usr/bin/docker-entrypoint.sh
 
-RUN mkdir -p /etc/lorawan-sniffer /var/lib/lorawan-sniffer
+RUN mkdir -p /var/lib/lorawan-sniffer
 
 # WebUI / HTTP API
 EXPOSE 8888
@@ -59,5 +62,5 @@ EXPOSE 1700/udp
 # Database is stored here; mount a named volume for persistence.
 VOLUME ["/var/lib/lorawan-sniffer"]
 
-ENTRYPOINT ["/usr/bin/lorawan-sniffer"]
-CMD ["-c", "/etc/lorawan-sniffer/sniffer.toml"]
+ENTRYPOINT ["/usr/bin/docker-entrypoint.sh"]
+CMD ["/usr/bin/lorawan-sniffer", "-c", "/etc/lorawan-sniffer/sniffer.toml"]

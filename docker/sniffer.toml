@@ -1,0 +1,28 @@
+[sniffer]
+  log_level="$SNIFFER_LOG_LEVEL"
+  log_to_syslog=false
+
+  [sniffer.api]
+    bind="$SNIFFER_API_BIND"
+
+  [sniffer.database]
+    path="$SNIFFER_DATABASE_PATH"
+    retention="$SNIFFER_DATABASE_RETENTION"
+
+[gateway]
+  protocol="$GATEWAY_PROTOCOL"
+
+  [gateway.udp.downstream]
+    bind="$GATEWAY_UDP_DOWNSTREAM_BIND"
+
+  [gateway.udp.upstream]
+    server="$GATEWAY_UDP_UPSTREAM_SERVER"
+    port=$GATEWAY_UDP_UPSTREAM_PORT
+
+  [gateway.concentratord.downstream]
+    event_url="$GATEWAY_CONCENTRATORD_DOWNSTREAM_EVENT_URL"
+    command_url="$GATEWAY_CONCENTRATORD_DOWNSTREAM_COMMAND_URL"
+
+  [gateway.concentratord.upstream]
+    event_bind="$GATEWAY_CONCENTRATORD_UPSTREAM_EVENT_BIND"
+    command_bind="$GATEWAY_CONCENTRATORD_UPSTREAM_COMMAND_BIND"

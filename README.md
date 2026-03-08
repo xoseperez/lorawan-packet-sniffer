@@ -74,6 +74,36 @@ make docker-build
 DOCKER_IMAGE=ghcr.io/yourname/lorawan-sniffer DOCKER_TAG=latest make docker-buildx
 ```
 
+## Docker Environment Variables
+
+When running with Docker, the sniffer can be configured entirely via environment variables in your `docker-compose.yml` (or `docker run -e`). All variables have sensible defaults, so the service starts even if none are set.
+
+| Variable | Description | Default |
+|---|---|---|
+| `SNIFFER_LOG_LEVEL` | Log verbosity (`TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`) | `INFO` |
+| `SNIFFER_API_BIND` | Address and port for the WebUI / HTTP API | `0.0.0.0:8888` |
+| `SNIFFER_DATABASE_PATH` | Path to the SQLite database file | `/var/lib/lorawan-sniffer/sniffer.db` |
+| `SNIFFER_DATABASE_RETENTION` | How long to keep messages (e.g. `30days`, `12hours`) | `30days` |
+| `GATEWAY_PROTOCOL` | Backend protocol (`udp` or `concentratord`) | `udp` |
+| `GATEWAY_UDP_DOWNSTREAM_BIND` | Address the gateway sends packets to | `0.0.0.0:1700` |
+| `GATEWAY_UDP_UPSTREAM_SERVER` | LNS hostname or IP to forward packets to | `localhost` |
+| `GATEWAY_UDP_UPSTREAM_PORT` | LNS UDP port | `1700` |
+| `GATEWAY_CONCENTRATORD_DOWNSTREAM_EVENT_URL` | ZMQ URL to subscribe to concentratord events | `ipc:///tmp/concentratord_event` |
+| `GATEWAY_CONCENTRATORD_DOWNSTREAM_COMMAND_URL` | ZMQ URL to send commands to concentratord | `ipc:///tmp/concentratord_command` |
+| `GATEWAY_CONCENTRATORD_UPSTREAM_EVENT_BIND` | ZMQ URL to publish events to upstream consumers | `ipc:///tmp/sniffer_event` |
+| `GATEWAY_CONCENTRATORD_UPSTREAM_COMMAND_BIND` | ZMQ URL to accept commands from upstream consumers | `ipc:///tmp/sniffer_command` |
+
+You only need to set the variables relevant to your chosen protocol. For example, a minimal UDP setup:
+
+```yaml
+environment:
+  GATEWAY_PROTOCOL: "udp"
+  GATEWAY_UDP_UPSTREAM_SERVER: "10.0.0.1"
+  GATEWAY_UDP_UPSTREAM_PORT: "1700"
+```
+
+To use custom filter rules or advanced options not covered by these variables, volume-mount a full TOML config file to `/etc/lorawan-sniffer/sniffer.toml` (this overrides the built-in template).
+
 ## Configuration
 
 The sniffer is configured via a TOML file. Run `lorawan-sniffer configfile` to print an annotated template.
