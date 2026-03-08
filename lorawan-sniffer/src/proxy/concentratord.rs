@@ -47,6 +47,11 @@ use super::{broadcast_record, decision_to_status, log_message, send_record, unpa
 /// ZMQ `poll` timeout in milliseconds — governs shutdown responsiveness.
 const POLL_TIMEOUT_MS: i64 = 100;
 
+/// Timeout (ms) for the downstream REQ socket when relaying commands to
+/// concentratord.  Prevents the command thread from blocking forever if
+/// concentratord is unreachable (e.g. during startup).
+const REQ_TIMEOUT_MS: i32 = 5000;
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -72,17 +77,23 @@ pub async fn run(
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // Single ZMQ context shared by both threads — one I/O thread pool
+    // handles all sockets, avoiding potential issues with separate contexts
+    // in static musl builds.
+    let zmq_ctx = zmq::Context::new();
+
     // ── Event thread ─────────────────────────────────────────────────────
     let ev_config = config.clone();
     let ev_filters = filters.to_vec();
     let ev_record_tx = record_tx.clone();
     let ev_broadcast_tx = broadcast_tx.clone();
     let ev_shutdown = Arc::clone(&shutdown);
+    let ev_ctx = zmq_ctx.clone();
 
     let event_handle = std::thread::Builder::new()
         .name("zmq-event".to_string())
         .spawn(move || {
-            run_event_thread(&ev_config, &ev_filters, ev_record_tx, ev_broadcast_tx, &ev_shutdown);
+            run_event_thread(&ev_ctx, &ev_config, &ev_filters, ev_record_tx, ev_broadcast_tx, &ev_shutdown);
         })?;
 
     // ── Command thread ────────────────────────────────────────────────────
@@ -91,11 +102,13 @@ pub async fn run(
     let cmd_record_tx = record_tx.clone();
     let cmd_broadcast_tx = broadcast_tx.clone();
     let cmd_shutdown = Arc::clone(&shutdown);
+    let cmd_ctx = zmq_ctx.clone();
 
     let cmd_handle = std::thread::Builder::new()
         .name("zmq-command".to_string())
         .spawn(move || {
             run_command_thread(
+                &cmd_ctx,
                 &cmd_config,
                 &cmd_filters,
                 cmd_record_tx,
@@ -127,13 +140,13 @@ pub async fn run(
 // ---------------------------------------------------------------------------
 
 fn run_event_thread(
+    ctx: &zmq::Context,
     config: &ConcentratordConfig,
     filters: &[FilterRule],
     record_tx: mpsc::Sender<MessageRecord>,
     broadcast_tx: broadcast::Sender<Arc<String>>,
     shutdown: &AtomicBool,
 ) {
-    let ctx = zmq::Context::new();
 
     let sub = match ctx.socket(zmq::SUB) {
         Ok(s) => s,
@@ -158,10 +171,19 @@ fn run_event_thread(
             return;
         }
     };
+    // Remove any stale socket file from a previous run before binding.
+    if config.upstream.event_bind.starts_with("ipc://") {
+        let ipc_path = &config.upstream.event_bind["ipc://".len()..];
+        if std::path::Path::new(ipc_path).exists() {
+            warn!("zmq-event: removing stale socket file {}", ipc_path);
+            let _ = std::fs::remove_file(ipc_path);
+        }
+    }
     if let Err(e) = pub_sock.bind(&config.upstream.event_bind) {
         error!("ZMQ PUB bind to {} failed: {}", config.upstream.event_bind, e);
         return;
     }
+    chmod_ipc_socket(&config.upstream.event_bind);
 
     info!("zmq-event: SUB {} → PUB {}", config.downstream.event_url, config.upstream.event_bind);
 
@@ -225,14 +247,13 @@ fn run_event_thread(
 // ---------------------------------------------------------------------------
 
 fn run_command_thread(
+    ctx: &zmq::Context,
     config: &ConcentratordConfig,
     filters: &[FilterRule],
     record_tx: mpsc::Sender<MessageRecord>,
     broadcast_tx: broadcast::Sender<Arc<String>>,
     shutdown: &AtomicBool,
 ) {
-    let ctx = zmq::Context::new();
-
     let rep = match ctx.socket(zmq::REP) {
         Ok(s) => s,
         Err(e) => {
@@ -240,10 +261,24 @@ fn run_command_thread(
             return;
         }
     };
+
+    // Remove any stale socket file from a previous run before binding.
+    if config.upstream.command_bind.starts_with("ipc://") {
+        let ipc_path = &config.upstream.command_bind["ipc://".len()..];
+        if std::path::Path::new(ipc_path).exists() {
+            warn!("zmq-command: removing stale socket file {}", ipc_path);
+            let _ = std::fs::remove_file(ipc_path);
+        }
+    }
+
     if let Err(e) = rep.bind(&config.upstream.command_bind) {
-        error!("ZMQ REP bind to {} failed: {}", config.upstream.command_bind, e);
+        error!(
+            "ZMQ REP bind to {} failed: {}",
+            config.upstream.command_bind, e
+        );
         return;
     }
+    chmod_ipc_socket(&config.upstream.command_bind);
 
     let req = match ctx.socket(zmq::REQ) {
         Ok(s) => s,
@@ -252,8 +287,18 @@ fn run_command_thread(
             return;
         }
     };
+    // REQ_RELAXED + REQ_CORRELATE allow the socket to recover after a
+    // send/recv timeout instead of getting permanently stuck in the
+    // "waiting-for-reply" state.
+    let _ = req.set_req_relaxed(true);
+    let _ = req.set_req_correlate(true);
+    let _ = req.set_rcvtimeo(REQ_TIMEOUT_MS);
+    let _ = req.set_sndtimeo(REQ_TIMEOUT_MS);
     if let Err(e) = req.connect(&config.downstream.command_url) {
-        error!("ZMQ REQ connect to {} failed: {}", config.downstream.command_url, e);
+        error!(
+            "ZMQ REQ connect to {} failed: {}",
+            config.downstream.command_url, e
+        );
         return;
     }
 
@@ -284,28 +329,44 @@ fn run_command_thread(
             }
         };
 
+        info!(
+            "zmq-command: received command ({} bytes)",
+            bytes.len()
+        );
+
         let response = match gw::Command::decode(bytes.as_slice()) {
             Err(e) => {
-                warn!("gw::Command decode error: {} — forwarding to concentratord", e);
-                relay(&req, &bytes)
+                warn!(
+                    "gw::Command decode error: {} — forwarding to concentratord",
+                    e
+                );
+                relay(&req, &bytes, shutdown)
             }
             Ok(ref cmd) => match &cmd.command {
                 Some(gw::command::Command::SendDownlinkFrame(frame)) => {
-                    process_downlink(frame, filters, &record_tx, &broadcast_tx, &req, &bytes)
+                    process_downlink(
+                        frame,
+                        filters,
+                        &record_tx,
+                        &broadcast_tx,
+                        &req,
+                        &bytes,
+                        shutdown,
+                    )
                 }
                 Some(gw::command::Command::GetGatewayId(_)) => {
                     debug!("Command: GetGatewayId");
-                    relay(&req, &bytes)
+                    relay(&req, &bytes, shutdown)
                 }
                 Some(gw::command::Command::SetGatewayConfiguration(_)) => {
                     debug!("Command: SetGatewayConfiguration");
-                    relay(&req, &bytes)
+                    relay(&req, &bytes, shutdown)
                 }
                 Some(gw::command::Command::GetLocation(_)) => {
                     debug!("Command: GetLocation");
-                    relay(&req, &bytes)
+                    relay(&req, &bytes, shutdown)
                 }
-                None => relay(&req, &bytes),
+                None => relay(&req, &bytes, shutdown),
             },
         };
 
@@ -353,6 +414,7 @@ fn process_downlink(
     broadcast_tx: &broadcast::Sender<Arc<String>>,
     req: &zmq::Socket,
     raw_bytes: &[u8],
+    shutdown: &AtomicBool,
 ) -> Vec<u8> {
     let record = build_downlink_record(frame, filters);
     let blocked = record.status == Status::Blocked;
@@ -376,22 +438,54 @@ fn process_downlink(
         };
         ack.encode_to_vec()
     } else {
-        relay(req, raw_bytes)
+        relay(req, raw_bytes, shutdown)
     }
 }
 
-/// Forward raw bytes to concentratord on the REQ socket and return the response.
-fn relay(req: &zmq::Socket, bytes: &[u8]) -> Vec<u8> {
-    if let Err(e) = req.send(bytes, 0) {
-        warn!("zmq REQ send error: {}", e);
-        return Vec::new();
-    }
-    match req.recv_bytes(0) {
-        Ok(resp) => resp,
-        Err(e) => {
-            warn!("zmq REQ recv error: {}", e);
-            Vec::new()
+/// Forward raw bytes to concentratord on the REQ socket and return the
+/// response.
+///
+/// The REQ socket has `RCVTIMEO`/`SNDTIMEO` + `REQ_RELAXED` set, so
+/// individual send/recv calls will not block forever.  If concentratord is
+/// not yet ready (common during startup while hardware initialises), this
+/// function retries every second until a response arrives or the shutdown
+/// flag is raised.
+fn relay(req: &zmq::Socket, bytes: &[u8], shutdown: &AtomicBool) -> Vec<u8> {
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Vec::new();
         }
+
+        if let Err(e) = req.send(bytes, 0) {
+            warn!(
+                "zmq REQ send to concentratord failed: {} — retrying in 1 s",
+                e
+            );
+            interruptible_sleep(shutdown, 1000);
+            continue;
+        }
+        match req.recv_bytes(0) {
+            Ok(resp) => return resp,
+            Err(e) => {
+                warn!(
+                    "zmq REQ recv from concentratord timed out: {} — retrying in 1 s",
+                    e
+                );
+                interruptible_sleep(shutdown, 1000);
+            }
+        }
+    }
+}
+
+/// Sleep for up to `ms` milliseconds, checking the shutdown flag every
+/// `POLL_TIMEOUT_MS` so we stay responsive to cancellation.
+fn interruptible_sleep(shutdown: &AtomicBool, ms: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    while std::time::Instant::now() < deadline {
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(POLL_TIMEOUT_MS as u64));
     }
 }
 
@@ -551,3 +645,23 @@ fn extract_rx_info(
     );
     (rssi, snr, crc)
 }
+
+// ---------------------------------------------------------------------------
+// IPC socket permissions
+// ---------------------------------------------------------------------------
+
+/// Make an IPC socket file world-accessible (0o777) so that processes running
+/// as a different user (e.g. `nobody` in chirpstack-mqtt-forwarder) can
+/// connect.  Unix domain socket `connect()` requires write permission on the
+/// socket file.
+fn chmod_ipc_socket(zmq_url: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(path) = zmq_url.strip_prefix("ipc://") {
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777)) {
+            warn!("Failed to chmod IPC socket {}: {}", path, e);
+        } else {
+            debug!("IPC socket {} permissions set to 0777", path);
+        }
+    }
+}
+
