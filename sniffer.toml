@@ -23,7 +23,7 @@
   # SQLite database configuration.
   [sniffer.database]
     # Path to the SQLite database file.
-    path = "./sniffer.db"
+    path = "/var/lib/lorawan-sniffer/sniffer.db"
 
     # Message retention period. Older messages are periodically deleted.
     retention = "30days"
@@ -47,7 +47,7 @@
 
     # Upstream: forward packets to the LoRaWAN Network Server.
     [gateway.udp.upstream]
-      server = "localhost"
+      server = "lns.example.com"
       port = 1700
 
   # ChirpStack Concentratord IPC configuration (used when protocol = "concentratord").

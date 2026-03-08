@@ -1,0 +1,40 @@
+services:
+
+  lorawan-sniffer:
+    image: lorawan-sniffer:latest
+    container_name: lorawan-sniffer
+    restart: unless-stopped
+
+    ports:
+      
+      # WebUI and HTTP API
+      - "8888:8888"
+      
+      # LoRaWAN gateway UDP port (Semtech Packet Forwarder)
+      - "1700:1700/udp"
+
+    volumes:
+
+      # Mount your configuration file (see sniffer.toml for an example).
+      - ./sniffer.toml:/etc/lorawan-sniffer/sniffer.toml:ro
+
+      # Persistent SQLite database.
+      - sniffer-data:/var/lib/lorawan-sniffer
+
+
+  udp-packet-forwarder:
+    
+    image: rakwireless/udp-packet-forwarder:latest
+    container_name: udp-packet-forwarder
+    restart: unless-stopped
+    devices:
+      - /dev/ttyACM0
+    environment:
+      MODEL: "RAK5146"
+      INTERFACE: "USB"
+      GATEWAY_EUI: "0016c001f156d7e5"
+      SERVER_HOST: lorawan-sniffer
+
+volumes:
+  sniffer-data:
+
