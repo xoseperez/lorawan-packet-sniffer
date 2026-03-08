@@ -1,6 +1,10 @@
 services:
+
   lorawan-sniffer:
     image: lorawan-sniffer:latest
+    depends_on:
+      chirpstack-concentratord:
+        condition: service_healthy
     ports:
       # WebUI and HTTP API
       - "8888:8888"
@@ -13,6 +17,12 @@ services:
       - sniffer-data:/var/lib/lorawan-sniffer
       - /tmp:/tmp
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "test", "-S", "/tmp/sniffer_command"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
 
   # For Concentratord IPC mode, the sniffer must share the host IPC namespace
   # (or a shared tmpfs volume) with concentratord so ZMQ IPC sockets are
@@ -45,6 +55,41 @@ services:
     environment:
       - MODEL=RAK5146
       - INTERFACE=USB
+  
+  chirpstack-mqtt-forwarder:
+
+    container_name: chirpstack-mqtt-forwarder
+    image: xoseperez/chirpstack-mqtt-forwarder
+    depends_on:
+      lorawan-sniffer:
+        condition: service_started
+    restart: unless-stopped
+
+    volumes:
+      - /tmp:/tmp
+    
+    secrets:
+      - ca.pem
+      - cert.pem
+      - key.pem
+    
+    environment:
+      LOGGING_LEVEL: "INFO"
+      MQTT_SERVER: "ssl://lns.example.com:8883"
+      MQTT_CA_CERT_PATH: "/run/secrets/ca.pem"
+      MQTT_CLIENT_CERT_PATH: "/run/secrets/cert.pem"
+      MQTT_CLIENT_KEY_PATH: "/run/secrets/key.pem"
+      BACKEND: "concentratord"
+      BACKEND_SOCKET_NAME: "sniffer"
+
+secrets:
+  ca.pem:
+    file: .certs/tc.trust
+  cert.pem:
+    file: .certs/tc.cert
+  key.pem:
+    file: .certs/tc.key 
+
 
 volumes:
   sniffer-data:
