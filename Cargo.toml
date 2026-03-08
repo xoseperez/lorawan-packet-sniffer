@@ -1,0 +1,44 @@
+[workspace]
+  resolver = "3"
+  members = [
+    "lorawan-sniffer",
+  ]
+
+[workspace.dependencies]
+  serde = { version = "1.0", features = ["derive"] }
+  serde_json = "1.0"
+  toml = { version = "0.9", default-features = false, features = [
+    "std",
+    "parse",
+    "serde",
+  ] }
+  clap = { version = "4.5", default-features = false, features = [
+    "std",
+    "help",
+    "usage",
+    "derive",
+  ] }
+  log = "0.4"
+  simple_logger = { version = "5", default-features = false, features = [
+    "timestamps",
+  ] }
+  chrono = { version = "0.4", default-features = false, features = [
+    "now",
+    "serde",
+  ] }
+  humantime-serde = "1.1"
+  syslog = "7.0"
+  handlebars = "6.4"
+  anyhow = "1.0"
+  thiserror = "2.0"
+  tokio = { version = "1", features = ["full"] }
+  tokio-util = { version = "0.7", features = ["rt"] }
+  uuid = { version = "1.0", features = ["v4"] }
+  base64 = "0.22"
+  rusqlite = { version = "0.32", features = ["bundled"] }
+  prost = "0.13"
+  zmq = "0.10"
+  axum = { version = "0.7", features = ["ws"] }
+  tower-http = { version = "0.5", features = ["cors"] }
+  rust-embed = "8"
+  mime_guess = "2.0"

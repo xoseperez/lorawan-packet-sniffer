@@ -1,0 +1,94 @@
+# LoRaWAN Packet Sniffer configuration.
+
+[sniffer]
+  # Log level.
+  #
+  # Valid options are: TRACE, DEBUG, INFO, WARN, ERROR, OFF
+  log_level = "INFO"
+
+  # Log to syslog.
+  #
+  # When set to true, log messages are written to syslog instead of stdout.
+  log_to_syslog = false
+
+  # HTTP API / WebSocket configuration.
+  [sniffer.api]
+    # Bind address for the HTTP API and WebSocket feed.
+    bind = "0.0.0.0:8888"
+
+    # Allowed CORS origins.
+    # Uncomment and set when accessing the API from a different origin.
+    # cors_origins = ["https://example.com"]
+
+  # SQLite database configuration.
+  [sniffer.database]
+    # Path to the SQLite database file.
+    path = "./sniffer.db"
+
+    # Message retention period. Older messages are periodically deleted.
+    retention = "30days"
+
+
+# Gateway connection configuration.
+[gateway]
+  # Gateway protocol.
+  #
+  # Valid options are:
+  #   * udp          – Semtech UDP Packet Forwarder (recommended)
+  #   * concentratord – ChirpStack Concentratord IPC (ZMQ/Protobuf)
+  protocol = "concentratord"
+
+  # Semtech UDP Packet Forwarder MITM configuration.
+  [gateway.udp]
+
+    # Downstream: listen for packets from the gateway.
+    [gateway.udp.downstream]
+      bind = "0.0.0.0:1700"
+
+    # Upstream: forward packets to the LoRaWAN Network Server.
+    [gateway.udp.upstream]
+      server = "localhost"
+      port = 1700
+
+  # ChirpStack Concentratord IPC configuration (used when protocol = "concentratord").
+  [gateway.concentratord]
+
+    # Downstream: connect to the Concentratord.
+    [gateway.concentratord.downstream]
+      event_url   = "ipc:///tmp/concentratord_event"
+      command_url = "ipc:///tmp/concentratord_command"
+
+    # Upstream: expose a Concentratord-compatible IPC interface.
+    [gateway.concentratord.upstream]
+      event_bind   = "ipc:///tmp/sniffer_event"
+      command_bind = "ipc:///tmp/sniffer_command"
+
+
+# Packet filter rules.
+# Rules are evaluated in order; the first matching rule wins.
+# Packets not matching any rule are forwarded transparently.
+
+# [[filters]]
+#   # Human-readable name (shown in logs and WebUI).
+#   name = "Block confirmed uplinks"
+#   enabled = true
+#
+#   # Direction to match: "up" (gateway → LNS) or "down" (LNS → gateway).
+#   # Omit to match both directions.
+#   direction = "up"
+#
+#   # LoRaWAN MTypes to match. Omit or leave empty to match all MTypes.
+#   # Valid values: JoinRequest, JoinAccept, UnconfirmedDataUp, UnconfirmedDataDown,
+#   #               ConfirmedDataUp, ConfirmedDataDown, RejoinRequest, Proprietary
+#   mtype = ["ConfirmedDataUp"]
+#
+#   # Stealth mode: when true, the ACK is suppressed so the sender is
+#   # unaware the packet was intercepted.
+#   suppress_ack = false
+
+# [[filters]]
+#   name = "Block all downlinks (stealth)"
+#   enabled = true
+#   direction = "down"
+#   suppress_ack = true
+#   mtype = ["UnconfirmedDataDown", "ConfirmedDataDown", "JoinAccept"]

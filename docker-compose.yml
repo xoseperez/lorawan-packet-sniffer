@@ -1,0 +1,55 @@
+services:
+  lorawan-sniffer:
+    image: lorawan-sniffer:latest
+    ports:
+      # WebUI and HTTP API
+      - "8888:8888"
+      # LoRaWAN gateway UDP port (Semtech Packet Forwarder)
+      - "1700:1700/udp"
+    volumes:
+      # Mount your configuration file (see sniffer.toml for an example).
+      - ./sniffer.toml:/etc/lorawan-sniffer/sniffer.toml:ro
+      # Persistent SQLite database.
+      - sniffer-data:/var/lib/lorawan-sniffer
+      - /tmp:/tmp
+    restart: unless-stopped
+
+  # For Concentratord IPC mode, the sniffer must share the host IPC namespace
+  # (or a shared tmpfs volume) with concentratord so ZMQ IPC sockets are
+  # accessible by both processes.  Uncomment the lines below and set
+  # protocol = "concentratord" in sniffer.toml.
+  #
+  # network_mode: host          # allows IPC socket access on host /tmp
+  #   # or mount a shared tmpfs:
+  # volumes:
+  #    - ipc-sockets:/tmp
+  # See https://github.com/xoseperez/chirpstack-concentratord-docker
+  
+  chirpstack-concentratord:
+
+    container_name: chirpstack-concentratord
+    image: xoseperez/chirpstack-concentratord
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "test", "-S", "/tmp/concentratord_command"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    volumes:
+      - /tmp:/tmp
+    devices:
+      - /dev/rak5146:/dev/ttyACM0
+    group_add:
+      - dialout
+    environment:
+      - MODEL=RAK5146
+      - INTERFACE=USB
+
+volumes:
+  sniffer-data:
+  # ipc-sockets:
+  #   driver: local
+  #   driver_opts:
+  #     type: tmpfs
+  #     device: tmpfs

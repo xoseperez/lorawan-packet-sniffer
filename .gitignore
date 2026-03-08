@@ -1,0 +1,19 @@
+# Rust
+target/
+
+# Node / WebUI
+webui/node_modules/
+webui/dist/
+# Keep the placeholder so rust-embed can compile without a prior npm build
+!webui/dist/index.html
+
+# SQLite
+*.db
+*.db-shm
+*.db-wal
+
+# Editor / OS
+.*
+!.gitignore
+Thumbs.db
+*~
