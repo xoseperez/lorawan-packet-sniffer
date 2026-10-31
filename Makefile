@@ -4,12 +4,14 @@ WEBUI_DIST := $(WEBUI_DIR)/dist
 DOCKER_IMAGE ?= lorawan-sniffer
 DOCKER_TAG   ?= latest
 
+DIST_DIR := dist
+
 .PHONY: build build-full run fmt clippy test \
 	webui-install webui-build webui-dev \
 	build-x86_64-unknown-linux-musl \
 	build-aarch64-unknown-linux-musl \
-	build-all \
-	docker-build docker-buildx
+	build-all dist \
+	docker-build docker-build-release docker-buildx
 
 # ── WebUI ───────────────────────────────────────────────────────────────────
 
@@ -65,16 +67,32 @@ build-all: webui-build
 	cross build --target x86_64-unknown-linux-musl --release
 	cross build --target aarch64-unknown-linux-musl --release
 
+# ── Release archives ────────────────────────────────────────────────────────
+
+# Release archives for both targets plus SHA256SUMS in dist/, and the
+# binaries laid out for docker/Dockerfile.release.
+dist: build-all
+	rm -rf $(DIST_DIR)
+	packaging/package.sh x86_64-unknown-linux-musl $(DIST_DIR)
+	packaging/package.sh aarch64-unknown-linux-musl $(DIST_DIR)
+	cd $(DIST_DIR) && sha256sum *.tar.gz > SHA256SUMS
+
 # ── Docker ───────────────────────────────────────────────────────────────────
 
-# Build Docker image for the host architecture.
+# Build a Docker image from source (x86_64 only; no toolchain needed locally).
 docker-build:
 	docker build -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
 
-# Build and push a multi-arch image (amd64 + arm64) using buildx.
+# Build the release image for the host architecture from the dist/ binaries.
+docker-build-release: dist
+	docker buildx build -f docker/Dockerfile.release --load \
+		-t $(DOCKER_IMAGE):$(DOCKER_TAG) .
+
+# Build and push the multi-arch release image (amd64 + arm64) from the dist/
+# binaries; the same binaries as the release archives, no emulation needed.
 # Requires: docker buildx create --use
-docker-buildx:
-	docker buildx build \
+docker-buildx: dist
+	docker buildx build -f docker/Dockerfile.release \
 		--platform linux/amd64,linux/arm64 \
 		-t $(DOCKER_IMAGE):$(DOCKER_TAG) \
 		--push .

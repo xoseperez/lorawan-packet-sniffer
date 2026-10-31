@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+
+# Release image, built from the same static binaries as the release archives
+# (dist/docker/<arch>/lorawan-sniffer, written by packaging/package.sh).
+# Nothing is compiled or run during the build, so a multi-arch image needs no
+# emulation:
+#
+#   make dist
+#   docker buildx build -f docker/Dockerfile.release \
+#       --platform linux/amd64,linux/arm64 -t IMAGE:TAG --push .
+
+FROM alpine:3.23
+
+# Set by buildx for each platform: amd64 or arm64.
+ARG TARGETARCH
+
+# ZeroMQ, SQLite and all other dependencies are compiled into the binary; no
+# extra packages are needed at runtime. Alpine is kept for the shell that the
+# entrypoint script needs.
+COPY --chmod=0755 dist/docker/${TARGETARCH}/lorawan-sniffer /usr/bin/lorawan-sniffer
+COPY --chmod=0644 docker/sniffer.toml /etc/lorawan-sniffer/sniffer.toml
+COPY --chmod=0755 docker/docker-entrypoint.sh /usr/bin/docker-entrypoint.sh
+
+# Creates the database directory without a RUN step.
+WORKDIR /var/lib/lorawan-sniffer
+
+# WebUI / HTTP API
+EXPOSE 8888
+# LoRaWAN gateway UDP port (Semtech protocol)
+EXPOSE 1700/udp
+
+# Database is stored here; mount a named volume for persistence.
+VOLUME ["/var/lib/lorawan-sniffer"]
+
+ENTRYPOINT ["/usr/bin/docker-entrypoint.sh"]
+CMD ["/usr/bin/lorawan-sniffer", "-c", "/etc/lorawan-sniffer/sniffer.toml"]

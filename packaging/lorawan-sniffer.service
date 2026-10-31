@@ -1,0 +1,54 @@
+[Unit]
+Description=LoRaWAN Packet Sniffer
+Documentation=https://github.com/xoseperez/lorawan-packet-sniffer-rs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/lorawan-sniffer -c /etc/lorawan-sniffer/sniffer.toml
+# Secrets such as MQTT_PASSWORD, referenced from sniffer.toml as "$NAME".
+EnvironmentFile=-/etc/lorawan-sniffer/sniffer.env
+Restart=on-failure
+RestartSec=5s
+# SIGTERM makes the sniffer save its queued records and exit, which takes at
+# most a few seconds.
+TimeoutStopSec=20s
+
+# Run as a throwaway unprivileged user. The database lives in
+# /var/lib/lorawan-sniffer, the only place the service can write to.
+DynamicUser=yes
+StateDirectory=lorawan-sniffer
+StateDirectoryMode=0750
+UMask=0027
+
+# One UDP socket per gateway in proxy mode: leave room above max_gateways.
+LimitNOFILE=4096
+
+# Sandboxing. The sniffer only needs its UDP and HTTP ports (above 1024, so no
+# capabilities), its state directory and, in Concentratord mode, Unix sockets
+# (see concentratord.conf).
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

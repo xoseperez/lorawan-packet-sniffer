@@ -1,6 +1,9 @@
 # Rust
 target/
 
+# Release archives (make dist)
+dist/
+
 # Node / WebUI
 webui/node_modules/
 webui/dist/
@@ -15,5 +18,10 @@ webui/dist/
 # Editor / OS
 .*
 !.gitignore
+# Project files that happen to start with a dot: CI workflows, the build
+# flags for the static release binaries, and the Docker build context filter.
+!.github/
+!.cargo/
+!.dockerignore
 Thumbs.db
 *~

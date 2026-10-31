@@ -42,7 +42,7 @@ RUN touch lorawan-sniffer/src/main.rs
 RUN cargo build --release --bin lorawan-sniffer --target x86_64-unknown-linux-musl
 
 # ─── Stage 3: Minimal runtime image ──────────────────────────────────────────
-FROM alpine:3.20
+FROM alpine:3.23
 
 # ZeroMQ, SQLite, and all other dependencies are compiled into the binary;
 # no extra packages are needed at runtime.

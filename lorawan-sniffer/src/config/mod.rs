@@ -19,6 +19,10 @@ pub struct Configuration {
     pub sniffer: Sniffer,
     pub gateway: Gateway,
     pub filters: Vec<FilterConfig>,
+    /// Problems found while loading that do not stop the sniffer, to be
+    /// logged once logging is set up.
+    #[serde(skip)]
+    pub load_warnings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +322,61 @@ pub fn get(filenames: Vec<String>) -> Result<Configuration> {
         return Ok(Configuration::default());
     }
 
-    toml::from_str(&content).context("failed to parse configuration file")
+    let mut config: Configuration =
+        toml::from_str(&content).context("failed to parse configuration file")?;
+    config.load_warnings = unexpanded_references(&content)
+        .into_iter()
+        .map(|key| {
+            format!(
+                "{key} refers to an environment variable that is not set, so its text \
+                 is used as it is; define the variable (for the systemd service, in \
+                 /etc/lorawan-sniffer/sniffer.env) or write the value itself"
+            )
+        })
+        .collect();
+    Ok(config)
+}
+
+/// Keys whose whole value still reads `$NAME` after expansion.
+///
+/// That is a reference to an environment variable that is not set, and the
+/// sniffer would quietly use the text itself, for example sending
+/// "$MQTT_PASSWORD" as the password.  Only the keys are returned, never the
+/// values: a password can legitimately start with `$`, and it must not end up
+/// in the logs.
+fn unexpanded_references(content: &str) -> Vec<String> {
+    fn walk(value: &toml::Value, path: &str, keys: &mut Vec<String>) {
+        match value {
+            toml::Value::String(text) => {
+                let name = text.strip_prefix('$').unwrap_or_default();
+                if !name.is_empty() && env_name_len(name) == name.len() {
+                    keys.push(path.to_string());
+                }
+            }
+            toml::Value::Table(table) => {
+                for (key, value) in table {
+                    let path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk(value, &path, keys);
+                }
+            }
+            toml::Value::Array(items) => {
+                for (i, value) in items.iter().enumerate() {
+                    walk(value, &format!("{path}[{i}]"), keys);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut keys = Vec::new();
+    if let Ok(table) = content.parse::<toml::Table>() {
+        walk(&toml::Value::Table(table), "", &mut keys);
+    }
+    keys
 }
 
 /// Replace `$NAME` references in `content` with the values `lookup` returns.
@@ -740,5 +798,99 @@ mod tests {
     fn expansion_of_nothing_is_nothing() {
         assert_eq!(expand_env("", |_| None), "");
         assert_eq!(expand_env("no references", |_| None), "no references");
+    }
+
+    /// The configuration shipped in the release archives must keep loading
+    /// as the code changes, or a fresh install would fail to start.
+    #[test]
+    fn packaged_config_is_valid() {
+        let text = include_str!("../../../packaging/sniffer.toml");
+        let cfg = parse(&expand_env(text, |_| None));
+
+        validate(&cfg).unwrap();
+        assert!(cfg.gateway.protocol == Protocol::Udp);
+        assert_eq!(cfg.gateway.udp.mode, UdpMode::Proxy);
+        assert_eq!(
+            cfg.sniffer.database.path,
+            "/var/lib/lorawan-sniffer/sniffer.db"
+        );
+        assert!(!cfg.sniffer.mqtt.enabled);
+
+        // Next to an LNS on the same host: the sniffer must not take the
+        // LNS's port, and the upstream must not be the sniffer itself.
+        let bind: std::net::SocketAddr = cfg.gateway.udp.downstream.bind.parse().unwrap();
+        assert_eq!(bind.port(), 1702);
+        assert_eq!(cfg.gateway.udp.upstream.server, "127.0.0.1");
+        assert_eq!(cfg.gateway.udp.upstream.port, 1700);
+    }
+
+    #[test]
+    fn unset_reference_is_reported_by_key_only() {
+        let text = r#"
+[sniffer.mqtt]
+  username = "sniffer"
+  password = "$LORAWAN_SNIFFER_TEST_NEVER_SET"
+[[filters]]
+  name = "$ALSO_NEVER_SET_IN_TESTS"
+"#;
+
+        assert_eq!(
+            unexpanded_references(text),
+            vec!["filters[0].name", "sniffer.mqtt.password"]
+        );
+    }
+
+    #[test]
+    fn dollar_inside_a_value_is_not_a_reference() {
+        let text = r#"
+[sniffer.mqtt]
+  password = "pa$word"
+  username = "$"
+  client_id = "$1abc"
+"#;
+
+        assert!(unexpanded_references(text).is_empty());
+    }
+
+    #[test]
+    fn loading_records_the_warning_without_the_value() {
+        let file = TempFile::new("unset-reference.toml");
+        fs::write(
+            &file.0,
+            "[sniffer.mqtt]\npassword = \"$LORAWAN_SNIFFER_TEST_NEVER_SET\"\n",
+        )
+        .unwrap();
+
+        let cfg = get(vec![file.path().to_string()]).unwrap();
+
+        assert_eq!(cfg.load_warnings.len(), 1);
+        assert!(cfg.load_warnings[0].starts_with("sniffer.mqtt.password "));
+        assert!(!cfg.load_warnings[0].contains("LORAWAN_SNIFFER_TEST_NEVER_SET"));
+    }
+
+    #[test]
+    fn packaged_config_loads_without_warnings() {
+        let file = TempFile::new("packaged.toml");
+        fs::write(&file.0, include_str!("../../../packaging/sniffer.toml")).unwrap();
+
+        assert!(get(vec![file.path().to_string()])
+            .unwrap()
+            .load_warnings
+            .is_empty());
+    }
+
+    /// The MQTT password in the packaged file is meant to come from the
+    /// service's environment file; check that route works once uncommented.
+    #[test]
+    fn packaged_config_takes_password_from_environment() {
+        let text = include_str!("../../../packaging/sniffer.toml").replace(
+            "# password = \"$MQTT_PASSWORD\"",
+            "password = \"$MQTT_PASSWORD\"",
+        );
+        let vars = [("MQTT_PASSWORD", r#"a"b\c$HOME"#)];
+
+        let cfg = parse(&expand_env(&text, lookup_in(&vars)));
+
+        assert_eq!(cfg.sniffer.mqtt.password, r#"a"b\c$HOME"#);
     }
 }

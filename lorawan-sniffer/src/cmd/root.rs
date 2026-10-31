@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -24,7 +25,42 @@ const RETENTION_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// LoRaWAN rates are << 1000/s, so 1024 is plenty.
 const CHANNEL_CAPACITY: usize = 1024;
 
+/// How long a stop request waits for the storage writer to save the records
+/// still queued.  Long enough for a full channel on a slow SD card, short
+/// enough to stay well inside the stop timeouts of systemd and Docker.
+const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The two ways the sniffer is asked to stop: Ctrl-C in a terminal (SIGINT),
+/// and SIGTERM from `systemctl stop`, `docker stop` or `kill`.
+///
+/// Both handlers are installed when this is created, at the very start of
+/// `run`: until then SIGTERM would kill the process outright, and under
+/// Docker, where the sniffer is PID 1, the kernel drops any signal that has
+/// no handler, so `docker stop` would wait out its timeout and then kill it.
+struct StopSignals {
+    interrupt: Signal,
+    terminate: Signal,
+}
+
+impl StopSignals {
+    fn install() -> Result<Self> {
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).context("cannot handle SIGINT")?,
+            terminate: signal(SignalKind::terminate()).context("cannot handle SIGTERM")?,
+        })
+    }
+
+    /// Wait for either signal and return its name.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.interrupt.recv() => "SIGINT",
+            _ = self.terminate.recv() => "SIGTERM",
+        }
+    }
+}
+
 pub async fn run(config: &Configuration) -> Result<()> {
+    let mut stop = StopSignals::install()?;
     info!("Starting LoRaWAN Packet Sniffer v{}", config::VERSION);
 
     // -----------------------------------------------------------------------
@@ -72,7 +108,7 @@ pub async fn run(config: &Configuration) -> Result<()> {
     // -----------------------------------------------------------------------
     let writer_storage = storage.clone();
     let writer_cancel = cancel.clone();
-    tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         run_writer(record_rx, writer_storage, writer_cancel).await;
     });
 
@@ -136,8 +172,8 @@ pub async fn run(config: &Configuration) -> Result<()> {
                 ) => {
                     result?;
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    warn!("Received SIGINT, shutting down");
+                name = stop.recv() => {
+                    info!("Received {}, shutting down", name);
                     cancel.cancel();
                 }
             }
@@ -160,12 +196,27 @@ pub async fn run(config: &Configuration) -> Result<()> {
                 ) => {
                     result?;
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    warn!("Received SIGINT, shutting down");
+                name = stop.recv() => {
+                    info!("Received {}, shutting down", name);
                     cancel.cancel();
                 }
             }
         }
+    }
+
+    // The proxy has stopped and dropped its side of the record channel.  Wait
+    // for the writer to save what is still queued: returning straight away
+    // would end the runtime and lose the last records captured before the
+    // stop.  A stuck disk must not hold the shutdown forever, hence the limit.
+    cancel.cancel();
+    if tokio::time::timeout(WRITER_DRAIN_TIMEOUT, writer)
+        .await
+        .is_err()
+    {
+        warn!(
+            "Queued records not saved within {}s; some may be lost",
+            WRITER_DRAIN_TIMEOUT.as_secs()
+        );
     }
 
     info!("Sniffer stopped");
@@ -277,7 +328,7 @@ async fn run_api(
 ///
 /// Every datagram the sniffer forwarded to such an address would arrive again
 /// as if a gateway had sent it, so this refuses to start instead.  Returns the
-/// first resolved address, which is the one the proxy uses.
+/// address the proxy uses; see [`pick_upstream`].
 async fn resolve_upstream(udp: &config::UdpConfig) -> Result<SocketAddr> {
     let server = &udp.upstream.server;
     let port = udp.upstream.port;
@@ -286,9 +337,19 @@ async fn resolve_upstream(udp: &config::UdpConfig) -> Result<SocketAddr> {
         .await
         .with_context(|| format!("cannot resolve the UDP upstream server '{server}:{port}'"))?
         .collect();
-    let first = *addrs.first().ok_or_else(|| {
+    let chosen = pick_upstream(&addrs).ok_or_else(|| {
         anyhow!("the UDP upstream server '{server}:{port}' resolves to no address")
     })?;
+    if addrs.len() > 1 {
+        info!(
+            "UDP upstream '{server}' resolves to {}; using {chosen}",
+            addrs
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let bind: SocketAddr = udp.downstream.bind.parse().with_context(|| {
         format!(
@@ -298,7 +359,23 @@ async fn resolve_upstream(udp: &config::UdpConfig) -> Result<SocketAddr> {
     })?;
     proxy::udp::loopguard::check_startup(bind, &addrs).map_err(|e| anyhow!(e))?;
 
-    Ok(first)
+    Ok(chosen)
+}
+
+/// The address to forward to when the upstream name resolves to several.
+///
+/// The first IPv4 address wins.  Names such as `localhost` usually resolve to
+/// `::1` first, but network servers and packet multiplexers commonly listen
+/// on `0.0.0.0`, which is IPv4 only: forwarding to `::1` would then reach
+/// nothing, silently.  A listener that accepts IPv6 almost always accepts
+/// IPv4 as well, so IPv4 is the choice that works in both cases.  A name with
+/// only IPv6 addresses uses its first one.
+fn pick_upstream(addrs: &[SocketAddr]) -> Option<SocketAddr> {
+    addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.first())
+        .copied()
 }
 
 /// A warning for a configuration that has filter rules but cannot apply them:
@@ -361,6 +438,58 @@ mod tests {
 
     fn config_from(toml_text: &str) -> Configuration {
         toml::from_str(toml_text).unwrap()
+    }
+
+    fn addrs(list: &[&str]) -> Vec<SocketAddr> {
+        list.iter().map(|a| a.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn upstream_prefers_ipv4() {
+        // What `localhost` resolves to on a typical Debian host.
+        assert_eq!(
+            pick_upstream(&addrs(&["[::1]:1718", "127.0.0.1:1718"])),
+            Some("127.0.0.1:1718".parse().unwrap())
+        );
+        assert_eq!(
+            pick_upstream(&addrs(&[
+                "[2001:db8::1]:1700",
+                "192.0.2.1:1700",
+                "192.0.2.2:1700"
+            ])),
+            Some("192.0.2.1:1700".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn upstream_falls_back_to_ipv6() {
+        assert_eq!(
+            pick_upstream(&addrs(&["[2001:db8::1]:1700", "[2001:db8::2]:1700"])),
+            Some("[2001:db8::1]:1700".parse().unwrap())
+        );
+        assert_eq!(pick_upstream(&[]), None);
+    }
+
+    /// End to end through the resolver: `localhost` must end up on IPv4
+    /// whatever order the system returns its addresses in.
+    #[tokio::test]
+    async fn localhost_upstream_resolves_to_ipv4() {
+        let udp = config_from(
+            r#"
+[gateway.udp]
+  [gateway.udp.downstream]
+    bind = "0.0.0.0:1717"
+  [gateway.udp.upstream]
+    server = "localhost"
+    port   = 1718
+"#,
+        )
+        .gateway
+        .udp;
+
+        let chosen = resolve_upstream(&udp).await.unwrap();
+
+        assert_eq!(chosen, "127.0.0.1:1718".parse::<SocketAddr>().unwrap());
     }
 
     #[test]

@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Release archives** for x86_64 and aarch64 Linux (`make dist`), with a
+  `SHA256SUMS` file. Each holds the static binary, a systemd service, an
+  install script and the configuration templates, and is reproducible.
+- **systemd service** for bare-metal installs (`packaging/`). The sniffer runs
+  as an unprivileged, sandboxed user and keeps its database in
+  `/var/lib/lorawan-sniffer`. Secrets such as the MQTT password go in a
+  root-only environment file and are referenced from the configuration as
+  `$NAME`. An override (`concentratord.conf`) enables Concentratord mode.
+- **`install.sh`** installs or upgrades the service without overwriting an
+  existing configuration, never restarts it on its own, and removes it with
+  `--uninstall` (keeping configuration and database).
+- **Configuration for running next to the LNS** on the same machine: the
+  sniffer takes UDP port 1702 and forwards to the LNS on `127.0.0.1:1700`.
+- **Release Docker image** (`docker/Dockerfile.release`, `make
+  docker-build-release`), built from the same binaries as the archives, so
+  the multi-arch image needs no emulation to build.
+- **Automated releases.** Pushing a `vX.Y.Z` tag on `master` builds the x86_64
+  and aarch64 Linux archives, publishes them with a `SHA256SUMS` file as a
+  GitHub Release (notes taken from this changelog), and pushes a multi-arch
+  (amd64 + arm64) image to `ghcr.io/xoseperez/lorawan-packet-sniffer-rs`.
+  Versions with a suffix such as `-rc.1` are published as pre-releases and do
+  not move the `latest` image tag. The workflow can also be run by hand as a
+  dry run that publishes nothing.
+- **Warning for unset environment variables:** a configuration value that is
+  exactly `$NAME` with no such variable set is logged at startup by key (never
+  by value), instead of the text being used silently, for example as an MQTT
+  password.
+
+### Changed
+
+- **Same-origin API by default.** With `cors_origins` empty the API sends no
+  CORS headers (it used to allow every origin), and the WebSocket feed refuses
+  handshakes from other sites. Before, any web page open in a browser that
+  could reach the sniffer could read the captured traffic. Origins listed in
+  `cors_origins` are allowed for both.
+- **One log line per packet only at DEBUG.** Captured messages and
+  Concentratord commands are no longer logged at INFO, which filled the
+  journal on busy servers; startup, gateway sessions and warnings still are.
+- Docker images are based on Alpine 3.23 (3.20 is no longer supported).
+
+### Fixed
+
+- An upstream given by name, such as `localhost`, could resolve to `::1`
+  first, and the sniffer forwarded there even when the LNS or multiplexer
+  only listened on IPv4, so nothing arrived. IPv4 addresses are now
+  preferred; IPv6 is used when the name has no IPv4 address.
+- SIGTERM, as sent by `systemctl stop` and `docker stop`, now stops the
+  sniffer cleanly like Ctrl-C. Before, it killed the process outright, and
+  under Docker, where the sniffer is PID 1, it was ignored until Docker's stop
+  timeout killed it.
+- Records still waiting to be written to the database are saved before the
+  sniffer exits; before, the last ones could be lost on shutdown.
+- `make docker-buildx` built its arm64 image around an x86_64 binary, so that
+  image could not run; it now uses the cross-compiled binaries.
+
 ## [2.1.0] - 2026-10-31
 
 ### Added
@@ -167,6 +224,6 @@ protocols (Semtech UDP and ChirpStack Concentratord).
 - **Docker support** — single-stage `Dockerfile`; `make docker-buildx` pushes
   a multi-arch image (amd64 + arm64).
 
-[Unreleased]: https://github.com/xoseperez/lorawan-packet-sniffer-v2/compare/v2.1.0...HEAD
-[2.1.0]: https://github.com/xoseperez/lorawan-packet-sniffer-v2/compare/v2.0.0...v2.1.0
-[2.0.0]: https://github.com/xoseperez/lorawan-packet-sniffer-v2/releases/tag/v2.0.0
+[Unreleased]: https://github.com/xoseperez/lorawan-packet-sniffer-rs/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/xoseperez/lorawan-packet-sniffer-rs/compare/v2.0.0...v2.1.0
+[2.0.0]: https://github.com/xoseperez/lorawan-packet-sniffer-rs/releases/tag/v2.0.0

@@ -37,6 +37,87 @@ xdg-open http://localhost:8888
 
 Point your LoRaWAN gateway at `<host>:1700` instead of the LNS directly. Set `GATEWAY_UDP_UPSTREAM_SERVER` to your LNS to forward the traffic; leave it unset to run in [listen mode](#listen-mode-no-lns) instead.
 
+## Install as a service (bare metal)
+
+Each release has an archive for x86_64 and one for aarch64 (arm64) Linux, holding the static binary, a systemd service and an install script. This suits running the sniffer on the same machine as the LNS. Pick the archive that matches `uname -m` on the target:
+
+```bash
+VERSION=2.1.0
+ARCH=$(uname -m)    # x86_64 or aarch64
+BASE=https://github.com/xoseperez/lorawan-packet-sniffer-rs/releases/download/v$VERSION
+curl -LO $BASE/lorawan-sniffer-$VERSION-linux-$ARCH.tar.gz
+curl -LO $BASE/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+
+tar xzf lorawan-sniffer-$VERSION-linux-$ARCH.tar.gz
+cd lorawan-sniffer-$VERSION-linux-$ARCH
+sudo ./install.sh
+```
+
+`make dist` builds the same archives locally, in `dist/`.
+
+`install.sh` puts the files in place and reloads systemd; it never starts or restarts the service:
+
+| Path | Contents |
+|---|---|
+| `/usr/local/bin/lorawan-sniffer` | the program |
+| `/etc/systemd/system/lorawan-sniffer.service` | the service |
+| `/etc/lorawan-sniffer/sniffer.toml` | configuration; an existing one is kept, and the new template is written next to it as `sniffer.toml.new` |
+| `/etc/lorawan-sniffer/sniffer.env` | secrets, readable by root only; kept on upgrade |
+| `/var/lib/lorawan-sniffer/` | the database, created by the service |
+
+Review the configuration, then start the service:
+
+```bash
+sudoedit /etc/lorawan-sniffer/sniffer.toml
+sudo systemctl enable --now lorawan-sniffer
+journalctl -u lorawan-sniffer -f
+```
+
+The WebUI is then at `http://<host>:8888`. It has no authentication, so anyone who can reach that port sees all captured traffic; on a machine reachable from untrusted networks, set `bind = "127.0.0.1:8888"` in `[sniffer.api]` and use an SSH tunnel or a reverse proxy.
+
+### Next to the LNS on the same machine
+
+The installed configuration is set up for this without touching the LNS. The LNS keeps UDP port 1700; the sniffer listens on 1702 and forwards to `127.0.0.1:1700`:
+
+```
+gateway ──▶ host:1702 (sniffer) ──▶ 127.0.0.1:1700 (LNS)
+```
+
+Point a gateway's packet forwarder at port 1702 to sniff it; gateways still sending to 1700 reach the LNS directly, as before.
+
+To sniff every gateway without reconfiguring any of them, swap the ports: move the LNS's UDP listener to a loopback port (for ChirpStack Gateway Bridge, `udp_bind = "127.0.0.1:1701"` in `[backend.semtech_udp]`), then set `bind = "0.0.0.0:1700"` in `[gateway.udp.downstream]` and `port = 1701` in `[gateway.udp.upstream]`. Either way the LNS sees each gateway as its own peer, coming from `127.0.0.1` with a port of its own.
+
+### Secrets
+
+`sniffer.toml` is readable by every local user. Put the MQTT password in `/etc/lorawan-sniffer/sniffer.env` instead, which systemd reads as root before starting the sniffer:
+
+```bash
+# /etc/lorawan-sniffer/sniffer.env (mode 0600)
+MQTT_PASSWORD='p@ss"word\with$symbols'
+```
+
+and refer to it from `sniffer.toml` as `password = "$MQTT_PASSWORD"`. Single-quoted values are taken literally.
+
+### About the service
+
+- It runs as an unprivileged user that systemd creates on the fly, inside a sandbox: it can write only to `/var/lib/lorawan-sniffer`, holds no capabilities and sees a private `/tmp`. Ports below 1024 are therefore not available.
+- `systemctl stop` (SIGTERM) makes the sniffer save the records still queued for the database and exit, within a few seconds.
+- It is restarted automatically if it crashes.
+- **Concentratord mode** needs Concentratord's ZeroMQ sockets in the real `/tmp` and permission to open them. Install the override shipped in the archive: `sudo mkdir -p /etc/systemd/system/lorawan-sniffer.service.d && sudo cp concentratord.conf /etc/systemd/system/lorawan-sniffer.service.d/`, then `sudo systemctl daemon-reload && sudo systemctl restart lorawan-sniffer`. It runs the sniffer as root with a shared `/tmp`.
+
+### Upgrade and removal
+
+```bash
+# Upgrade: unpack the new archive, then
+sudo ./install.sh
+sudo systemctl restart lorawan-sniffer
+diff /etc/lorawan-sniffer/sniffer.toml /etc/lorawan-sniffer/sniffer.toml.new   # new options, if any
+
+# Remove the program and the service (configuration and database are kept)
+sudo ./install.sh --uninstall
+```
+
 ## Deployment (Semtech UDP)
 
 There are two ways to place the sniffer between the gateways and the LNS, plus listen mode when there is no LNS at all. In every case the gateway's packet forwarder is configured to send to the sniffer's UDP port instead of the LNS.
@@ -106,15 +187,42 @@ Output: `target/<triple>/release/lorawan-sniffer`
 
 Binaries are statically linked against musl libc. ZeroMQ and SQLite are compiled from source and embedded; the binary has no runtime dependencies.
 
+```bash
+# Release archives for both targets, plus SHA256SUMS, in dist/
+make dist
+```
+
+`make dist` builds the WebUI and both binaries, then packs each binary with the systemd service, the install script and the configuration templates from `packaging/` (see [Install as a service](#install-as-a-service-bare-metal)). The archives are reproducible: building the same commit twice gives identical files.
+
 ## Docker
 
 ```bash
-# Build image for the host architecture
+# Build an image from source (x86_64 only; needs only Docker)
 make docker-build
 
-# Build and push a multi-arch image (amd64 + arm64) to a registry
+# Build the release image for the host architecture from the dist/ binaries
+make docker-build-release
+
+# Build and push the multi-arch release image (amd64 + arm64) to a registry
 DOCKER_IMAGE=ghcr.io/yourname/lorawan-sniffer DOCKER_TAG=latest make docker-buildx
 ```
+
+The release image (`docker/Dockerfile.release`) contains the same binaries as the release archives. It compiles nothing, so building the arm64 image on an x86_64 machine needs no emulation. `docker stop` stops the sniffer cleanly within a second or so.
+
+## Releases
+
+Releases are built by GitHub Actions (`.github/workflows/release.yml`) when a version tag is pushed.
+
+1. Set the new version in `lorawan-sniffer/Cargo.toml`, run `cargo check` so `Cargo.lock` follows, and run `npm version X.Y.Z --no-git-tag-version` in `webui/` (updates `package.json` and `package-lock.json`).
+2. In `CHANGELOG.md`, move the `[Unreleased]` entries into a new `## [X.Y.Z] - YYYY-MM-DD` section, keep an empty `[Unreleased]` above it, and update the link references at the bottom.
+3. Commit and push to `master`, then tag that commit and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`
+
+The workflow refuses to release if the tag is not exactly `v` plus the version in `Cargo.toml`, if the tagged commit is not on `master`, if `CHANGELOG.md` has no section for the version, or if the tests fail. It then publishes:
+
+- a GitHub Release `vX.Y.Z` whose notes are the changelog section, with `lorawan-sniffer-X.Y.Z-linux-x86_64.tar.gz`, `lorawan-sniffer-X.Y.Z-linux-aarch64.tar.gz` and `SHA256SUMS`;
+- the multi-arch (amd64 + arm64) image `ghcr.io/xoseperez/lorawan-packet-sniffer-rs` tagged `X.Y.Z`, `X.Y` and `latest`.
+
+A version with a suffix (`2.2.0-rc.1`) is published as a pre-release and only gets its full-version image tag. To test the pipeline without releasing anything, run the workflow by hand (Actions > Release > Run workflow): it builds and packages everything, builds the image without pushing it, and keeps the archives as the `release-files` artifact of the run.
 
 ## Docker Environment Variables
 
@@ -182,7 +290,7 @@ The sniffer is configured via a TOML file. Run `lorawan-sniffer configfile` to p
 
 [sniffer.api]
   bind = "0.0.0.0:8888"
-  # cors_origins = ["https://example.com"]   # default: allow all origins
+  # cors_origins = ["https://example.com"]   # default: only the sniffer's own WebUI
 
 [sniffer.database]
   path      = "/var/lib/lorawan-sniffer/sniffer.db"
@@ -368,14 +476,18 @@ FCtrl bit 4 is `class_b` on uplinks and `f_pending` on downlinks; flags that do 
 
 The WebUI has matching Gateway (last 8 hex digits, full EUI in the tooltip), JoinEUI, DevNonce, flags and FOptsLen columns in the column picker, a gateway filter, and the new fields in the CSV export.
 
-### CORS
+### Cross-origin access
 
-By default all origins are allowed (the sniffer is a local/private network tool). To restrict access:
+The API and the live feed have no authentication, so by default only the sniffer's own WebUI can use them from a browser: the API sends no CORS headers, and a WebSocket handshake whose `Origin` names another site is refused with 403. Without this, any web page open in a browser that can reach the sniffer could read the captured traffic. Clients that are not browsers (curl, scripts) send no `Origin` and are not affected.
+
+To let a dashboard on another origin use the API and the live feed, list it:
 
 ```toml
 [sniffer.api]
   cors_origins = ["https://dashboard.example.com"]
 ```
+
+Behind a reverse proxy, either pass the original `Host` header through (nginx: `proxy_set_header Host $host;`) or list the public origin in `cors_origins`; otherwise the WebUI's live feed is refused.
 
 ## Known limitations
 

@@ -428,7 +428,7 @@ fn run_command_thread(
             }
         };
 
-        info!("zmq-command: received command ({} bytes)", bytes.len());
+        debug!("zmq-command: received command ({} bytes)", bytes.len());
 
         let response = match gw::Command::decode(bytes.as_slice()) {
             Err(e) => {

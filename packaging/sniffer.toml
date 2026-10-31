@@ -1,0 +1,139 @@
+# LoRaWAN Packet Sniffer configuration for a system install
+# (/etc/lorawan-sniffer/sniffer.toml, read by lorawan-sniffer.service).
+#
+# It is set up to run next to the LNS on the same machine, without touching
+# the LNS:
+#
+#   gateway ──▶ this host:1702 (sniffer) ──▶ 127.0.0.1:1700 (LNS, unchanged)
+#
+# Point a gateway's packet forwarder at port 1702 of this machine to sniff
+# it; gateways still pointing at 1700 go straight to the LNS as before.
+#
+# To sniff every gateway without reconfiguring them, swap the ports instead:
+# move the LNS's UDP listener to a loopback port (for example
+# 127.0.0.1:1701), then set below
+#
+#   [gateway.udp.downstream]  bind = "0.0.0.0:1700"
+#   [gateway.udp.upstream]    server = "127.0.0.1"  and  port = 1701
+#
+# Apply changes with: systemctl restart lorawan-sniffer
+
+[sniffer]
+  # Log level. Valid options: TRACE, DEBUG, INFO, WARN, ERROR, OFF
+  log_level = "INFO"
+
+  # Log to syslog instead of stdout. Under systemd, stdout already goes to
+  # the journal: journalctl -u lorawan-sniffer
+  log_to_syslog = false
+
+  [sniffer.api]
+    # HTTP API / WebSocket bind address. The WebUI and the API have no
+    # authentication: anyone who can reach this port sees all captured
+    # traffic. On a machine reachable from untrusted networks, bind to
+    # "127.0.0.1:8888" and use an SSH tunnel or a reverse proxy.
+    bind = "0.0.0.0:8888"
+
+    # Allowed CORS origins (optional).
+    # cors_origins = ["https://example.com"]
+
+  [sniffer.database]
+    # Path to the SQLite database file. The service owns /var/lib/lorawan-sniffer.
+    path = "/var/lib/lorawan-sniffer/sniffer.db"
+
+    # Message retention period.
+    retention = "30days"
+
+  # MQTT publishing (optional): every captured message is also published to
+  # the broker as JSON. Best effort: messages that cannot be sent are dropped
+  # and counted, never queued without limit.
+  [sniffer.mqtt]
+    # Publish messages to MQTT.
+    enabled = false
+
+    # Broker host name or IP address, and port (1883 plain, usually 8883 TLS).
+    server = "localhost"
+    port   = 1883
+
+    # Connect using TLS. The broker certificate is always verified.
+    tls = false
+
+    # TLS only: PEM file with the CA certificate(s) that verify the broker.
+    # Empty uses the bundled public CA roots.
+    ca_file = ""
+
+    # TLS only: PEM client certificate and key for brokers requiring mutual
+    # TLS. Set both or none.
+    client_cert_file = ""
+    client_key_file  = ""
+
+    # MQTT client identifier.
+    client_id = "lorawan-sniffer"
+
+    # Optional credentials. Leave empty for anonymous access.
+    username = ""
+
+    # This file is readable by every local user, so keep the password out of
+    # it: put MQTT_PASSWORD='...' in /etc/lorawan-sniffer/sniffer.env (readable
+    # by root only, loaded by the service) and uncomment this line.
+    # password = "$MQTT_PASSWORD"
+
+    # Topic template. Placeholders: {gateway_eui}, {direction}, {mtype},
+    # {status}, {dev_addr}, {dev_eui}.
+    topic = "lorawan-sniffer/{gateway_eui}/{direction}/{mtype}"
+
+    # Quality of service: 0 (at most once), 1 or 2.
+    qos = 0
+
+
+[gateway]
+  # Gateway protocol: "udp" or "concentratord".
+  protocol = "udp"
+
+  [gateway.udp]
+    # Operating mode: "proxy" relays between the gateways and the LNS,
+    # "listen" only records what the gateways send (no LNS involved).
+    mode = "proxy"
+
+    # Listen mode only: answer PUSH_DATA and PULL_DATA with the ACKs the
+    # gateways expect, so they consider their server alive.
+    listen_acks = true
+
+    # Release a gateway's session after this much silence.
+    session_timeout = "5m"
+
+    # Maximum number of gateways handled at once (at least 1). Each one uses
+    # a socket; the service allows 4096 open files, so stay well below that.
+    max_gateways = 100
+
+    # Where the gateways send their traffic.
+    [gateway.udp.downstream]
+      bind = "0.0.0.0:1702"
+
+    # Proxy mode only: the LoRaWAN Network Server to forward to.
+    [gateway.udp.upstream]
+      server = "127.0.0.1"
+      port   = 1700
+
+  # Concentratord mode also needs the service override in concentratord.conf:
+  # these sockets live in /tmp, which the service otherwise keeps private.
+  [gateway.concentratord]
+    [gateway.concentratord.downstream]
+      event_url   = "ipc:///tmp/concentratord_event"
+      command_url = "ipc:///tmp/concentratord_command"
+
+    [gateway.concentratord.upstream]
+      event_bind   = "ipc:///tmp/sniffer_event"
+      command_bind = "ipc:///tmp/sniffer_command"
+
+
+# Packet filter rules (repeatable). They have no effect in UDP listen mode.
+#
+# [[filters]]
+#   name        = "Block confirmed uplinks"
+#   enabled     = true
+#   direction   = "up"
+#   suppress_ack = false
+#   mtype       = ["ConfirmedDataUp"]
+#   # Optional: only apply to these gateways (EUIs, with or without ':' or
+#   # '-'). Omit to apply to every gateway.
+#   gateways    = ["AA:BB:CC:DD:00:11:22:33"]

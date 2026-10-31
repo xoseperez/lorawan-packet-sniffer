@@ -1,0 +1,11 @@
+# Rust build artifacts
+target/
+
+# Node.js artifacts
+webui/node_modules/
+
+# Version control
+.git/
+
+# Documentation (not needed for builds)
+docs/

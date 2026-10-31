@@ -238,9 +238,13 @@ fn try_queue(
     }
 }
 
-/// Log a captured message at INFO level in a compact, structured format.
+/// Log a captured message at DEBUG level in a compact, structured format.
+///
+/// One line per packet is too much for INFO: on a server in front of many
+/// gateways it would fill the journal. The database, the WebUI and MQTT
+/// already record every message.
 pub(super) fn log_message(rec: &MessageRecord) {
-    info!("{}", log_line(rec));
+    debug!("{}", log_line(rec));
 
     if let Some(name) = rec.blocked_by.as_deref() {
         debug!("[blocked_by=\"{}\"]", name);

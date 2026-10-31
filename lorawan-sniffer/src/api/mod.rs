@@ -17,6 +17,14 @@
 //!
 //! Client → server: ignored for now.
 //!
+//! ## Cross-origin access
+//!
+//! The API has no authentication, so it must not be readable from other web
+//! sites the operator happens to open.  By default it sends no CORS headers,
+//! so browsers only let the sniffer's own pages read it, and the WebSocket
+//! handshake (which browsers never subject to CORS) is checked against the
+//! `Origin` header.  Origins listed in `cors_origins` are allowed for both.
+//!
 //! ## `/api/messages` query params
 //!
 //! - `since`: ISO-8601 timestamp — return only messages after this time (asc)
@@ -26,10 +34,10 @@ use std::sync::Arc;
 
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{rejection::WebSocketUpgradeRejection, Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    http::{header, StatusCode, Uri},
+    http::{header, HeaderMap, StatusCode, Uri},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -60,6 +68,8 @@ struct Frontend;
 pub struct AppState {
     broadcast_tx: broadcast::Sender<Arc<String>>,
     storage: Storage,
+    /// Origins other than the sniffer's own that may use the API.
+    allowed_origins: Arc<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -71,33 +81,80 @@ pub fn router(
     storage: Storage,
     cors_origins: Vec<String>,
 ) -> Router {
-    let state = AppState {
-        broadcast_tx,
-        storage,
-    };
-
-    let cors = if cors_origins.is_empty() {
-        CorsLayer::permissive()
-    } else {
-        let origins: Vec<axum::http::HeaderValue> =
-            cors_origins.iter().filter_map(|o| o.parse().ok()).collect();
-        CorsLayer::new().allow_origin(origins)
-    };
-
-    Router::new()
+    let mut app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/messages", get(messages_handler))
-        .fallback(frontend_handler)
-        .layer(cors)
-        .with_state(state)
+        .fallback(frontend_handler);
+
+    // Without CORS headers a browser only lets pages served by the sniffer
+    // read the API.  Answering every origin would let any web site the
+    // operator visits read the captured traffic from their browser.
+    if !cors_origins.is_empty() {
+        let origins: Vec<axum::http::HeaderValue> =
+            cors_origins.iter().filter_map(|o| o.parse().ok()).collect();
+        app = app.layer(CorsLayer::new().allow_origin(origins));
+    }
+
+    app.with_state(AppState {
+        broadcast_tx,
+        storage,
+        allowed_origins: Arc::new(cors_origins),
+    })
 }
 
 // ---------------------------------------------------------------------------
 // WebSocket handler
 // ---------------------------------------------------------------------------
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state.broadcast_tx.subscribe()))
+async fn ws_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> axum::response::Response {
+    if !ws_origin_allowed(&headers, &state.allowed_origins) {
+        debug!(
+            "WebSocket handshake refused for origin {:?}",
+            headers.get(header::ORIGIN)
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match ws {
+        Ok(ws) => ws
+            .on_upgrade(move |socket| handle_socket(socket, state.broadcast_tx.subscribe()))
+            .into_response(),
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// Whether a WebSocket handshake may go ahead, judged by its `Origin` header.
+///
+/// Browsers do not apply CORS to WebSockets, so without this check any page
+/// the operator opens could connect to the live feed.  Browsers always send
+/// `Origin` on a handshake; it is accepted when it names the host the request
+/// was sent to (one of the sniffer's own pages, also through the WebUI dev
+/// server's proxy) or is listed in `cors_origins`.  A handshake without
+/// `Origin` does not come from a browser and is accepted.
+fn ws_origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    if allowed
+        .iter()
+        .any(|a| a.trim_end_matches('/').eq_ignore_ascii_case(origin))
+    {
+        return true;
+    }
+    // An origin is `scheme://host[:port]`; a sandboxed page sends "null".
+    let Some((_, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|host| host.eq_ignore_ascii_case(authority))
 }
 
 async fn handle_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Arc<String>>) {
@@ -410,5 +467,174 @@ mod tests {
         assert_eq!(envelope["type"], json!("message"));
         assert_eq!(keys_of(&envelope["data"]), expected_keys());
         assert_new_field_values(&envelope["data"]);
+    }
+
+    // -- cross-origin access ------------------------------------------------
+
+    fn app_with(cors_origins: &[&str]) -> Router {
+        let (tx, _rx) = broadcast::channel(4);
+        router(
+            tx,
+            Storage::open_in_memory().unwrap(),
+            cors_origins.iter().map(|o| o.to_string()).collect(),
+        )
+    }
+
+    async fn get_with(
+        app: Router,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let mut request = Request::builder().uri(uri);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, value.parse().unwrap());
+        }
+        map
+    }
+
+    #[tokio::test]
+    async fn api_sends_no_cors_headers_by_default() {
+        let response = get_with(
+            app_with(&[]),
+            "/api/messages",
+            &[("origin", "http://evil.example")],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn api_allows_only_configured_origins() {
+        let allowed = get_with(
+            app_with(&["https://ui.example"]),
+            "/api/messages",
+            &[("origin", "https://ui.example")],
+        )
+        .await;
+        let other = get_with(
+            app_with(&["https://ui.example"]),
+            "/api/messages",
+            &[("origin", "http://evil.example")],
+        )
+        .await;
+
+        assert_eq!(
+            allowed
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "https://ui.example"
+        );
+        assert!(other.headers().get("access-control-allow-origin").is_none());
+    }
+
+    #[tokio::test]
+    async fn ws_refuses_a_foreign_origin() {
+        let response = get_with(
+            app_with(&[]),
+            "/ws",
+            &[("host", "sniffer:8888"), ("origin", "http://evil.example")],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn ws_origin_rules() {
+        let none: &[String] = &[];
+        let listed = ["https://ui.example/".to_string()];
+
+        // Not a browser.
+        assert!(ws_origin_allowed(&headers(&[("host", "lns01:8888")]), none));
+        // The sniffer's own pages, any case.
+        assert!(ws_origin_allowed(
+            &headers(&[("host", "lns01:8888"), ("origin", "http://lns01:8888")]),
+            none
+        ));
+        assert!(ws_origin_allowed(
+            &headers(&[("host", "LNS01:8888"), ("origin", "http://lns01:8888")]),
+            none
+        ));
+        assert!(ws_origin_allowed(
+            &headers(&[("host", "[::1]:8888"), ("origin", "http://[::1]:8888")]),
+            none
+        ));
+        // Another site, another port of the same host, or a sandboxed page.
+        assert!(!ws_origin_allowed(
+            &headers(&[("host", "lns01:8888"), ("origin", "http://evil.example")]),
+            none
+        ));
+        assert!(!ws_origin_allowed(
+            &headers(&[("host", "lns01:8888"), ("origin", "http://lns01:9999")]),
+            none
+        ));
+        assert!(!ws_origin_allowed(
+            &headers(&[("host", "lns01:8888"), ("origin", "null")]),
+            none
+        ));
+        assert!(!ws_origin_allowed(
+            &headers(&[("origin", "http://lns01:8888")]),
+            none
+        ));
+        // Listed in cors_origins (a trailing slash in the setting is fine).
+        assert!(ws_origin_allowed(
+            &headers(&[("host", "127.0.0.1:8888"), ("origin", "https://ui.example")]),
+            &listed
+        ));
+    }
+
+    /// The full handshake over a real socket: the in-process test service
+    /// cannot upgrade a connection, so this is where a successful handshake
+    /// is proven.
+    #[tokio::test]
+    async fn ws_handshake_over_tcp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app_with(&[])).await.unwrap();
+        });
+
+        async fn status_of(addr: std::net::SocketAddr, origin: Option<String>) -> String {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let origin = origin
+                .map(|o| format!("Origin: {o}\r\n"))
+                .unwrap_or_default();
+            let request = format!(
+                "GET /ws HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                 Sec-WebSocket-Version: 13\r\n{origin}\r\n"
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = stream.read(&mut buf).await.unwrap();
+            let text = String::from_utf8_lossy(&buf[..n]).to_string();
+            text.lines().next().unwrap_or_default().to_string()
+        }
+
+        let own = status_of(addr, Some(format!("http://{addr}"))).await;
+        let foreign = status_of(addr, Some("http://evil.example".to_string())).await;
+        let no_origin = status_of(addr, None).await;
+
+        assert!(own.contains(" 101 "), "{own}");
+        assert!(foreign.contains(" 403 "), "{foreign}");
+        assert!(no_origin.contains(" 101 "), "{no_origin}");
     }
 }

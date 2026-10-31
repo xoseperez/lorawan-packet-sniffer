@@ -1,0 +1,368 @@
+# Release pipeline.
+#
+# Pushing a tag vX.Y.Z (on a commit that is already on the default branch)
+# builds the static Linux binaries for x86_64 and aarch64, publishes them as a
+# GitHub Release with a SHA256SUMS file, and pushes a multi-arch image
+# (amd64 + arm64) to ghcr.io.
+#
+# Run manually (Actions tab > Release > Run workflow) for a dry run: everything
+# is built and packaged, the image is built but not pushed, and the archives
+# are kept as a workflow artifact. Nothing is released or pushed.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+# A second run for the same ref waits instead of racing the first one, and a
+# run that is publishing is never cancelled half way.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22'
+  # cross 0.2.5 as built from this commit (it prints as "19bc73f"). A git
+  # build rather than the crates.io release because its images are the :main
+  # tags, which the toolchain here has been built and tested with.
+  CROSS_REV: 19bc73f2775a0683a991910a21c6368aaaa858f8
+
+jobs:
+  # Decide what is being released and refuse anything inconsistent before
+  # spending minutes on builds.
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history so that origin/<default branch> is available for the
+          # ancestry check below.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read version
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^[[:space:]]*version[[:space:]]*=/ { print $2; exit }' lorawan-sniffer/Cargo.toml)
+          if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Cannot read a semantic version from lorawan-sniffer/Cargo.toml (got '$version')"
+            exit 1
+          fi
+          if [[ $version == *-* ]]; then
+            prerelease=true
+          else
+            prerelease=false
+          fi
+          echo "Version $version (prerelease: $prerelease)"
+          {
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check the tag matches the version
+        if: github.event_name == 'push'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ $GITHUB_REF_NAME != "v$VERSION" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the version in lorawan-sniffer/Cargo.toml (expected v$VERSION). Fix the version or tag the right commit."
+            exit 1
+          fi
+
+      - name: Check the tagged commit is on the default branch
+        if: github.event_name == 'push'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          rc=0
+          git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH" || rc=$?
+          case $rc in
+            0) ;;
+            1)
+              echo "::error::Tag $GITHUB_REF_NAME points to $GITHUB_SHA, which is not on $DEFAULT_BRANCH. Merge it into $DEFAULT_BRANCH first and tag from there."
+              exit 1
+              ;;
+            *)
+              echo "::error::Could not compare $GITHUB_SHA with origin/$DEFAULT_BRANCH (git exit status $rc)."
+              exit 1
+              ;;
+          esac
+
+      # The text of the version's CHANGELOG section becomes the release body.
+      - name: Extract release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/release-notes.md"
+          # From the "## [VERSION]" heading to the next "## [" heading (or the
+          # link references at the bottom), without leading or trailing blank
+          # lines.
+          awk -v want="## [$VERSION]" '
+            /^## \[/ {
+              if (found) exit
+              found = (index($0, want) == 1)
+              next
+            }
+            found && /^\[[^]]+\]: / { exit }
+            found {
+              if ($0 ~ /^[[:space:]]*$/) { pending = pending "\n"; next }
+              if (started) printf "%s", pending
+              pending = ""
+              started = 1
+              print
+            }
+          ' CHANGELOG.md > "$notes"
+          if [[ ! -s $notes ]]; then
+            msg="CHANGELOG.md has no notes for [$VERSION]; add a '## [$VERSION] - YYYY-MM-DD' section"
+            if [[ $GITHUB_EVENT_NAME == push ]]; then
+              echo "::error::$msg"
+              exit 1
+            fi
+            echo "::warning::$msg"
+          fi
+          echo "---- release notes for $VERSION ----"
+          cat "$notes"
+          echo "------------------------------------"
+
+      - name: Keep the release notes for the publish job
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      # webui/dist is not in git and the Rust build embeds it, so the WebUI
+      # has to exist before cargo runs.
+      - name: Build the WebUI
+        working-directory: webui
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      # Installs what rust-toolchain.toml asks for; rustup does not always do
+      # that on its own the first time cargo runs.
+      - name: Install the Rust toolchain
+        run: rustup toolchain install
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run the tests
+        run: cargo test --locked
+
+  build:
+    needs: [check, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The release flags (static linking, stripping) live in this file. If it
+      # is missing the build still succeeds, but produces a different binary
+      # from the one built locally.
+      - name: Check the build configuration is in the checkout
+        run: |
+          if [[ ! -f .cargo/config.toml ]]; then
+            echo "::error::.cargo/config.toml is missing from the checkout; is it ignored by .gitignore?"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Build the WebUI
+        working-directory: webui
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - name: Install the Rust toolchain
+        run: rustup toolchain install
+
+      # Compiling cross takes a few minutes; its binary only depends on the
+      # revision and the runner image.
+      - name: Restore cross
+        id: cross-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/cross
+          key: cross-${{ runner.os }}-${{ runner.arch }}-${{ env.CROSS_REV }}
+
+      - name: Install cross
+        if: steps.cross-cache.outputs.cache-hit != 'true'
+        run: cargo install cross --git https://github.com/cross-rs/cross --rev "$CROSS_REV" --locked
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cross build --release --locked --target "$TARGET"
+
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: packaging/package.sh "$TARGET" dist
+
+      # File permissions are lost in an artifact. That is harmless: the
+      # archive keeps its own, and docker/Dockerfile.release sets the mode of
+      # the binary it copies.
+      - name: Keep the packages for the publish job
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # The only job that can write anything outside the run.
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      PRERELEASE: ${{ needs.check.outputs.prerelease }}
+    steps:
+      # For docker/Dockerfile.release and the files it copies.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download the packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Download the release notes
+        if: github.event_name == 'push'
+        uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          for arch in x86_64 aarch64; do
+            archive="lorawan-sniffer-$VERSION-linux-$arch.tar.gz"
+            if [[ ! -f $archive ]]; then
+              echo "::error::Missing $archive in the build artifacts"
+              exit 1
+            fi
+          done
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      # The image only copies the binaries built above, so there is nothing
+      # to run for the other architecture and no need for QEMU.
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        if: github.event_name == 'push'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # "latest" is added explicitly below, only for final releases.
+          flavor: latest=false
+          # The version comes from Cargo.toml (already checked against the tag)
+          # so that a dry run produces the same tags as a real release.
+          tags: |
+            type=semver,pattern={{version}},value=v${{ env.VERSION }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ env.VERSION }}
+            type=raw,value=latest,enable=${{ env.PRERELEASE == 'false' }}
+
+      - name: Build the image, and push it on tag runs
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Create the GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          flags=()
+          if [[ $PRERELEASE == true ]]; then
+            flags+=(--prerelease)
+          fi
+          # --verify-tag: without it, a tag that has disappeared from the
+          # remote would be recreated by gh from the default branch head, and
+          # the release would point at a commit nobody tagged.
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+            --title "v$VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --verify-tag \
+            "${flags[@]}"
+
+      - name: Keep the release files (dry run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-files
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
