@@ -42,3 +42,21 @@
   tower-http = { version = "0.5", features = ["cors"] }
   rust-embed = "8"
   mime_guess = "2.0"
+  # MQTT client without its default TLS provider: the default pulls in aws-lc-rs,
+  # which needs CMake/NASM to cross-compile to musl. TLS uses rustls with ring instead.
+  rumqttc = { version = "0.25", default-features = false, features = [
+    "use-rustls-no-provider",
+  ] }
+  rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+  ] }
+  rustls-pki-types = { version = "1", features = ["std"] }
+  webpki-roots = "1"
+
+  # Test-only
+  bytes = "1"
+  tower = { version = "0.5", features = ["util"] }
+  http-body-util = "0.1"

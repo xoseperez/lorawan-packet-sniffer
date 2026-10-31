@@ -41,11 +41,45 @@
   # Semtech UDP Packet Forwarder MITM configuration.
   [gateway.udp]
 
-    # Downstream: listen for packets from the gateway.
+    # Operating mode.
+    #
+    # Valid options are:
+    #   * proxy  – forward everything between the gateways and the LNS
+    #              configured in [gateway.udp.upstream]. Any number of
+    #              gateways can use the same sniffer; each one gets its own
+    #              UDP socket towards the LNS, so the LNS sees them as
+    #              separate peers and can address downlinks to each of them.
+    #   * listen – no LNS: record what the gateways send and forward nothing.
+    #              Captured messages get the status "Captured", blocking
+    #              rules ([[filters]]) have no effect, and downlinks are never
+    #              sent. [gateway.udp.upstream] is not used.
+    mode = "proxy"
+
+    # Listen mode only: answer every PUSH_DATA with a PUSH_ACK and every
+    # PULL_DATA with a PULL_ACK, so gateways see a healthy link to their
+    # "server". Set to false to stay completely silent.
+    listen_acks = true
+
+    # How long a gateway may stay silent before its session (its upstream
+    # socket and routing state) is released. A gateway that sends again gets a
+    # fresh session. Packet forwarders send a keep-alive every 10 seconds by
+    # default, so a live gateway never reaches this.
+    session_timeout = "5m"
+
+    # Maximum number of gateways (distinct EUIs) handled at the same time, in
+    # both modes. Packets from new gateways beyond this limit are dropped with
+    # a warning; gateways already connected are not affected. Must be at least 1.
+    max_gateways = 100
+
+    # Downstream: listen for packets from the gateways.
     [gateway.udp.downstream]
       bind = "0.0.0.0:1700"
 
-    # Upstream: forward packets to the LoRaWAN Network Server.
+    # Upstream (proxy mode): forward packets to the LoRaWAN Network Server.
+    #
+    # The sniffer refuses to start if this points to its own downstream port
+    # (through any address of the machine), because it would forward packets
+    # to itself.
     [gateway.udp.upstream]
       server = "lns.example.com"
       port = 1700
@@ -67,6 +101,8 @@
 # Packet filter rules.
 # Rules are evaluated in order; the first matching rule wins.
 # Packets not matching any rule are forwarded transparently.
+# In UDP listen mode there is nothing to forward, so rules have no effect (a
+# warning is logged at startup if any are configured).
 
 # [[filters]]
 #   # Human-readable name (shown in logs and WebUI).
@@ -92,3 +128,75 @@
 #   direction = "down"
 #   suppress_ack = true
 #   mtype = ["UnconfirmedDataDown", "ConfirmedDataDown", "JoinAccept"]
+
+# [[filters]]
+#   # Optional: limit the rule to some gateways. The rule then only matches
+#   # messages received from, or addressed to, one of the listed gateways.
+#   # Omit it (or leave it empty) to match every gateway. EUIs are 8 bytes of
+#   # hex, with or without colons or dashes, in any case. An invalid EUI is a
+#   # startup error.
+#   name = "Block join requests from two gateways"
+#   enabled = true
+#   direction = "up"
+#   mtype = ["JoinRequest"]
+#   gateways = ["AA:BB:CC:DD:00:11:22:33", "aabbccdd00112244"]
+#   suppress_ack = false
+
+
+# MQTT publishing (optional, disabled by default).
+#
+# When enabled, every captured message is also published to an MQTT broker as
+# JSON, with the same fields as a record returned by /api/messages. Blocked
+# messages are published too (their "status" says so).
+#
+# Publishing is best effort and never slows down forwarding: each message is
+# handed to the MQTT client at most once, and when the broker is unreachable or
+# too slow the messages that cannot be sent are dropped (and counted) instead
+# of queued without limit. The sniffer reconnects on its own. With QoS 1 or 2
+# the broker may receive a duplicate after a reconnect.
+
+# [sniffer.mqtt]
+#   # Publish messages to MQTT.
+#   enabled = false
+#
+#   # Broker host name or IP address, and port (1883 for plain TCP, 8883 is
+#   # the usual port for TLS).
+#   server = "localhost"
+#   port = 1883
+#
+#   # Connect using TLS. The broker certificate is always verified, against
+#   # the public CA roots bundled in the binary unless ca_file is set.
+#   tls = false
+#
+#   # TLS only. PEM file with the CA certificate(s) used to verify the broker.
+#   # It replaces the bundled public roots, so set it for brokers with a
+#   # private CA. Empty = use the bundled roots.
+#   ca_file = ""
+#
+#   # TLS only. PEM files with a client certificate and its private key, for
+#   # brokers that require mutual TLS. Set both or none.
+#   client_cert_file = ""
+#   client_key_file = ""
+#
+#   # MQTT client identifier.
+#   client_id = "lorawan-sniffer"
+#
+#   # Optional credentials. Leave empty for anonymous access. Never logged.
+#   username = ""
+#   password = ""
+#
+#   # Topic template. These placeholders are replaced for every message:
+#   #   {gateway_eui}  gateway EUI, e.g. AA:BB:CC:DD:00:11:22:33
+#   #   {direction}    up | down
+#   #   {mtype}        message type, e.g. JoinRequest
+#   #   {status}       Forwarded | Blocked | Captured
+#   #   {dev_addr}     device address
+#   #   {dev_eui}      device EUI
+#   # A value the message does not have (a DevAddr on a join request, for
+#   # example) is replaced by "unknown". A template without placeholders sends
+#   # everything to one topic. Unknown placeholders and the MQTT wildcards
+#   # "+" and "#" are rejected at startup.
+#   topic = "lorawan-sniffer/{gateway_eui}/{direction}/{mtype}"
+#
+#   # Quality of service: 0 (at most once), 1 or 2.
+#   qos = 0

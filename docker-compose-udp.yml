@@ -15,8 +15,35 @@ services:
 
     environment:
       GATEWAY_PROTOCOL: "udp"
+
+      # Proxy mode: forward everything to your LNS. Any number of gateways can
+      # point at this container; each one reaches the LNS through its own UDP
+      # socket. Remove GATEWAY_UDP_UPSTREAM_SERVER (and the port) to run in
+      # listen mode instead: no LNS, the sniffer only records what the
+      # gateways send (status "Captured") and, by default, acknowledges their
+      # PUSH_DATA / PULL_DATA so they see a healthy link.
       GATEWAY_UDP_UPSTREAM_SERVER: "your-lns-host"
       GATEWAY_UDP_UPSTREAM_PORT: "1700"
+
+      # Optional tuning
+      # GATEWAY_UDP_MODE: "proxy"            # "proxy" | "listen"; default depends on the upstream server
+      # GATEWAY_UDP_LISTEN_ACKS: "true"      # listen mode only: answer PUSH_DATA / PULL_DATA
+      # GATEWAY_UDP_SESSION_TIMEOUT: "5m"    # release a silent gateway after this long
+      # GATEWAY_UDP_MAX_GATEWAYS: "100"      # maximum number of gateways at once
+
+      # Optional: also publish every captured message to an MQTT broker.
+      # SNIFFER_MQTT_ENABLED: "true"
+      # SNIFFER_MQTT_SERVER: "mqtt.example.com"
+      # SNIFFER_MQTT_PORT: "1883"            # usually 8883 with TLS
+      # SNIFFER_MQTT_TLS: "false"
+      # SNIFFER_MQTT_CA_FILE: ""             # PEM file, e.g. mounted under /run/secrets; empty = bundled public CAs
+      # SNIFFER_MQTT_CLIENT_CERT_FILE: ""    # set both for mutual TLS
+      # SNIFFER_MQTT_CLIENT_KEY_FILE: ""
+      # SNIFFER_MQTT_CLIENT_ID: "lorawan-sniffer"
+      # SNIFFER_MQTT_USERNAME: ""
+      # SNIFFER_MQTT_PASSWORD: ""
+      # SNIFFER_MQTT_TOPIC: "lorawan-sniffer/{gateway_eui}/{direction}/{mtype}"
+      # SNIFFER_MQTT_QOS: "0"
 
     volumes:
 

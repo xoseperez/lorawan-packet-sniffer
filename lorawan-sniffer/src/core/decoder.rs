@@ -1,6 +1,51 @@
 use base64::prelude::*;
 
+use crate::core::eui::Eui64;
 use crate::core::metadata::MType;
+
+/// Frame control byte (FCtrl) of a data frame.
+///
+/// The top bits of FCtrl mean different things in each direction, so the
+/// decoder resolves them from the MType and only fills in the flags that exist
+/// for that direction.  The others stay `None` rather than `false`, so "not
+/// applicable" and "bit clear" remain distinguishable downstream.
+///
+/// | Bit | Uplink    | Downlink                 |
+/// |-----|-----------|--------------------------|
+/// | 7   | ADR       | ADR                      |
+/// | 6   | ADRACKReq | reserved (always `None`) |
+/// | 5   | ACK       | ACK                      |
+/// | 4   | ClassB    | FPending                 |
+/// | 3:0 | FOptsLen  | FOptsLen                 |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FCtrl {
+    /// Adaptive data rate enabled (bit 7, both directions).
+    pub adr: bool,
+    /// Device asks the network to confirm its ADR state (bit 6, uplink only).
+    pub adr_ack_req: Option<bool>,
+    /// Acknowledges the previous confirmed message (bit 5, both directions).
+    pub ack: bool,
+    /// Device is in Class B mode (bit 4, uplink only).
+    pub class_b: Option<bool>,
+    /// Network has more downlink data queued for the device (bit 4, downlink only).
+    pub f_pending: Option<bool>,
+    /// Length of the FOpts field in bytes (bits 3..0).
+    pub f_opts_len: u8,
+}
+
+impl FCtrl {
+    fn parse(byte: u8, uplink: bool) -> Self {
+        let bit = |n: u8| byte & (1 << n) != 0;
+        Self {
+            adr: bit(7),
+            adr_ack_req: uplink.then(|| bit(6)),
+            ack: bit(5),
+            class_b: uplink.then(|| bit(4)),
+            f_pending: (!uplink).then(|| bit(4)),
+            f_opts_len: byte & 0x0F,
+        }
+    }
+}
 
 /// Decoded fields from a LoRaWAN PHY payload.
 ///
@@ -15,18 +60,16 @@ pub struct DecodedFrame {
     pub dev_eui: Option<String>,
     /// JoinEUI / AppEUI as colon-separated uppercase hex (JoinRequest).
     pub join_eui: Option<String>,
+    /// DevNonce (JoinRequest).
+    pub dev_nonce: Option<u16>,
     /// Frame counter from FHDR (16-bit value, not extended).
     pub fcnt: Option<u32>,
     /// FPort byte.
     pub fport: Option<u8>,
+    /// Frame control flags (data frames).
+    pub fctrl: Option<FCtrl>,
     /// PHY payload size in bytes.
     pub payload_size: u16,
-}
-
-impl Default for MType {
-    fn default() -> Self {
-        MType::Unknown
-    }
 }
 
 /// Decode a base64-encoded LoRaWAN PHY payload.
@@ -64,11 +107,11 @@ pub fn decode_phy_bytes(bytes: &[u8]) -> Option<DecodedFrame> {
     let payload_size = bytes.len() as u16;
 
     match &mtype {
-        MType::JoinRequest => decode_join_request(&bytes, mtype, payload_size),
+        MType::JoinRequest => decode_join_request(bytes, mtype, payload_size),
         MType::UnconfirmedDataUp
         | MType::ConfirmedDataUp
         | MType::UnconfirmedDataDown
-        | MType::ConfirmedDataDown => decode_data_frame(&bytes, mtype, payload_size),
+        | MType::ConfirmedDataDown => decode_data_frame(bytes, mtype, payload_size),
         _ => Some(DecodedFrame {
             mtype,
             payload_size,
@@ -87,16 +130,21 @@ fn decode_join_request(bytes: &[u8], mtype: MType, payload_size: u16) -> Option<
             ..Default::default()
         });
     }
-    let join_eui = format_eui_le(&bytes[1..9]);
-    let dev_eui = format_eui_le(&bytes[9..17]);
+    let join_eui = Eui64::from_le_slice(&bytes[1..9]).map(|e| e.to_string());
+    let dev_eui = Eui64::from_le_slice(&bytes[9..17]).map(|e| e.to_string());
+    let dev_nonce = u16::from_le_bytes([bytes[17], bytes[18]]);
     Some(DecodedFrame {
         mtype,
-        dev_eui: Some(dev_eui),
-        join_eui: Some(join_eui),
+        dev_eui,
+        join_eui,
+        dev_nonce: Some(dev_nonce),
         payload_size,
         ..Default::default()
     })
 }
+
+/// Length of the message integrity code that ends every data frame.
+const MIC_LEN: usize = 4;
 
 /// Data frame layout:
 ///   MHDR(1) + DevAddr(4,LE) + FCtrl(1) + FCnt(2,LE) + FOpts(0-15) + [FPort(1)] + FRMPayload + MIC(4)
@@ -115,12 +163,17 @@ fn decode_data_frame(bytes: &[u8], mtype: MType, payload_size: u16) -> Option<De
 
     let fcnt = u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32;
 
-    let fctrl = bytes[5];
-    let fopts_len = (fctrl & 0x0F) as usize;
+    // Bit meanings in FCtrl differ between uplink and downlink.
+    let uplink = matches!(mtype, MType::UnconfirmedDataUp | MType::ConfirmedDataUp);
+    let fctrl = FCtrl::parse(bytes[5], uplink);
+    let fopts_len = fctrl.f_opts_len as usize;
 
-    // FPort sits immediately after FHDR (1+4+1+2+fopts_len = 8+fopts_len)
+    // FPort sits immediately after FHDR (1+4+1+2+fopts_len = 8+fopts_len), but
+    // only when something lies between the FHDR and the MIC.  A frame that
+    // ends right after the FHDR (a bare ACK, for instance) has no FPort, and
+    // the byte at that position is the first byte of the MIC.
     let fport_idx = 8 + fopts_len;
-    let fport = if bytes.len() > fport_idx {
+    let fport = if bytes.len() > fport_idx + MIC_LEN {
         Some(bytes[fport_idx])
     } else {
         None
@@ -131,21 +184,10 @@ fn decode_data_frame(bytes: &[u8], mtype: MType, payload_size: u16) -> Option<De
         dev_addr: Some(dev_addr),
         fcnt: Some(fcnt),
         fport,
+        fctrl: Some(fctrl),
         payload_size,
         ..Default::default()
     })
-}
-
-/// Format a little-endian EUI byte slice as colon-separated big-endian hex.
-///
-/// Example: bytes `[0x01, 0x02, ..., 0x08]` → `"08:07:06:05:04:03:02:01"`
-fn format_eui_le(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .rev()
-        .map(|b| format!("{:02X}", b))
-        .collect::<Vec<_>>()
-        .join(":")
 }
 
 #[cfg(test)]
@@ -172,6 +214,8 @@ mod tests {
         assert_eq!(frame.join_eui.as_deref(), Some("00:00:00:00:00:00:00:01"));
         // DevEUI LE [08,07,06,05,04,03,02,01] → BE → "01:02:03:04:05:06:07:08"
         assert_eq!(frame.dev_eui.as_deref(), Some("01:02:03:04:05:06:07:08"));
+        assert_eq!(frame.dev_nonce, Some(1));
+        assert_eq!(frame.fctrl, None);
         assert_eq!(frame.payload_size, 23);
     }
 
@@ -233,10 +277,258 @@ mod tests {
         assert!(decode_phy("not!valid~base64").is_none());
     }
 
+    /// A well-formed data frame: FCnt 1, as many FOpts bytes as the low nibble
+    /// of `fctrl` announces, FPort 1, a 2-byte payload and a MIC.
+    fn data_frame(mhdr: u8, fctrl: u8) -> Vec<u8> {
+        let mut pkt = vec![mhdr];
+        pkt.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // DevAddr LE
+        pkt.push(fctrl);
+        pkt.extend_from_slice(&[0x01, 0x00]); // FCnt
+        pkt.extend(std::iter::repeat_n(0xEE, (fctrl & 0x0F) as usize)); // FOpts
+        pkt.push(0x01); // FPort
+        pkt.extend_from_slice(&[0xDE, 0xAD]); // FRMPayload
+        pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // MIC
+        pkt
+    }
+
+    fn join_request(dev_nonce: [u8; 2]) -> Vec<u8> {
+        let mut pkt = vec![0x00u8];
+        pkt.extend_from_slice(&[0x11; 8]); // JoinEUI LE
+        pkt.extend_from_slice(&[0x22; 8]); // DevEUI LE
+        pkt.extend_from_slice(&dev_nonce);
+        pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // MIC
+        pkt
+    }
+
+    fn uplink_fctrl(
+        adr: bool,
+        adr_ack_req: bool,
+        ack: bool,
+        class_b: bool,
+        f_opts_len: u8,
+    ) -> FCtrl {
+        FCtrl {
+            adr,
+            adr_ack_req: Some(adr_ack_req),
+            ack,
+            class_b: Some(class_b),
+            f_pending: None,
+            f_opts_len,
+        }
+    }
+
+    fn downlink_fctrl(adr: bool, ack: bool, f_pending: bool, f_opts_len: u8) -> FCtrl {
+        FCtrl {
+            adr,
+            adr_ack_req: None,
+            ack,
+            class_b: None,
+            f_pending: Some(f_pending),
+            f_opts_len,
+        }
+    }
+
+    // Uplink: bit7 ADR, bit6 ADRACKReq, bit5 ACK, bit4 ClassB.
+    #[test]
+    fn fctrl_uplink_bits() {
+        for mhdr in [0x40u8, 0x80] {
+            // UnconfirmedDataUp, ConfirmedDataUp
+            let cases = [
+                (0x00, uplink_fctrl(false, false, false, false, 0)),
+                (0x80, uplink_fctrl(true, false, false, false, 0)),
+                (0x40, uplink_fctrl(false, true, false, false, 0)),
+                (0x20, uplink_fctrl(false, false, true, false, 0)),
+                (0x10, uplink_fctrl(false, false, false, true, 0)),
+                (0xF0, uplink_fctrl(true, true, true, true, 0)),
+                (0xA5, uplink_fctrl(true, false, true, false, 5)),
+            ];
+            for (byte, expected) in cases {
+                let frame = decode_phy_bytes(&data_frame(mhdr, byte)).unwrap();
+                assert_eq!(
+                    frame.fctrl,
+                    Some(expected),
+                    "mhdr {mhdr:#04x} fctrl {byte:#04x}"
+                );
+            }
+        }
+    }
+
+    // Downlink: bit7 ADR, bit6 reserved, bit5 ACK, bit4 FPending.
+    #[test]
+    fn fctrl_downlink_bits() {
+        for mhdr in [0x60u8, 0xA0] {
+            // UnconfirmedDataDown, ConfirmedDataDown
+            let cases = [
+                (0x00, downlink_fctrl(false, false, false, 0)),
+                (0x80, downlink_fctrl(true, false, false, 0)),
+                (0x20, downlink_fctrl(false, true, false, 0)),
+                (0x10, downlink_fctrl(false, false, true, 0)),
+                // Bit 6 is reserved downlink: it must not leak into any flag.
+                (0x40, downlink_fctrl(false, false, false, 0)),
+                (0xF0, downlink_fctrl(true, true, true, 0)),
+                (0x93, downlink_fctrl(true, false, true, 3)),
+            ];
+            for (byte, expected) in cases {
+                let frame = decode_phy_bytes(&data_frame(mhdr, byte)).unwrap();
+                assert_eq!(
+                    frame.fctrl,
+                    Some(expected),
+                    "mhdr {mhdr:#04x} fctrl {byte:#04x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_data_frames_have_no_flags() {
+        // JoinRequest, JoinAccept, RejoinRequest, Proprietary
+        let frames: [Vec<u8>; 4] = [
+            join_request([0x01, 0x00]),
+            vec![0x20, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            vec![0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            vec![0xE0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        ];
+        for pkt in frames {
+            let frame = decode_phy_bytes(&pkt).unwrap();
+            assert_eq!(frame.fctrl, None, "mtype {:?}", frame.mtype);
+            assert_eq!(frame.fcnt, None, "mtype {:?}", frame.mtype);
+            assert_eq!(frame.fport, None, "mtype {:?}", frame.mtype);
+        }
+
+        // Only a JoinRequest carries a DevNonce.
+        for pkt in [
+            vec![0x20u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            data_frame(0x40, 0xFF),
+        ] {
+            assert_eq!(decode_phy_bytes(&pkt).unwrap().dev_nonce, None);
+        }
+    }
+
+    #[test]
+    fn join_request_dev_nonce() {
+        // DevNonce is little-endian: [0x34, 0x12] is 0x1234.
+        let frame = decode_phy_bytes(&join_request([0x34, 0x12])).unwrap();
+        assert_eq!(frame.mtype, MType::JoinRequest);
+        assert_eq!(frame.dev_nonce, Some(0x1234));
+
+        let frame = decode_phy_bytes(&join_request([0xFF, 0x00])).unwrap();
+        assert_eq!(frame.dev_nonce, Some(0x00FF));
+
+        // Data frames do not have one.
+        assert_eq!(
+            decode_phy_bytes(&data_frame(0x40, 0)).unwrap().dev_nonce,
+            None
+        );
+    }
+
+    #[test]
+    fn data_frame_fopts_len() {
+        for len in 0u8..=15 {
+            for (mhdr, uplink) in [(0x40u8, true), (0x60, false)] {
+                let frame = decode_phy_bytes(&data_frame(mhdr, 0x80 | len)).unwrap();
+                let fctrl = frame.fctrl.unwrap();
+                assert_eq!(fctrl.f_opts_len, len, "mhdr {mhdr:#04x}");
+                assert!(fctrl.adr, "FOptsLen must not disturb the flag bits");
+                assert_eq!(fctrl.class_b.is_some(), uplink);
+                assert_eq!(fctrl.f_pending.is_some(), !uplink);
+                // FPort follows the FOpts bytes, wherever they end.
+                assert_eq!(frame.fport, Some(1), "mhdr {mhdr:#04x} len {len}");
+                assert_eq!(frame.fcnt, Some(1));
+            }
+        }
+    }
+
+    #[test]
+    fn frame_without_fport_has_no_fport() {
+        // MHDR + DevAddr + FCtrl (ACK) + FCnt + MIC: a bare acknowledgement.
+        // The byte right after the FHDR is the first MIC byte, not an FPort.
+        let mut ack = vec![0x60u8];
+        ack.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // DevAddr LE
+        ack.push(0x20); // FCtrl: ACK, no FOpts
+        ack.extend_from_slice(&[0x07, 0x00]); // FCnt
+        ack.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // MIC
+        let frame = decode_phy_bytes(&ack).unwrap();
+        assert_eq!(frame.fport, None);
+        assert_eq!(frame.fcnt, Some(7));
+        assert!(frame.fctrl.unwrap().ack);
+
+        // The same with FOpts: they are skipped, and still no FPort follows.
+        let mut with_fopts = vec![0x60u8];
+        with_fopts.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        with_fopts.push(0x22); // FCtrl: ACK, 2 bytes of FOpts
+        with_fopts.extend_from_slice(&[0x07, 0x00]);
+        with_fopts.extend_from_slice(&[0x02, 0x01]); // FOpts
+        with_fopts.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(decode_phy_bytes(&with_fopts).unwrap().fport, None);
+
+        // Frames cut short inside or before the MIC cannot carry an FPort either.
+        for len in 8..ack.len() {
+            assert_eq!(
+                decode_phy_bytes(&ack[..len]).unwrap().fport,
+                None,
+                "len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_with_fport_and_empty_payload_reports_its_fport() {
+        // MHDR + FHDR + FPort + MIC, with no FRMPayload at all.
+        for fport in [0x00u8, 0x01, 0xDF, 0xFF] {
+            let mut pkt = vec![0x40u8];
+            pkt.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // DevAddr LE
+            pkt.push(0x00); // FCtrl
+            pkt.extend_from_slice(&[0x01, 0x00]); // FCnt
+            pkt.push(fport);
+            pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // MIC
+            let frame = decode_phy_bytes(&pkt).unwrap();
+            assert_eq!(frame.fport, Some(fport));
+            assert_eq!(frame.payload_size, 13);
+        }
+    }
+
+    #[test]
+    fn truncated_frames_have_no_header_fields() {
+        // Data frames need 8 bytes (MHDR + DevAddr + FCtrl + FCnt).
+        for mhdr in [0x40u8, 0x60, 0x80, 0xA0] {
+            let full = data_frame(mhdr, 0xFF);
+            for len in 1..8 {
+                let frame = decode_phy_bytes(&full[..len]).unwrap();
+                assert_eq!(frame.payload_size, len as u16);
+                assert_eq!(frame.dev_addr, None, "len {len}");
+                assert_eq!(frame.fcnt, None, "len {len}");
+                assert_eq!(frame.fport, None, "len {len}");
+                assert_eq!(frame.fctrl, None, "len {len}");
+                assert_eq!(frame.dev_nonce, None, "len {len}");
+            }
+            // 8 bytes is enough for the whole frame header.
+            let frame = decode_phy_bytes(&full[..8]).unwrap();
+            assert!(frame.dev_addr.is_some());
+            assert_eq!(frame.fcnt, Some(1));
+            assert!(frame.fctrl.is_some());
+        }
+
+        // JoinRequests need 19 bytes (everything but the MIC).
+        let full = join_request([0x34, 0x12]);
+        for len in 1..19 {
+            let frame = decode_phy_bytes(&full[..len]).unwrap();
+            assert_eq!(frame.mtype, MType::JoinRequest);
+            assert_eq!(frame.dev_eui, None, "len {len}");
+            assert_eq!(frame.join_eui, None, "len {len}");
+            assert_eq!(frame.dev_nonce, None, "len {len}");
+            assert_eq!(frame.fctrl, None, "len {len}");
+        }
+        let frame = decode_phy_bytes(&full[..19]).unwrap();
+        assert!(frame.dev_eui.is_some());
+        assert!(frame.join_eui.is_some());
+        assert_eq!(frame.dev_nonce, Some(0x1234));
+    }
+
     #[test]
     fn eui_le_formatting() {
         // Bytes in LE order → reversed to BE display
         let bytes = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
-        assert_eq!(format_eui_le(&bytes), "08:07:06:05:04:03:02:01");
+        let eui = Eui64::from_le_slice(&bytes).unwrap();
+        assert_eq!(eui.to_string(), "08:07:06:05:04:03:02:01");
     }
 }

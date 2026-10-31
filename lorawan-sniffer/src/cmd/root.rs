@@ -1,17 +1,20 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::core::eui::Eui64;
 use crate::core::filter::FilterRule;
 use crate::core::metadata::MessageRecord;
 use crate::core::storage::Storage;
 
 use crate::api;
-use crate::config::{self, Configuration};
+use crate::config::{self, Configuration, UdpMode};
+use crate::mqtt;
 use crate::proxy;
 
 /// How often the retention task sweeps the database for expired rows.
@@ -27,7 +30,7 @@ pub async fn run(config: &Configuration) -> Result<()> {
     // -----------------------------------------------------------------------
     // Filter rules
     // -----------------------------------------------------------------------
-    let filters = build_filters(config);
+    let filters = build_filters(config)?;
     info!("Loaded {} filter rule(s)", filters.len());
 
     // -----------------------------------------------------------------------
@@ -49,7 +52,18 @@ pub async fn run(config: &Configuration) -> Result<()> {
     // Capacity 512: at LoRaWAN rates this is never hit; slow WS clients lag.
     let (broadcast_tx, _broadcast_rx) = broadcast::channel::<Arc<String>>(512);
 
+    // Everywhere a captured record goes, behind one non-blocking `emit`.
+    let outputs = proxy::Outputs::new(record_tx, broadcast_tx.clone());
+
     let cancel = CancellationToken::new();
+
+    // MQTT publisher: the third consumer of every record, when enabled.
+    let outputs = if config.sniffer.mqtt.enabled {
+        let (mqtt_tx, mqtt_stats) = mqtt::start(&config.sniffer.mqtt, cancel.clone())?;
+        outputs.with_mqtt(mqtt_tx, mqtt_stats)
+    } else {
+        outputs
+    };
 
     // -----------------------------------------------------------------------
     // Storage writer task
@@ -91,19 +105,33 @@ pub async fn run(config: &Configuration) -> Result<()> {
     // -----------------------------------------------------------------------
     match config.gateway.protocol {
         config::Protocol::Udp => {
-            info!(
-                "Gateway protocol: UDP  downstream={} upstream={}:{}",
-                config.gateway.udp.downstream.bind,
-                config.gateway.udp.upstream.server,
-                config.gateway.udp.upstream.port,
-            );
+            let udp = &config.gateway.udp;
+            let upstream = match udp.mode {
+                UdpMode::Proxy => {
+                    info!(
+                        "Gateway protocol: UDP  mode=proxy  downstream={} upstream={}:{}",
+                        udp.downstream.bind, udp.upstream.server, udp.upstream.port,
+                    );
+                    Some(resolve_upstream(udp).await?)
+                }
+                UdpMode::Listen => {
+                    info!(
+                        "Gateway protocol: UDP  mode=listen  downstream={}",
+                        udp.downstream.bind,
+                    );
+                    None
+                }
+            };
+            if let Some(warning) = listen_filters_warning(config) {
+                warn!("{}", warning);
+            }
 
             tokio::select! {
                 result = proxy::udp::run(
-                    &config.gateway.udp,
+                    udp,
+                    upstream,
                     &filters,
-                    record_tx,
-                    broadcast_tx,
+                    outputs,
                     cancel.clone(),
                 ) => {
                     result?;
@@ -127,8 +155,7 @@ pub async fn run(config: &Configuration) -> Result<()> {
                 result = proxy::concentratord::run(
                     &config.gateway.concentratord,
                     &filters,
-                    record_tx,
-                    broadcast_tx,
+                    outputs,
                     cancel.clone(),
                 ) => {
                     result?;
@@ -245,16 +272,209 @@ async fn run_api(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn build_filters(config: &Configuration) -> Vec<FilterRule> {
+/// Resolve the LNS address once and make sure it does not lead back to the
+/// sniffer's own gateway-facing socket.
+///
+/// Every datagram the sniffer forwarded to such an address would arrive again
+/// as if a gateway had sent it, so this refuses to start instead.  Returns the
+/// first resolved address, which is the one the proxy uses.
+async fn resolve_upstream(udp: &config::UdpConfig) -> Result<SocketAddr> {
+    let server = &udp.upstream.server;
+    let port = udp.upstream.port;
+
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((server.as_str(), port))
+        .await
+        .with_context(|| format!("cannot resolve the UDP upstream server '{server}:{port}'"))?
+        .collect();
+    let first = *addrs.first().ok_or_else(|| {
+        anyhow!("the UDP upstream server '{server}:{port}' resolves to no address")
+    })?;
+
+    let bind: SocketAddr = udp.downstream.bind.parse().with_context(|| {
+        format!(
+            "the UDP downstream bind '{}' is not an IP address and port",
+            udp.downstream.bind
+        )
+    })?;
+    proxy::udp::loopguard::check_startup(bind, &addrs).map_err(|e| anyhow!(e))?;
+
+    Ok(first)
+}
+
+/// A warning for a configuration that has filter rules but cannot apply them:
+/// a listening UDP sniffer forwards nothing, so it never blocks anything.
+fn listen_filters_warning(config: &Configuration) -> Option<String> {
+    let listening = config.gateway.protocol == config::Protocol::Udp
+        && config.gateway.udp.mode == UdpMode::Listen;
+    if !listening || config.filters.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} filter rule(s) configured, but the UDP gateway is in listen mode: \
+         nothing is forwarded, so no rule can block anything and every message \
+         is recorded as captured",
+        config.filters.len()
+    ))
+}
+
+/// Compile the configured filter rules.
+///
+/// Fails on a gateway EUI that does not parse: a typo there would otherwise
+/// leave the rule matching no gateway at all, and the traffic it was meant to
+/// block would flow without any sign that the rule is dead.
+fn build_filters(config: &Configuration) -> Result<Vec<FilterRule>> {
     config
         .filters
         .iter()
-        .map(|f| FilterRule {
-            name: f.name.clone(),
-            enabled: f.enabled,
-            direction: f.direction.clone(),
-            suppress_ack: f.suppress_ack,
-            mtypes: f.mtype.clone(),
+        .enumerate()
+        .map(|(index, f)| {
+            let gateways = f
+                .gateways
+                .iter()
+                .map(|value| {
+                    value.parse::<Eui64>().map_err(|e| {
+                        anyhow!(
+                            "filter rule #{} ('{}'): bad gateway: {}",
+                            index + 1,
+                            f.name,
+                            e
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            Ok(FilterRule {
+                name: f.name.clone(),
+                enabled: f.enabled,
+                direction: f.direction.clone(),
+                suppress_ack: f.suppress_ack,
+                mtypes: f.mtype.clone(),
+                gateways,
+            })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_from(toml_text: &str) -> Configuration {
+        toml::from_str(toml_text).unwrap()
+    }
+
+    #[test]
+    fn gateway_euis_in_filters_are_parsed() {
+        let config = config_from(
+            r#"
+            [[filters]]
+              name = "only these"
+              enabled = true
+              gateways = ["AA:BB:CC:DD:00:11:22:33", "58a0cbfffe801234", "01-02-03-04-05-06-07-08"]
+            "#,
+        );
+
+        let rules = build_filters(&config).unwrap();
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].gateways,
+            vec![
+                Eui64([0xAA, 0xBB, 0xCC, 0xDD, 0x00, 0x11, 0x22, 0x33]),
+                Eui64([0x58, 0xA0, 0xCB, 0xFF, 0xFE, 0x80, 0x12, 0x34]),
+                Eui64([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]),
+            ]
+        );
+    }
+
+    #[test]
+    fn filters_without_gateways_apply_to_all() {
+        let config = config_from(
+            r#"
+            [[filters]]
+              name = "everyone"
+              enabled = true
+              mtype = ["JoinRequest"]
+            "#,
+        );
+
+        let rules = build_filters(&config).unwrap();
+
+        assert!(rules[0].gateways.is_empty());
+        assert_eq!(config.filters[0].gateways, Vec::<String>::new());
+    }
+
+    #[test]
+    fn invalid_gateway_eui_stops_startup() {
+        let config = config_from(
+            r#"
+            [[filters]]
+              name = "fine"
+              enabled = true
+              gateways = ["AA:BB:CC:DD:00:11:22:33"]
+
+            [[filters]]
+              name = "typo"
+              enabled = true
+              gateways = ["AA:BB:CC:DD:00:11:22:33", "AA:BB:CC:DD:00:11:22"]
+            "#,
+        );
+
+        let err = build_filters(&config).unwrap_err().to_string();
+
+        // The message names both the rule and the value that did not parse.
+        assert!(err.contains("typo"), "{err}");
+        assert!(err.contains("AA:BB:CC:DD:00:11:22"), "{err}");
+        assert!(err.contains("#2"), "{err}");
+    }
+
+    #[test]
+    fn listen_filters_warning_when_rules_set() {
+        let rules = r#"
+            [[filters]]
+              name = "join"
+              enabled = true
+              mtype = ["JoinRequest"]
+
+            [[filters]]
+              name = "other"
+              enabled = false
+        "#;
+        let listen = "[gateway.udp]\n mode = \"listen\"\n";
+
+        // Listen mode with rules: warn, and say how many rules are idle.
+        let warning = listen_filters_warning(&config_from(&format!("{listen}{rules}")))
+            .expect("rules in listen mode must warn");
+        assert!(warning.contains("2 filter rule(s)"), "{warning}");
+        assert!(warning.contains("listen mode"), "{warning}");
+
+        // Listen mode without rules: nothing to warn about.
+        assert_eq!(listen_filters_warning(&config_from(listen)), None);
+
+        // Proxy mode, which is the default, applies its rules.
+        assert_eq!(listen_filters_warning(&config_from(rules)), None);
+        let proxy = format!("[gateway.udp]\n mode = \"proxy\"\n{rules}");
+        assert_eq!(listen_filters_warning(&config_from(&proxy)), None);
+
+        // The UDP mode means nothing to Concentratord.
+        let concentratord = format!(
+            "[gateway]\n protocol = \"concentratord\"\n[gateway.udp]\n mode = \"listen\"\n{rules}"
+        );
+        assert_eq!(listen_filters_warning(&config_from(&concentratord)), None);
+    }
+
+    #[test]
+    fn invalid_gateway_eui_in_a_disabled_rule_still_stops_startup() {
+        // Disabling a rule must not hide its typo until someone re-enables it.
+        let config = config_from(
+            r#"
+            [[filters]]
+              name = "off"
+              enabled = false
+              gateways = ["nonsense"]
+            "#,
+        );
+
+        assert!(build_filters(&config).is_err());
+    }
 }

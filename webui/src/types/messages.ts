@@ -10,7 +10,8 @@ export type MType =
   | 'Unknown';
 
 export type Direction = 'up' | 'down';
-export type Status = 'Forwarded' | 'Blocked';
+// 'Captured' is used in listen mode, where nothing is forwarded or blocked.
+export type Status = 'Forwarded' | 'Blocked' | 'Captured';
 export type Protocol = 'udp' | 'concentratord';
 export type CrcStatus = 'Ok' | 'Fail' | 'NoCrc';
 
@@ -33,6 +34,28 @@ export interface MessageRecord {
   fport: number | null;
   payload_size: number;
   toa_ms: number | null;
+  // EUIs are colon-separated uppercase hex, e.g. "AA:BB:CC:DD:00:11:22:33".
+  gateway_eui: string | null;
+  // Join requests only.
+  join_eui: string | null;
+  dev_nonce: number | null;
+  // FCtrl flags of data frames. null means the flag does not exist for the
+  // frame's direction or type (e.g. f_pending on an uplink), as opposed to
+  // false, which means the bit was present and clear.
+  adr: boolean | null;
+  adr_ack_req: boolean | null;
+  ack: boolean | null;
+  class_b: boolean | null;
+  f_pending: boolean | null;
+  f_opts_len: number | null; // 0-15
+}
+
+/**
+ * Compact form of an EUI for narrow places: the last 8 hex digits without
+ * colons (e.g. "AA:BB:CC:DD:00:11:22:33" -> "00112233").
+ */
+export function shortEui(eui: string): string {
+  return eui.replace(/:/g, '').slice(-8);
 }
 
 export interface WsMessage {

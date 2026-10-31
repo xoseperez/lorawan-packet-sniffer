@@ -15,6 +15,7 @@ mod api;
 mod cmd;
 mod config;
 mod core;
+mod mqtt;
 mod proxy;
 
 #[derive(Parser)]
@@ -50,6 +51,11 @@ async fn main() {
     if let Some(Commands::Configfile {}) = &cli.command {
         cmd::configfile::run(&config);
         process::exit(0);
+    }
+
+    if let Err(e) = config::validate(&config) {
+        eprintln!("Configuration error: {:#}", e);
+        process::exit(1);
     }
 
     // -----------------------------------------------------------------------

@@ -187,8 +187,11 @@ details summary:focus-visible {
   flex: 1;
 }
 
-.filter-device { width: 110px; }
+.filter-device  { width: 110px; }
 .filter-select  { width: 90px; }
+/* Holds the 8-digit short EUI; a full EUI (shown only when two gateways
+   collide) is clipped here but visible in the opened list and the title. */
+.filter-gateway { width: 100px; }
 
 .filter-clear { color: var(--text-muted); }
 .filter-clear:hover { background: var(--bg-hover); }
@@ -359,6 +362,18 @@ tr:hover td { background: var(--bg-hover) !important; }
 }
 .status-dot-forwarded { background: var(--signal-good); }
 .status-dot-blocked   { background: var(--signal-poor);  }
+.status-dot-captured  { background: var(--text-muted); }
+
+/* ─── FCtrl flags ───
+   One fixed-width slot per flag so every letter stays in the same position
+   from row to row, whether neighbouring flags are set, clear or absent. */
+.flag {
+  display: inline-block;
+  width: 9px;
+  text-align: center;
+}
+.flag-on  { color: var(--text); font-weight: 700; }
+.flag-off { color: var(--text-muted); }
 
 /* ─── Signal quality ─── */
 .signal-good { color: var(--signal-good); }
@@ -370,8 +385,13 @@ tr:hover td { background: var(--bg-hover) !important; }
 .col-dir    { width: 28px; text-align: center; }
 .col-mtype  { width: 58px; }
 .col-device { width: 88px; }
+.col-gateway  { width: 70px; }
+.col-joineui  { width: 178px; }  /* full colon-separated EUI in the mono font */
+.col-devnonce { width: 52px; text-align: right; }
 .col-fcnt   { width: 44px; text-align: right; }
 .col-fport  { width: 28px; text-align: right; }
+.col-flags  { width: 58px; }
+.col-fopts  { width: 48px; text-align: right; }
 .col-freq   { width: 58px; text-align: right; }
 .col-dr     { width: 68px; }
 .col-rssi   { width: 44px; text-align: right; }

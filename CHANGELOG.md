@@ -7,14 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-31
+
 ### Added
 
+- **Multiple gateways in the UDP proxy.** The sniffer keeps one session per
+  gateway EUI, each with its own upstream socket towards the LNS, so the LNS
+  sees every gateway as a separate peer. A session follows the gateway's EUI
+  when its address or port changes, is released after an idle timeout
+  (`session_timeout`, default `5m`) and is capped (`max_gateways`, default
+  `100`); packets from new gateways beyond the cap are dropped with a
+  rate-limited warning without affecting existing ones.
+- **UDP listen mode** (`[gateway.udp] mode = "listen"`) for running without an
+  LNS: any number of gateways are recorded and nothing is forwarded. Optional
+  PUSH_ACK / PULL_ACK replies (`listen_acks`, on by default); downlinks are
+  never sent. A warning is logged at startup if blocking rules are configured,
+  since they have no effect.
+- **Gateway EUI on every record**, in both UDP and Concentratord modes
+  (Concentratord's gateway ID is learned from its uplinks and from a
+  `GetGatewayId` reply).
+- **JoinEUI and DevNonce** on join requests, and the **FCtrl flags** (ADR,
+  ADRACKReq, ACK, ClassB on uplinks; ADR, ACK, FPending on downlinks) and
+  **FOptsLen** on data frames, in the database, REST API, WebSocket feed, CSV
+  export and MQTT. Flags that do not apply to a frame are `null`, not `false`.
+- **Gateway-specific blocking rules:** `[[filters]]` accept an optional
+  `gateways` list of EUIs (with or without colons, any case). An invalid EUI is
+  a startup error.
+- **MQTT publishing** (`[sniffer.mqtt]`, disabled by default) over TCP or TLS,
+  with a topic template (`{gateway_eui}`, `{direction}`, `{mtype}`, `{status}`,
+  `{dev_addr}`, `{dev_eui}`), QoS 0–2, optional credentials and a CA file for
+  private brokers (public CA roots are bundled in the binary); a client
+  certificate and key enable mutual TLS. Publishing is best effort and never
+  slows forwarding: when the broker is down or slow, messages are dropped and
+  counted instead of queued without limit, and the client reconnects by itself.
+  Credentials and keys are never logged.
+- **Self-forwarding guard.** In proxy mode the sniffer refuses to start if its
+  upstream is its own gateway-facing port, reached through any of the machine's
+  addresses, and drops looped packets at runtime (NAT, Docker port forwarding)
+  without recording or forwarding them again.
+- **Database schema migrations** through `PRAGMA user_version`. Databases
+  created by v2.0.0 are upgraded in place on startup and keep their rows, with
+  the new fields empty.
+- **`Captured` message status** for messages seen in listen mode, shown as a
+  neutral grey dot in the WebUI and available in the status filter.
+- **WebUI:** a gateway column (the last 8 hex digits of the EUI, full EUI in the
+  tooltip) and a gateway filter, optional JoinEUI, DevNonce, flags and FOptsLen
+  columns in the column picker, and the new fields in the CSV export.
+- **Simulator tools:** `tools/gwsim.py` (simulated gateways and a fake LNS for
+  functional and load testing) and `tools/procstat.sh` (peak memory and open
+  descriptors of a running process).
 - **`docs/MOBILE.md`** — touchscreen optimization report with recommendations
   for the 800×600 tablet target device (tap target sizes, collapsible filter
   row, `<details>` reliability, font sizing).
 
 ### Changed
 
+- **The Docker image starts in listen mode when no upstream LNS is set**
+  (`GATEWAY_UDP_UPSTREAM_SERVER` unset or empty), and in proxy mode when it is.
+  New environment variables: `GATEWAY_UDP_MODE`, `GATEWAY_UDP_LISTEN_ACKS`,
+  `GATEWAY_UDP_SESSION_TIMEOUT`, `GATEWAY_UDP_MAX_GATEWAYS` and
+  `SNIFFER_MQTT_ENABLED`, `_SERVER`, `_PORT`, `_TLS`, `_CA_FILE`,
+  `_CLIENT_CERT_FILE`, `_CLIENT_KEY_FILE`, `_CLIENT_ID`, `_USERNAME`,
+  `_PASSWORD`, `_TOPIC`, `_QOS`.
+- **Environment values are inserted into the configuration literally.** A value
+  with quotes, backslashes or `$` (a password, for example) no longer breaks
+  parsing or gets expanded a second time, and a variable whose name is a prefix
+  of another no longer corrupts the longer one.
+- **ACKs are routed per gateway session** (PUSH_ACK to the source of the
+  gateway's last PUSH_DATA; PULL_ACK and PULL_RESP to the source of its last
+  PULL_DATA) instead of through a token map shared by all gateways. Packets are
+  still forwarded byte for byte.
+- Synthetic TX_ACKs for blocked downlinks carry the EUI of the gateway the
+  downlink was addressed to, instead of the last gateway seen.
 - **WebUI — visual design overhaul** (pure CSS, no new dependencies):
   - Direction column color-coded: uplink ▲ blue, downlink ▼ amber.
   - MType column renders a colored pill badge per category:
@@ -40,6 +104,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The two-crate workspace added complexity without benefit for a single-binary
   project with no external consumers; the `core/` module preserves the same
   architectural boundary enforced by convention rather than by the compiler.
+
+### Fixed
+
+- The default configuration forwarded packets to the sniffer itself, turning a
+  single packet into tens of thousands of records. This is now refused at
+  startup and cut at runtime.
+- FPort was read from the MIC on data frames that have no FPort.
+- The ACK token map was never pruned and could grow to 65,536 entries; it is
+  gone, replaced by per-gateway session state that is released when idle.
+- A single error on the LNS-facing UDP socket (for example connection refused
+  while the LNS was down) stopped the whole proxy; errors are now logged with
+  rate limiting and the proxy keeps running.
 
 ## [2.0.0] - 2026-03-06
 
@@ -91,5 +167,6 @@ protocols (Semtech UDP and ChirpStack Concentratord).
 - **Docker support** — single-stage `Dockerfile`; `make docker-buildx` pushes
   a multi-arch image (amd64 + arm64).
 
-[Unreleased]: https://github.com/xoseperez/lorawan-packet-sniffer-v2/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/xoseperez/lorawan-packet-sniffer-v2/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/xoseperez/lorawan-packet-sniffer-v2/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/xoseperez/lorawan-packet-sniffer-v2/releases/tag/v2.0.0

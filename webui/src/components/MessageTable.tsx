@@ -1,5 +1,5 @@
 import { TableVirtuoso, TableComponents } from 'react-virtuoso';
-import { MessageRecord, MType } from '../types/messages';
+import { MessageRecord, MType, Status, shortEui } from '../types/messages';
 import { ColumnConfig } from './ColumnPicker';
 
 type SortDir = 'asc' | 'desc';
@@ -72,6 +72,44 @@ function snrClass(snr: number | null, datarate: string): string {
   return 'signal-poor';
 }
 
+const STATUS_DOT: Record<Status, string> = {
+  Forwarded: 'forwarded',
+  Blocked:   'blocked',
+  Captured:  'captured',
+};
+
+// FCtrl flags in the fixed order they appear in the Flags column. A letter
+// means the flag is set, a dot means it is clear, and an empty slot means the
+// flag does not exist for this frame (e.g. FPending on an uplink). Keeping an
+// empty slot, rather than dropping it, keeps each letter in the same position
+// on every row.
+const FLAGS: { letter: string; field: 'adr' | 'adr_ack_req' | 'ack' | 'class_b' | 'f_pending' }[] = [
+  { letter: 'A', field: 'adr' },
+  { letter: 'R', field: 'adr_ack_req' },
+  { letter: 'K', field: 'ack' },
+  { letter: 'B', field: 'class_b' },
+  { letter: 'P', field: 'f_pending' },
+];
+
+const FLAGS_LEGEND =
+  'A = ADR, R = ADRACKReq, K = ACK, B = ClassB, P = FPending (· = clear, blank = not applicable)';
+
+function FlagsCell({ msg }: { msg: MessageRecord }) {
+  const hasAny = FLAGS.some(({ field }) => msg[field] != null);
+  return (
+    <td className="col-flags mono" title={hasAny ? FLAGS_LEGEND : undefined}>
+      {FLAGS.map(({ letter, field }) => {
+        const value = msg[field];
+        return (
+          <span key={letter} className={`flag ${value ? 'flag-on' : 'flag-off'}`}>
+            {value == null ? '' : value ? letter : '·'}
+          </span>
+        );
+      })}
+    </td>
+  );
+}
+
 function makeComponents(columns: ColumnConfig): TableComponents<MessageRecord> {
   return {
     TableRow: ({ item, ...props }) => (
@@ -106,8 +144,13 @@ export function MessageTable({ messages, columns, sortDir, onToggleSort, isLive 
           {columns.dir     && <th className="col-dir">Dir</th>}
           {columns.mtype   && <th className="col-mtype">Type</th>}
           {columns.device  && <th className="col-device">Device</th>}
+          {columns.gateway && <th className="col-gateway">Gateway</th>}
+          {columns.joinEui && <th className="col-joineui">JoinEUI</th>}
+          {columns.devNonce && <th className="col-devnonce" title="DevNonce">Nonce</th>}
           {columns.fcnt    && <th className="col-fcnt">FCnt</th>}
           {columns.fport   && <th className="col-fport">FP</th>}
+          {columns.flags   && <th className="col-flags" title={FLAGS_LEGEND}>Flags</th>}
+          {columns.fopts   && <th className="col-fopts">FOpts</th>}
           {columns.freq    && <th className="col-freq">Freq</th>}
           {columns.datarate && <th className="col-dr">DR</th>}
           {columns.rssi    && <th className="col-rssi">RSSI</th>}
@@ -124,7 +167,6 @@ export function MessageTable({ messages, columns, sortDir, onToggleSort, isLive 
 
 function RowCells({ msg, columns }: { msg: MessageRecord; columns: ColumnConfig }) {
   const device    = msg.dev_addr ?? msg.dev_eui ?? '';
-  const isBlocked = msg.status === 'Blocked';
   const mcat      = MTYPE_CAT[msg.mtype] ?? 'other';
 
   return (
@@ -145,8 +187,17 @@ function RowCells({ msg, columns }: { msg: MessageRecord; columns: ColumnConfig 
         </td>
       )}
       {columns.device  && <td className="col-device mono">{device}</td>}
+      {columns.gateway && (
+        <td className="col-gateway mono" title={msg.gateway_eui ?? undefined}>
+          {msg.gateway_eui ? shortEui(msg.gateway_eui) : ''}
+        </td>
+      )}
+      {columns.joinEui && <td className="col-joineui mono">{msg.join_eui ?? ''}</td>}
+      {columns.devNonce && <td className="col-devnonce mono">{msg.dev_nonce ?? ''}</td>}
       {columns.fcnt    && <td className="col-fcnt mono">{msg.fcnt ?? ''}</td>}
       {columns.fport   && <td className="col-fport mono">{msg.fport ?? ''}</td>}
+      {columns.flags   && <FlagsCell msg={msg} />}
+      {columns.fopts   && <td className="col-fopts mono">{msg.f_opts_len ?? ''}</td>}
       {columns.freq    && <td className="col-freq mono">{msg.freq_mhz.toFixed(3)}</td>}
       {columns.datarate && <td className="col-dr mono">{msg.datarate}</td>}
       {columns.rssi && (
@@ -167,7 +218,7 @@ function RowCells({ msg, columns }: { msg: MessageRecord; columns: ColumnConfig 
       )}
       {columns.status && (
         <td className="col-status" title={msg.status}>
-          <span className={`status-dot status-dot-${isBlocked ? 'blocked' : 'forwarded'}`} />
+          <span className={`status-dot status-dot-${STATUS_DOT[msg.status] ?? 'forwarded'}`} />
         </td>
       )}
     </>

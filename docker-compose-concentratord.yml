@@ -20,6 +20,11 @@ services:
       GATEWAY_CONCENTRATORD_UPSTREAM_EVENT_BIND: "ipc:///tmp/sniffer_event"
       GATEWAY_CONCENTRATORD_UPSTREAM_COMMAND_BIND: "ipc:///tmp/sniffer_command"
 
+      # Optional: also publish every captured message to an MQTT broker.
+      # See docker-compose-udp.yml for the full list of SNIFFER_MQTT_* variables.
+      # SNIFFER_MQTT_ENABLED: "true"
+      # SNIFFER_MQTT_SERVER: "mqtt.example.com"
+
     volumes:
 
       # Persistent SQLite database.

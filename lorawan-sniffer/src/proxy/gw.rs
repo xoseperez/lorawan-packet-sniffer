@@ -3,6 +3,7 @@
 ///
 /// Field numbers verified against:
 ///   https://github.com/chirpstack/chirpstack/blob/master/api/proto/gw/gw.proto
+/// and, for the gateway ID fields, against chirpstack_api 4.16.2.
 ///
 /// Only the fields accessed by the concentratord proxy are declared; prost
 /// silently skips unknown fields on decode, so missing fields are harmless.
@@ -84,7 +85,10 @@ pub struct UplinkTxInfo {
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UplinkRxInfo {
-    // fields 1–5: gateway_id, uplink_id, timestamps (skipped)
+    /// Gateway ID as 16 lowercase hex digits (EUI-64).
+    #[prost(string, tag = "1")]
+    pub gateway_id: String,
+    // fields 2–5: uplink_id, timestamps (skipped)
     #[prost(int32, tag = "6")]
     pub rssi: i32,
     #[prost(float, tag = "7")]
@@ -159,11 +163,14 @@ pub struct FskModulationInfo {
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DownlinkFrame {
-    // tags 1, 2 absent; tag 4 = downlink_id_legacy (skipped)
+    // tags 1, 2 absent; tag 4 = downlink_id_legacy; tag 6 = gateway_id_legacy (skipped)
     #[prost(uint32, tag = "3")]
     pub downlink_id: u32,
     #[prost(message, repeated, tag = "5")]
     pub items: Vec<DownlinkFrameItem>,
+    /// Gateway ID as 16 lowercase hex digits (EUI-64).  May be empty.
+    #[prost(string, tag = "7")]
+    pub gateway_id: String,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -182,6 +189,17 @@ pub struct DownlinkTxInfo {
     // tag 2 = power (skipped)
     #[prost(message, optional, tag = "3")]
     pub modulation: Option<Modulation>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GetGatewayId  (REP response to the GetGatewayId command)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetGatewayIdResponse {
+    /// Gateway ID as 16 lowercase hex digits (EUI-64).
+    #[prost(string, tag = "1")]
+    pub gateway_id: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

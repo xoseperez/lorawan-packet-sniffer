@@ -12,11 +12,23 @@ const MAX_MESSAGES = 10_000;
 // localStorage hook
 // ---------------------------------------------------------------------------
 
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
 function useLocalStorage<T>(key: string, initial: T): [T, (v: T) => void] {
   const [stored, setStored] = useState<T>(() => {
     try {
       const item = localStorage.getItem(key);
-      return item !== null ? (JSON.parse(item) as T) : initial;
+      if (item === null) return initial;
+      const parsed: unknown = JSON.parse(item);
+      // Settings saved by an older version lack the keys added since (new
+      // columns, new filters). Lay the stored values over the defaults so
+      // those keys still exist instead of staying undefined forever.
+      if (isPlainObject(initial) && isPlainObject(parsed)) {
+        return { ...initial, ...parsed } as T;
+      }
+      return parsed as T;
     } catch {
       return initial;
     }
@@ -140,6 +152,10 @@ export function App() {
       result = result.filter(m => m.status === filters.status);
     }
 
+    if (filters.gateway) {
+      result = result.filter(m => m.gateway_eui === filters.gateway);
+    }
+
     if (filters.timePreset !== 'all') {
       const ms = TIME_PRESET_MS[filters.timePreset];
       if (ms !== undefined) {
@@ -158,6 +174,16 @@ export function App() {
     return result;
   }, [messages, filters, sortDir]);
 
+  // Every gateway seen in the loaded messages (not just the filtered ones), so
+  // the gateway filter can always be switched to another gateway.
+  const gateways = useMemo(() => {
+    const seen = new Set<string>();
+    for (const m of messages) {
+      if (m.gateway_eui) seen.add(m.gateway_eui);
+    }
+    return [...seen].sort();
+  }, [messages]);
+
   const blockedCount = useMemo(
     () => messages.filter(m => m.status === 'Blocked').length,
     [messages],
@@ -172,9 +198,11 @@ export function App() {
       'dev_addr', 'dev_eui', 'fcnt', 'fport',
       'freq_mhz', 'datarate', 'rssi', 'snr', 'crc_status',
       'payload_size', 'toa_ms', 'blocked_by', 'source_protocol',
+      'gateway_eui', 'join_eui', 'dev_nonce',
+      'adr', 'adr_ack_req', 'ack', 'class_b', 'f_pending', 'f_opts_len',
     ];
 
-    const escape = (v: string | number | null | undefined): string => {
+    const escape = (v: string | number | boolean | null | undefined): string => {
       if (v === null || v === undefined) return '';
       const s = String(v);
       return s.includes(',') || s.includes('"') || s.includes('\n')
@@ -188,6 +216,8 @@ export function App() {
         m.dev_addr, m.dev_eui, m.fcnt, m.fport,
         m.freq_mhz, m.datarate, m.rssi, m.snr, m.crc_status,
         m.payload_size, m.toa_ms, m.blocked_by, m.source_protocol,
+        m.gateway_eui, m.join_eui, m.dev_nonce,
+        m.adr, m.adr_ack_req, m.ack, m.class_b, m.f_pending, m.f_opts_len,
       ].map(escape).join(','),
     );
 
@@ -208,7 +238,7 @@ export function App() {
           <span className="app-title-primary">LoRaWAN</span>
           <span className="app-title-secondary"> Sniffer</span>
         </span>
-        <FilterBar filters={filters} onChange={setFilters} />
+        <FilterBar filters={filters} onChange={setFilters} gateways={gateways} />
         <ColumnPicker columns={columns} onChange={setColumns} />
         <button
           className="export-btn"

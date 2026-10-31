@@ -9,8 +9,28 @@
     path="$SNIFFER_DATABASE_PATH"
     retention="$SNIFFER_DATABASE_RETENTION"
 
+  [sniffer.mqtt]
+    enabled=$SNIFFER_MQTT_ENABLED
+    server="$SNIFFER_MQTT_SERVER"
+    port=$SNIFFER_MQTT_PORT
+    tls=$SNIFFER_MQTT_TLS
+    ca_file="$SNIFFER_MQTT_CA_FILE"
+    client_cert_file="$SNIFFER_MQTT_CLIENT_CERT_FILE"
+    client_key_file="$SNIFFER_MQTT_CLIENT_KEY_FILE"
+    client_id="$SNIFFER_MQTT_CLIENT_ID"
+    username="$SNIFFER_MQTT_USERNAME"
+    password="$SNIFFER_MQTT_PASSWORD"
+    topic="$SNIFFER_MQTT_TOPIC"
+    qos=$SNIFFER_MQTT_QOS
+
 [gateway]
   protocol="$GATEWAY_PROTOCOL"
+
+  [gateway.udp]
+    mode="$GATEWAY_UDP_MODE"
+    listen_acks=$GATEWAY_UDP_LISTEN_ACKS
+    session_timeout="$GATEWAY_UDP_SESSION_TIMEOUT"
+    max_gateways=$GATEWAY_UDP_MAX_GATEWAYS
 
   [gateway.udp.downstream]
     bind="$GATEWAY_UDP_DOWNSTREAM_BIND"

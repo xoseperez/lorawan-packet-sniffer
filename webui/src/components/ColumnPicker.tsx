@@ -3,8 +3,13 @@ export interface ColumnConfig {
   dir: boolean;
   mtype: boolean;
   device: boolean;
+  gateway: boolean;
+  joinEui: boolean;
+  devNonce: boolean;
   fcnt: boolean;
   fport: boolean;
+  flags: boolean;
+  fopts: boolean;
   freq: boolean;
   datarate: boolean;
   rssi: boolean;
@@ -19,8 +24,15 @@ export const DEFAULT_COLUMNS: ColumnConfig = {
   dir: true,
   mtype: true,
   device: true,
+  // The short gateway form fits in the width left over at 800 px; the other
+  // new columns are opt-in because they would push the table past it.
+  gateway: true,
+  joinEui: false,
+  devNonce: false,
   fcnt: true,
   fport: true,
+  flags: false,
+  fopts: false,
   freq: true,
   datarate: true,
   rssi: true,
@@ -35,8 +47,13 @@ const LABELS: Record<keyof ColumnConfig, string> = {
   dir: 'Dir',
   mtype: 'Type',
   device: 'Device',
+  gateway: 'Gateway',
+  joinEui: 'JoinEUI',
+  devNonce: 'DevNonce',
   fcnt: 'FCnt',
   fport: 'FPort',
+  flags: 'Flags',
+  fopts: 'FOpts',
   freq: 'Freq',
   datarate: 'DR',
   rssi: 'RSSI',

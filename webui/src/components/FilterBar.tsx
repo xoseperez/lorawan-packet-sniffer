@@ -1,10 +1,11 @@
-import { MType } from '../types/messages';
+import { MType, Status, shortEui } from '../types/messages';
 
 export interface FilterState {
   device: string;
   mtype: MType[];
   direction: 'all' | 'up' | 'down';
-  status: 'all' | 'Forwarded' | 'Blocked';
+  status: 'all' | Status;
+  gateway: string; // gateway EUI, '' = all gateways
   timePreset: '5m' | '15m' | '1h' | '24h' | 'all';
 }
 
@@ -13,6 +14,7 @@ export const DEFAULT_FILTERS: FilterState = {
   mtype: [],
   direction: 'all',
   status: 'all',
+  gateway: '',
   timePreset: '5m',
 };
 
@@ -30,9 +32,33 @@ const ALL_MTYPES: { value: MType; label: string }[] = [
 interface Props {
   filters: FilterState;
   onChange: (f: FilterState) => void;
+  gateways: string[]; // EUIs of the gateways seen so far
 }
 
-export function FilterBar({ filters, onChange }: Props) {
+/**
+ * Option labels for the gateway select. The short form is used unless two
+ * gateways share the same last 8 digits, in which case those use the full EUI
+ * so they can still be told apart.
+ */
+function gatewayOptions(gateways: string[], selected: string) {
+  // A gateway saved in the filter may not have shown up in the loaded history
+  // yet; keep it in the list so the select does not silently show "All" while
+  // the filter is still applied.
+  const euis = selected && !gateways.includes(selected) ? [...gateways, selected] : gateways;
+
+  const shortCount = new Map<string, number>();
+  for (const eui of euis) {
+    const short = shortEui(eui);
+    shortCount.set(short, (shortCount.get(short) ?? 0) + 1);
+  }
+
+  return euis.map(eui => ({
+    value: eui,
+    label: (shortCount.get(shortEui(eui)) ?? 0) > 1 ? eui : shortEui(eui),
+  }));
+}
+
+export function FilterBar({ filters, onChange, gateways }: Props) {
   const update = (partial: Partial<FilterState>) =>
     onChange({ ...filters, ...partial });
 
@@ -96,6 +122,19 @@ export function FilterBar({ filters, onChange }: Props) {
         <option value="all">Status: All</option>
         <option value="Forwarded">Forwarded</option>
         <option value="Blocked">Blocked</option>
+        <option value="Captured">Captured</option>
+      </select>
+
+      <select
+        className="filter-select filter-gateway"
+        value={filters.gateway}
+        title={filters.gateway || undefined}
+        onChange={e => update({ gateway: e.target.value })}
+      >
+        <option value="">GW: All</option>
+        {gatewayOptions(gateways, filters.gateway).map(({ value, label }) => (
+          <option key={value} value={value}>{label}</option>
+        ))}
       </select>
 
       <select
