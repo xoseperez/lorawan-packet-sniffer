@@ -62,3 +62,31 @@ export interface WsMessage {
   type: 'message';
   data: MessageRecord;
 }
+
+/**
+ * The identifier a row can be labelled by: the DevAddr of a data frame, or the
+ * DevEUI of a join request. A record never carries both. Join accepts, rejoin
+ * requests, proprietary frames and truncated frames carry neither, so they
+ * have no identifier and cannot be labelled.
+ */
+export function deviceId(m: Pick<MessageRecord, 'dev_addr' | 'dev_eui'>): string | null {
+  return m.dev_addr ?? m.dev_eui ?? null;
+}
+
+/**
+ * Full set of labels, keyed by identifier. The server sends it when the
+ * socket connects and again whenever a client has lagged, so a receiver must
+ * replace what it holds rather than merge.
+ */
+export interface LabelsSnapshot {
+  type: 'labels';
+  data: Record<string, string>;
+}
+
+/** One label change. `label` is null when the label was removed. */
+export interface LabelEvent {
+  type: 'label';
+  data: { device: string; label: string | null };
+}
+
+export type LabelsFrame = LabelsSnapshot | LabelEvent;

@@ -10,11 +10,16 @@ Two roles, usable separately or together:
             forwarder, two UDP sockets: a "push" socket that sends PUSH_DATA
             (and receives PUSH_ACK) and a "pull" socket that sends PULL_DATA
             and TX_ACK (and receives PULL_ACK and PULL_RESP). Everything is
-            sent to --target.
+            sent to --target. Every gateway sends data uplinks from one fixed
+            DevAddr; --random-devaddr gives each uplink a new one, and
+            --joins N adds a JoinRequest (fixed DevEUI per gateway) every N
+            uplinks.
   lns       A fake network server. It answers PUSH_DATA with PUSH_ACK and
             PULL_DATA with PULL_ACK, sends PULL_RESP downlinks for a fraction
             of the uplinks to the source address of the gateway's latest
             PULL_DATA, and counts TX_ACKs and the source ports used per EUI.
+            Its summary also counts the uplink frames received by message
+            type and the distinct DevAddrs and DevEUIs in them.
   all       Both in the same process and event loop.
 
 Typical setup: gateways -> sniffer -> fake LNS, so the sniffer's upstream
@@ -34,6 +39,14 @@ upstream pointing at 127.0.0.1:1701):
 
     tools/gwsim.py all --lns-bind 127.0.0.1:1701 --target 127.0.0.1:1700 \\
         --count 1 --duration 60
+
+Traffic for trying device labels in the sniffer's WebUI: three gateways, each
+sending a JoinRequest every 5 uplinks (their DevEUIs are printed at start, so
+you know what to label), with every data uplink from a new random DevAddr, which
+also fills the sniffer's list of identifiers seen live:
+
+    tools/gwsim.py all --lns-bind 127.0.0.1:1701 --target 127.0.0.1:1700 \\
+        --count 3 --duration 120 --uplink-interval 1 --joins 5 --random-devaddr
 
 Only the fake LNS (for example behind a sniffer, with real gateways in front):
 
@@ -62,7 +75,10 @@ Packet formats follow the Semtech UDP protocol: version 2, a 2-byte random
 token, an identifier byte, then for PUSH_DATA, PULL_DATA and TX_ACK the 8-byte
 gateway EUI (big-endian) followed by an optional JSON body. Uplinks carry a
 structurally valid UnconfirmedDataUp frame (random MIC), downlinks an
-UnconfirmedDataDown frame. IPv4 only.
+UnconfirmedDataDown frame. With --joins, the PUSH_DATA of every Nth uplink
+carries a second frame, a structurally valid JoinRequest: MHDR 0x00, a fixed
+JoinEUI, the gateway's DevEUI (DE:AD:BE:EF:00:00:00:00 plus the gateway index),
+a random DevNonce and a random MIC. IPv4 only.
 """
 
 from __future__ import annotations
@@ -91,10 +107,19 @@ TX_ACK = 0x05
 HEADER = struct.Struct("!BHB")  # version, token, identifier
 HEADER_WITH_EUI = HEADER.size + 8
 
+MHDR_JOIN_REQUEST = 0x00
 MHDR_UNCONFIRMED_UP = 0x40
 MHDR_UNCONFIRMED_DOWN = 0x60
 MTYPE_UNCONFIRMED_UP = 2
 MTYPE_CONFIRMED_UP = 4
+# Names as the sniffer shows them, indexed by the MHDR bits 7..5.
+MTYPE_NAMES = ("JoinRequest", "JoinAccept", "UnconfirmedDataUp", "UnconfirmedDataDown",
+               "ConfirmedDataUp", "ConfirmedDataDown", "RejoinRequest", "Proprietary")
+
+# JoinRequests (--joins): one JoinEUI for everybody, and a DevEUI per gateway
+# made of this base plus the gateway's index.
+JOIN_EUI = 0xCAFE000000000001
+DEVEUI_BASE = 0xDEADBEEF00000000
 
 # EU868 default channel plan: (frequency MHz, IF channel, RF chain).
 CHANNELS = [
@@ -129,6 +154,11 @@ def fmt_eui(eui: int) -> str:
     return "%016X" % eui
 
 
+def fmt_eui_colon(eui: int) -> str:
+    """Colon-separated upper-case hex, the way the sniffer shows a DevEUI."""
+    return ":".join("%02X" % b for b in eui.to_bytes(8, "big"))
+
+
 def compact_json(obj) -> bytes:
     return json.dumps(obj, separators=(",", ":")).encode()
 
@@ -156,6 +186,17 @@ def build_uplink(devaddr: int, fcnt: int) -> bytes:
     )
 
 
+def build_join_request(join_eui: int, dev_eui: int, dev_nonce: int) -> bytes:
+    """JoinRequest: MHDR, JoinEUI (LE), DevEUI (LE), DevNonce (LE), MIC."""
+    return (
+        bytes([MHDR_JOIN_REQUEST])
+        + join_eui.to_bytes(8, "little")
+        + dev_eui.to_bytes(8, "little")
+        + (dev_nonce & 0xFFFF).to_bytes(2, "little")
+        + mic()
+    )
+
+
 def build_downlink(devaddr: int, fcnt: int) -> bytes:
     """UnconfirmedDataDown: MHDR, DevAddr (LE), FCtrl, FCnt (LE), FPort 1,
     four payload bytes, MIC."""
@@ -177,13 +218,18 @@ def parse_header(data: bytes):
     return HEADER.unpack_from(data)
 
 
-def uplink_devaddr(rxpk) -> "int | None":
-    """DevAddr of a data-up frame carried in one rxpk entry, else None."""
+def rxpk_phy(rxpk) -> "bytes | None":
+    """The LoRaWAN frame carried in one rxpk entry, else None."""
     try:
-        phy = base64.b64decode(rxpk["data"])
+        return base64.b64decode(rxpk["data"])
     except (KeyError, TypeError, ValueError):
         return None
-    if len(phy) < 12 or (phy[0] >> 5) not in (MTYPE_UNCONFIRMED_UP, MTYPE_CONFIRMED_UP):
+
+
+def uplink_devaddr(rxpk) -> "int | None":
+    """DevAddr of a data-up frame carried in one rxpk entry, else None."""
+    phy = rxpk_phy(rxpk)
+    if phy is None or len(phy) < 12 or (phy[0] >> 5) not in (MTYPE_UNCONFIRMED_UP, MTYPE_CONFIRMED_UP):
         return None
     return int.from_bytes(phy[1:5], "little")
 
@@ -273,17 +319,22 @@ class SimGateway:
     """One simulated forwarder with separate push and pull sockets."""
 
     def __init__(self, reactor: Reactor, index: int, eui: int, target, keepalive: float,
-                 uplink_interval: float) -> None:
+                 uplink_interval: float, joins: int = 0, random_devaddr: bool = False) -> None:
         self.reactor = reactor
         self.index = index
         self.eui = eui
         self.eui_bytes = eui.to_bytes(8, "big")
         # Unique per gateway as long as the EUIs differ in their low 24 bits.
         self.devaddr = 0x26000000 | (eui & 0x00FFFFFF)
+        # The DevEUI of this gateway's JoinRequests, fixed for the whole run.
+        self.dev_eui = DEVEUI_BASE + index
         self.target = target
         self.keepalive = keepalive
         self.uplink_interval = uplink_interval
+        self.joins = joins  # a JoinRequest every this many uplinks; 0 = never
+        self.random_devaddr = random_devaddr
         self.fcnt = 0
+        self.uplinks = 0
         self.t0 = time.monotonic()
         self.stopped = False
 
@@ -292,6 +343,7 @@ class SimGateway:
 
         self.push_sent = 0
         self.push_acked = 0
+        self.join_sent = 0
         self.pull_sent = 0
         self.pull_acked = 0
         self.pull_resp = 0
@@ -333,10 +385,17 @@ class SimGateway:
             return False
         return True
 
-    def _rxpk(self) -> dict:
-        freq, chan, rfch = random.choice(CHANNELS)
-        phy = build_uplink(self.devaddr, self.fcnt)
+    def _data_uplink(self) -> dict:
+        devaddr = random.getrandbits(32) if self.random_devaddr else self.devaddr
+        phy = build_uplink(devaddr, self.fcnt)
         self.fcnt = (self.fcnt + 1) & 0xFFFF
+        return self._rxpk(phy)
+
+    def _join_request(self) -> dict:
+        return self._rxpk(build_join_request(JOIN_EUI, self.dev_eui, random.getrandbits(16)))
+
+    def _rxpk(self, phy: bytes) -> dict:
+        freq, chan, rfch = random.choice(CHANNELS)
         return {
             "tmst": int((time.monotonic() - self.t0) * 1e6) & 0xFFFFFFFF,
             "freq": freq,
@@ -358,14 +417,21 @@ class SimGateway:
         now = time.monotonic()
         prune(self.push_out, now)
         token = fresh_token(self.push_out)
+        rxpk = [self._data_uplink()]
+        self.uplinks += 1
+        with_join = self.joins > 0 and self.uplinks % self.joins == 0
+        if with_join:
+            rxpk.append(self._join_request())
         datagram = (
             HEADER.pack(PROTOCOL_VERSION, token, PUSH_DATA)
             + self.eui_bytes
-            + compact_json({"rxpk": [self._rxpk()]})
+            + compact_json({"rxpk": rxpk})
         )
         if self._send(self.push_sock, datagram):
             self.push_out[token] = now
             self.push_sent += 1
+            if with_join:
+                self.join_sent += 1
         self.reactor.call_later(self.uplink_interval * random.uniform(0.8, 1.2), self.send_push)
 
     def send_pull(self) -> None:
@@ -454,6 +520,9 @@ class FakeLns:
         self.gateways = {}
         self.malformed = 0
         self.send_errors = 0
+        self.mtypes = {}  # uplink frames received, by message type name
+        self.devaddrs = set()  # distinct DevAddrs seen in data uplinks
+        self.deveuis = set()  # distinct DevEUIs seen in join requests
         reactor.add_reader(self.sock, self.on_readable)
 
     def close(self) -> None:
@@ -503,13 +572,14 @@ class FakeLns:
         gw.push_addrs.add(addr)
         gw.push_data += 1
         self._send(HEADER.pack(version, token, PUSH_ACK), addr)
-        if self.downlink_ratio <= 0.0 or random.random() >= self.downlink_ratio:
-            return
         try:
             rxpk_list = json.loads(body)["rxpk"]
         except (ValueError, KeyError, TypeError):
             return
         if not isinstance(rxpk_list, list):
+            return
+        self.count_frames(rxpk_list)
+        if self.downlink_ratio <= 0.0 or random.random() >= self.downlink_ratio:
             return
         for rxpk in rxpk_list:
             devaddr = uplink_devaddr(rxpk) if isinstance(rxpk, dict) else None
@@ -517,6 +587,20 @@ class FakeLns:
                 tmst = rxpk.get("tmst", 0)
                 self.send_downlink(gw, devaddr, tmst if isinstance(tmst, int) else 0)
                 return
+
+    def count_frames(self, rxpk_list) -> None:
+        """Tally the frames of one PUSH_DATA by message type, DevAddr and DevEUI."""
+        for rxpk in rxpk_list:
+            phy = rxpk_phy(rxpk) if isinstance(rxpk, dict) else None
+            if not phy:
+                continue
+            name = MTYPE_NAMES[phy[0] >> 5]
+            self.mtypes[name] = self.mtypes.get(name, 0) + 1
+            if name == "JoinRequest" and len(phy) >= 17:
+                self.deveuis.add(int.from_bytes(phy[9:17], "little"))
+            devaddr = uplink_devaddr(rxpk)
+            if devaddr is not None:
+                self.devaddrs.add(devaddr)
 
     def on_pull_data(self, version: int, token: int, eui: int, addr) -> None:
         gw = self._gateway(eui)
@@ -581,24 +665,27 @@ def gateway_summary_line(gws, elapsed: float) -> str:
     no_pull = sum(1 for g in gws if g.pull_acked == 0)
     stray = sum(g.stray + g.bad_token + g.bad_downlink for g in gws)
     errors = sum(g.send_errors for g in gws)
+    joins = sum(g.join_sent for g in gws)
     return (
         "[%7.1fs] gw:  %d gateways | push acked %d/%d | pull acked %d/%d | downlinks %d"
-        " | without push ack %d | without pull ack %d | stray %d | send errors %d"
+        " | without push ack %d | without pull ack %d | stray %d | send errors %d%s"
         % (elapsed, len(gws), push_acked, push_sent, pull_acked, pull_sent, downlinks,
-           no_push, no_pull, stray, errors)
+           no_push, no_pull, stray, errors, " | join requests %d" % joins if joins else "")
     )
 
 
 def lns_summary_line(lns: FakeLns, elapsed: float) -> str:
     gws = lns.gateways.values()
+    frames = ", ".join("%s %d" % kv for kv in sorted(lns.mtypes.items())) or "none"
     return (
         "[%7.1fs] lns: %d gateways | push %d | pull %d | downlinks %d (no pull address %d)"
         " | tx_ack %d (matched %d, errors %d) | malformed %d"
+        " | uplink frames: %s | distinct DevAddr %d, DevEUI %d"
         % (elapsed, len(lns.gateways), sum(g.push_data for g in gws),
            sum(g.pull_data for g in gws), sum(g.downlinks for g in gws),
            sum(g.no_pull_addr for g in gws), sum(g.tx_acks for g in gws),
            sum(g.tx_acks_matched for g in gws), sum(g.tx_ack_errors for g in gws),
-           lns.malformed)
+           lns.malformed, frames, len(lns.devaddrs), len(lns.deveuis))
     )
 
 
@@ -750,6 +837,12 @@ def add_gateway_args(p: argparse.ArgumentParser) -> None:
                    help="mean PUSH_DATA period per gateway, jittered +/-20%% (default 3)")
     p.add_argument("--eui-base", type=eui_base, default=0xAA555A0000000000, metavar="HEX",
                    help="EUI of the first gateway, 16 hex digits (default AA555A0000000000)")
+    p.add_argument("--joins", type=positive_int, default=0, metavar="N",
+                   help="every gateway also sends a JoinRequest, with its own fixed DevEUI, "
+                        "every N uplinks (default: none); the DevEUIs are printed at start")
+    p.add_argument("--random-devaddr", action="store_true",
+                   help="every data uplink uses a new random DevAddr instead of the "
+                        "gateway's fixed one (fills the sniffer's list of live identifiers)")
     p.add_argument("--allow-missing-acks", action="store_true",
                    help="exit 0 even if a gateway got no PUSH_ACK or PULL_ACK")
 
@@ -837,13 +930,24 @@ def main(argv=None) -> int:
             try:
                 for i in range(count):
                     gws.append(SimGateway(reactor, i, args.eui_base + i, args.target,
-                                          args.keepalive, args.uplink_interval))
+                                          args.keepalive, args.uplink_interval,
+                                          args.joins, args.random_devaddr))
             except OSError as exc:
                 sys.exit("gwsim: cannot open sockets for gateway %d: %s "
                          "(check `ulimit -n`)" % (len(gws), exc))
             out("%d gateways, EUIs %s..%s, target %s:%d, keepalive %gs, uplink interval %gs" % (
                 count, fmt_eui(gws[0].eui), fmt_eui(gws[-1].eui), args.target[0], args.target[1],
                 args.keepalive, args.uplink_interval))
+            if args.joins:
+                out("a JoinRequest every %d uplinks (JoinEUI %s); DevEUI per gateway:" % (
+                    args.joins, fmt_eui_colon(JOIN_EUI)))
+                for g in gws[:10]:
+                    out("  gateway %s  DevEUI %s" % (fmt_eui(g.eui), fmt_eui_colon(g.dev_eui)))
+                if len(gws) > 10:
+                    out("  ... (%d more, DevEUI %s plus the gateway's index)" % (
+                        len(gws) - 10, fmt_eui_colon(DEVEUI_BASE)))
+            if args.random_devaddr:
+                out("every data uplink uses a new random DevAddr")
             for g in gws:
                 g.start()
 

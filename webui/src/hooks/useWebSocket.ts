@@ -1,15 +1,22 @@
 import { useEffect, useRef, useState } from 'react';
-import { MessageRecord, WsMessage } from '../types/messages';
 
 export type WsStatus = 'connecting' | 'connected' | 'disconnected';
 
-export function useWebSocket(onMessage: (record: MessageRecord) => void): { status: WsStatus } {
+/**
+ * Keeps a WebSocket to `path` (e.g. '/ws') open, reconnecting after a drop, and
+ * hands every parsed JSON frame to `onEvent`. The handler decides which frame
+ * types it cares about; frames that are not valid JSON are ignored.
+ */
+export function useWebSocket<T>(
+  path: string,
+  onEvent: (event: T) => void,
+): { status: WsStatus } {
   const [status, setStatus] = useState<WsStatus>('connecting');
 
-  // Stable ref so connect() closure always calls the latest onMessage
+  // Stable ref so connect() closure always calls the latest onEvent
   // without needing to be re-created on every render.
-  const onMessageRef = useRef(onMessage);
-  onMessageRef.current = onMessage;
+  const onEventRef = useRef(onEvent);
+  onEventRef.current = onEvent;
 
   useEffect(() => {
     let ws: WebSocket | null = null;
@@ -19,7 +26,7 @@ export function useWebSocket(onMessage: (record: MessageRecord) => void): { stat
     function connect() {
       if (cancelled) return;
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = `${proto}//${location.host}/ws`;
+      const url = `${proto}//${location.host}${path}`;
 
       ws = new WebSocket(url);
       setStatus('connecting');
@@ -29,12 +36,13 @@ export function useWebSocket(onMessage: (record: MessageRecord) => void): { stat
       };
 
       ws.onmessage = (event: MessageEvent<string>) => {
+        let frame: T;
         try {
-          const msg = JSON.parse(event.data) as WsMessage;
-          if (msg.type === 'message') onMessageRef.current(msg.data);
+          frame = JSON.parse(event.data) as T;
         } catch {
-          // ignore malformed frames
+          return; // ignore malformed frames
         }
+        onEventRef.current(frame);
       };
 
       ws.onclose = () => {
@@ -54,7 +62,7 @@ export function useWebSocket(onMessage: (record: MessageRecord) => void): { stat
       if (reconnectTimer !== null) clearTimeout(reconnectTimer);
       ws?.close();
     };
-  }, []); // connect once; onMessage changes are handled via ref
+  }, [path]); // reconnect only if the path changes; onEvent changes are handled via ref
 
   return { status };
 }

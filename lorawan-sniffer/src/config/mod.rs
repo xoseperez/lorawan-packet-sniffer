@@ -56,6 +56,12 @@ impl Default for Sniffer {
 pub struct Api {
     pub bind: String,
     pub cors_origins: Vec<String>,
+    /// Host names the WebUI and API answer to, besides IP addresses and
+    /// `localhost`, which always work.  Written as a TOML array or as one
+    /// comma-separated string (see [`host_list`]); `["*"]` turns the check
+    /// off.  Checked by [`validate`].
+    #[serde(deserialize_with = "host_list")]
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for Api {
@@ -63,8 +69,58 @@ impl Default for Api {
         Api {
             bind: "0.0.0.0:8888".to_string(),
             cors_origins: vec![],
+            allowed_hosts: vec![],
         }
     }
+}
+
+/// Deserialize a list of host names from a TOML array of strings or from one
+/// string of names separated by commas.
+///
+/// The string form exists for Docker, where the setting is written as
+/// `allowed_hosts = "$SNIFFER_API_ALLOWED_HOSTS"` and a `$VAR` can only expand
+/// to text.  Both forms get the same treatment: every item is split on commas,
+/// trimmed, and dropped when empty, so an unset variable (an empty string) and
+/// a trailing comma both mean "nothing more to list" instead of becoming an
+/// empty name.
+fn host_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an array of host names or one string of comma-separated host names")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+            Ok(split_hosts(text))
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut hosts = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                hosts.extend(split_hosts(&item));
+            }
+            Ok(hosts)
+        }
+    }
+
+    deserializer.deserialize_any(Visitor)
+}
+
+fn split_hosts(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -456,9 +512,15 @@ pub(crate) fn push_toml_escaped(out: &mut String, value: &str) {
 /// Check settings that are only meaningful together or that would otherwise
 /// fail late and quietly.  Run once after loading, before anything starts.
 ///
-/// Only the MQTT section is checked, and only when MQTT is enabled: a disabled
-/// section is never used, so a leftover typo in it must not stop the sniffer.
+/// The API's `allowed_hosts` is always checked: it guards the WebUI whether or
+/// not anything else is enabled.  The MQTT section is checked only when MQTT
+/// is enabled: a disabled section is never used, so a leftover typo in it must
+/// not stop the sniffer.
 pub fn validate(cfg: &Configuration) -> Result<()> {
+    // This has to stay ahead of the early return below, which skips every
+    // check after it when MQTT is off.
+    validate_allowed_hosts(&cfg.sniffer.api.allowed_hosts)?;
+
     let mqtt = &cfg.sniffer.mqtt;
     if !mqtt.enabled {
         return Ok(());
@@ -490,6 +552,92 @@ pub fn validate(cfg: &Configuration) -> Result<()> {
                 fs::File::open(path)
                     .with_context(|| format!("[sniffer.mqtt] cannot read {} '{}'", key, path))?;
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether `byte` may appear in a host name: ASCII letters and digits, `-`,
+/// `_` and `.`.  The Host check uses the same rule, so that it only ever
+/// suggests a name this validation accepts.
+pub(crate) fn is_host_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+}
+
+/// Each entry of `allowed_hosts` must be a bare host name, or the list must be
+/// exactly `["*"]`.
+///
+/// A wrong entry would not fail anywhere else: a name that carries a port or
+/// a scheme can never equal the host of a request, so the WebUI would simply
+/// stay unreachable by that name, with only a 403 to show for it.  Failing at
+/// startup, with the reason, is kinder than that.
+fn validate_allowed_hosts(hosts: &[String]) -> Result<()> {
+    const SETTING: &str = "[sniffer.api] allowed_hosts";
+
+    if hosts.len() > 1 && hosts.iter().any(|host| host == "*") {
+        anyhow::bail!(
+            "{SETTING}: \"*\" turns the host check off, so it must be the only entry; \
+             remove the other names or remove \"*\""
+        );
+    }
+
+    for host in hosts {
+        if host == "*" {
+            continue;
+        }
+        if host.is_empty() {
+            anyhow::bail!("{SETTING}: an entry is empty");
+        }
+        if host.contains('*') {
+            anyhow::bail!(
+                "{SETTING}: '{host}' uses a wildcard, which is not supported; list each \
+                 host name, or use [\"*\"] alone to turn the host check off (unsafe)"
+            );
+        }
+        if host.contains(char::is_whitespace) {
+            anyhow::bail!("{SETTING}: '{host}' contains whitespace; list bare host names");
+        }
+        if host.contains("://") {
+            anyhow::bail!(
+                "{SETTING}: '{host}' contains a scheme; list the bare host name, without \
+                 \"http://\" or \"https://\""
+            );
+        }
+        if host.contains('/') {
+            anyhow::bail!(
+                "{SETTING}: '{host}' contains a '/'; list the bare host name, without a path"
+            );
+        }
+        if host.contains('@') {
+            anyhow::bail!(
+                "{SETTING}: '{host}' contains an '@'; list the bare host name, without \
+                 user information"
+            );
+        }
+        if host.contains(':') {
+            anyhow::bail!(
+                "{SETTING}: '{host}' contains a ':'; list the bare host name, without a port. \
+                 IP addresses (IPv4 and IPv6, with any port) are always allowed and never \
+                 need an entry"
+            );
+        }
+        // Browsers send an internationalised name in its ASCII (punycode)
+        // form, so an entry written with other characters could never match.
+        if host.starts_with('$') {
+            // The environment expansion leaves a reference to an unset
+            // variable as written, and startup stops here before the
+            // warning about it can be logged.
+            anyhow::bail!(
+                "{SETTING}: '{host}' looks like a reference to an environment variable \
+                 that is not set; define the variable or list the host names themselves"
+            );
+        }
+        if !host.bytes().all(is_host_name_byte) {
+            anyhow::bail!(
+                "{SETTING}: '{host}' is not a valid host name; use letters, digits, '-', '_' \
+                 and '.' only (for an internationalised name, its ASCII \"xn--\" form)"
+            );
         }
     }
 
@@ -683,6 +831,204 @@ mod tests {
         assert!(!err.contains("canary-7f3e"), "{err}");
     }
 
+    // --- [sniffer.api] allowed_hosts ---
+
+    fn allowed_hosts_of(toml_text: &str) -> Vec<String> {
+        parse(toml_text).sniffer.api.allowed_hosts
+    }
+
+    /// The error `validate` gives for a configuration, which must come even
+    /// though MQTT is off (the default).
+    fn allowed_hosts_error(toml_text: &str) -> String {
+        let cfg = parse(toml_text);
+        assert!(!cfg.sniffer.mqtt.enabled);
+        format!("{:#}", validate(&cfg).unwrap_err())
+    }
+
+    #[test]
+    fn allowed_hosts_defaults_to_nothing() {
+        assert!(Configuration::default()
+            .sniffer
+            .api
+            .allowed_hosts
+            .is_empty());
+        assert!(allowed_hosts_of("").is_empty());
+        assert!(allowed_hosts_of("[sniffer.api]\nbind = \"127.0.0.1:1\"\n").is_empty());
+        assert!(validate(&Configuration::default()).is_ok());
+    }
+
+    #[test]
+    fn allowed_hosts_accepts_an_array() {
+        let cfg = parse(
+            "[sniffer.api]\nallowed_hosts = [\"sniffer.example.com\", \"lab-pc\", \"Other.Example\"]\n",
+        );
+
+        assert_eq!(
+            cfg.sniffer.api.allowed_hosts,
+            ["sniffer.example.com", "lab-pc", "Other.Example"]
+        );
+        assert!(validate(&cfg).is_ok());
+        assert!(allowed_hosts_of("[sniffer.api]\nallowed_hosts = []\n").is_empty());
+    }
+
+    #[test]
+    fn allowed_hosts_accepts_a_comma_separated_string() {
+        assert_eq!(
+            allowed_hosts_of("[sniffer.api]\nallowed_hosts = \"sniffer.example.com\"\n"),
+            ["sniffer.example.com"]
+        );
+        // Spaces around the commas, and empty pieces, are not part of any name.
+        assert_eq!(
+            allowed_hosts_of(
+                "[sniffer.api]\nallowed_hosts = \"  a.example ,b.example,, c.example ,\"\n"
+            ),
+            ["a.example", "b.example", "c.example"]
+        );
+        let cfg = parse("[sniffer.api]\nallowed_hosts = \"a.example,b.example\"\n");
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn allowed_hosts_empty_string_means_none() {
+        // What Docker produces when SNIFFER_API_ALLOWED_HOSTS is left empty.
+        for value in ["\"\"", "\"  \"", "\",\"", "[\"\"]", "[]"] {
+            let text = format!("[sniffer.api]\nallowed_hosts = {value}\n");
+            assert!(allowed_hosts_of(&text).is_empty(), "{value}");
+            assert!(validate(&parse(&text)).is_ok(), "{value}");
+        }
+    }
+
+    #[test]
+    fn allowed_hosts_splits_commas_inside_array_items_too() {
+        // `["$VAR"]` with a comma-separated value behaves like the string form.
+        assert_eq!(
+            allowed_hosts_of(
+                "[sniffer.api]\nallowed_hosts = [\"a.example, b.example\", \"c.example\"]\n"
+            ),
+            ["a.example", "b.example", "c.example"]
+        );
+    }
+
+    #[test]
+    fn allowed_hosts_rejects_other_value_types() {
+        for value in ["5", "true", "[1, 2]", "{ a = 1 }"] {
+            let text = format!("[sniffer.api]\nallowed_hosts = {value}\n");
+            let err = toml::from_str::<Configuration>(&text).err().unwrap();
+            assert!(err.to_string().contains("allowed_hosts"), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn allowed_hosts_read_from_an_environment_variable() {
+        let text = "[sniffer.api]\nallowed_hosts=\"$SNIFFER_API_ALLOWED_HOSTS\"\n";
+
+        let list = [("SNIFFER_API_ALLOWED_HOSTS", "a.example, b.example")];
+        assert_eq!(
+            allowed_hosts_of(&expand_env(text, lookup_in(&list))),
+            ["a.example", "b.example"]
+        );
+
+        // A variable the entrypoint left empty.
+        let empty = [("SNIFFER_API_ALLOWED_HOSTS", "")];
+        assert!(allowed_hosts_of(&expand_env(text, lookup_in(&empty))).is_empty());
+
+        // The star arrives as a one-entry list.
+        let star = [("SNIFFER_API_ALLOWED_HOSTS", "*")];
+        assert_eq!(allowed_hosts_of(&expand_env(text, lookup_in(&star))), ["*"]);
+    }
+
+    #[test]
+    fn validate_accepts_plain_host_names() {
+        for host in [
+            "sniffer.example.com",
+            "Sniffer.Example.COM",
+            "lab-pc",
+            "lab_pc",
+            "sniffer.local.",
+            "xn--bcher-kva.example",
+            "192.168.1.5",
+        ] {
+            let cfg = parse(&format!("[sniffer.api]\nallowed_hosts = [\"{host}\"]\n"));
+            assert!(validate(&cfg).is_ok(), "{host}");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_lone_star() {
+        for text in [
+            "[sniffer.api]\nallowed_hosts = [\"*\"]\n",
+            "[sniffer.api]\nallowed_hosts = \"*\"\n",
+            "[sniffer.api]\nallowed_hosts = \" * ,\"\n",
+        ] {
+            let cfg = parse(text);
+            assert_eq!(cfg.sniffer.api.allowed_hosts, ["*"], "{text}");
+            assert!(validate(&cfg).is_ok(), "{text}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_star_next_to_names() {
+        for text in [
+            "[sniffer.api]\nallowed_hosts = [\"*\", \"a.example\"]\n",
+            "[sniffer.api]\nallowed_hosts = [\"a.example\", \"*\"]\n",
+            "[sniffer.api]\nallowed_hosts = \"a.example,*\"\n",
+            "[sniffer.api]\nallowed_hosts = [\"*\", \"*\"]\n",
+        ] {
+            let err = allowed_hosts_error(text);
+            assert!(
+                err.contains("allowed_hosts") && err.contains("only entry"),
+                "{text}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_entries_that_are_not_bare_host_names() {
+        let cases = [
+            ("sniffer.example.com:8888", "port"),
+            ("localhost:8888", "port"),
+            ("::1", "IP addresses"),
+            ("[::1]:8888", "IP addresses"),
+            ("http://sniffer.example.com", "scheme"),
+            ("https://sniffer.example.com:8443/", "scheme"),
+            ("sniffer.example.com/ui", "'/'"),
+            ("user@sniffer.example.com", "'@'"),
+            ("two words", "whitespace"),
+            ("*.example.com", "wildcard"),
+            ("sniffer*", "wildcard"),
+            ("b\u{fc}cher.example", "valid host name"),
+            ("$SNIFFER_NEVER_SET", "environment variable"),
+            ("a?b", "valid host name"),
+            ("a#b", "valid host name"),
+        ];
+
+        for (entry, reason) in cases {
+            let text = format!("[sniffer.api]\nallowed_hosts = [\"{entry}\"]\n");
+            let err = allowed_hosts_error(&text);
+            assert!(
+                err.contains("[sniffer.api] allowed_hosts")
+                    && err.contains(&format!("'{entry}'"))
+                    && err.contains(reason),
+                "{entry}: {err}"
+            );
+
+            // The same entry in the comma-separated form, next to a good one.
+            let text = format!("[sniffer.api]\nallowed_hosts = \"ok.example,{entry}\"\n");
+            assert!(validate(&parse(&text)).is_err(), "{entry}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_hosts_with_or_without_mqtt() {
+        for enabled in [false, true] {
+            let cfg = parse(&format!(
+                "[sniffer.mqtt]\nenabled = {enabled}\n[sniffer.api]\nallowed_hosts = \"host:80\"\n"
+            ));
+            let err = format!("{:#}", validate(&cfg).unwrap_err());
+            assert!(err.contains("allowed_hosts"), "mqtt {enabled}: {err}");
+        }
+    }
+
     // --- environment expansion ---
 
     #[test]
@@ -815,6 +1161,8 @@ mod tests {
             "/var/lib/lorawan-sniffer/sniffer.db"
         );
         assert!(!cfg.sniffer.mqtt.enabled);
+        // Only IP addresses and localhost until the operator lists a name.
+        assert!(cfg.sniffer.api.allowed_hosts.is_empty());
 
         // Next to an LNS on the same host: the sniffer must not take the
         // LNS's port, and the upstream must not be the sniffer itself.
@@ -822,6 +1170,31 @@ mod tests {
         assert_eq!(bind.port(), 1702);
         assert_eq!(cfg.gateway.udp.upstream.server, "127.0.0.1");
         assert_eq!(cfg.gateway.udp.upstream.port, 1700);
+    }
+
+    /// The commented `allowed_hosts` example in each sample file is what an
+    /// operator will uncomment, so it has to be valid as written.
+    #[test]
+    fn sample_allowed_hosts_example_works_once_uncommented() {
+        for (name, text) in [
+            ("sniffer.toml", include_str!("../../../sniffer.toml")),
+            (
+                "packaging/sniffer.toml",
+                include_str!("../../../packaging/sniffer.toml"),
+            ),
+        ] {
+            let example = "# allowed_hosts = [\"sniffer.example.com\"]";
+            assert!(text.contains(example), "{name} has no example");
+
+            let cfg = parse(&text.replace(example, &example[2..]));
+
+            assert_eq!(
+                cfg.sniffer.api.allowed_hosts,
+                ["sniffer.example.com"],
+                "{name}"
+            );
+            validate(&cfg).unwrap();
+        }
     }
 
     #[test]

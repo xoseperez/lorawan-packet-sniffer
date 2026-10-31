@@ -46,8 +46,8 @@ DOCKER_IMAGE=ghcr.io/yourname/lorawan-sniffer DOCKER_TAG=latest make docker-buil
 This is a Cargo workspace with a single crate:
 
 - **`lorawan-sniffer/`** — the binary, organised internally into:
-  - **`src/core/`** — protocol-agnostic logic: LoRaWAN PHY decoder, filter engine, SQLite storage, metadata types, ToA calculator.
-  - **`src/api/`** — HTTP/WebSocket server (axum).
+  - **`src/core/`** — protocol-agnostic logic: LoRaWAN PHY decoder, filter engine, SQLite storage, metadata types, ToA calculator, device-label validation (`labels.rs`) and the live-identifier list (`seen.rs`).
+  - **`src/api/`** — HTTP/WebSocket server (axum): Host check, label endpoints and the `LabelWriter` task.
   - **`src/proxy/`** — UDP and Concentratord MITM backends.
   - **`src/cmd/`** — run loop and `configfile` subcommand.
   - **`src/config/`** — TOML configuration structs and loader.
@@ -75,7 +75,8 @@ Gateway ──UDP/ZMQ──▶  Sniffer proxy  ──UDP/ZMQ──▶  LNS / Gat
 3. `core::filter::evaluate()` checks compiled `FilterRule`s — first match wins; no match = forward.
 4. Results are assembled into a `MessageRecord` (the canonical cross-protocol representation defined in `core::metadata`).
 5. The record is sent to two async channels: `mpsc` → `Storage` (SQLite persistence) and `broadcast` → all connected WebSocket clients.
-6. The axum API server (`src/api/mod.rs`) handles `/ws` (live feed), `/api/messages` (REST history), and `/*` (embedded React SPA).
+6. The axum API server (`src/api/mod.rs`) handles `/ws` (live feed), `/ws/labels` (device labels: full set on connect, then one event per change), `/api/messages` (REST history), `/api/labels` (`GET`, `PUT`/`DELETE` on `/api/labels/{device}`), and `/*` (embedded React SPA). A Host check (`src/api/host.rs`, `[sniffer.api] allowed_hosts`) is the outermost layer for every request.
+7. A listener on the same `broadcast` channel notes which DevAddr/DevEUI values were seen live (`core/seen.rs`), so rows that never reached the database can still be labelled.
 
 ### Proxy backends
 
@@ -88,10 +89,11 @@ Gateway ──UDP/ZMQ──▶  Sniffer proxy  ──UDP/ZMQ──▶  LNS / Gat
 - `MType` — LoRaWAN message type decoded from MHDR bits [7:5].
 - `FilterRule` / `FilterDecision` — compiled filter rule and its evaluation result.
 - `Storage` — thin `Clone`able wrapper around an `Arc<Mutex<rusqlite::Connection>>`.
+- Device labels live outside `MessageRecord`: the `device_labels` table is keyed by identifier (`dev_addr`, else `dev_eui`, in the record's text form), and the WebUI joins labels to rows by that key. Labels never touch the forwarding path. Every label change goes through the `LabelWriter` task in `api/labels.rs`, which commits and then publishes on `/ws/labels`.
 
 ## WebUI Development
 
-The Vite dev server proxies `/ws` and `/api` to `localhost:8888`, so you can run the binary with a real config and iterate on the frontend independently:
+The Vite dev server proxies `/ws` (which also covers `/ws/labels`) and `/api` to `localhost:8888`, so you can run the binary with a real config and iterate on the frontend independently. The Host the sniffer sees is `localhost:5173`, which passes the Host check:
 
 ```bash
 # Terminal 1: run the sniffer
@@ -107,14 +109,16 @@ After any frontend change that needs to be embedded in the binary, run `make bui
 
 | File | Role |
 |---|---|
-| `src/App.tsx` | Layout shell; localStorage hooks; filtering/sorting logic; CSV export |
-| `src/components/MessageTable.tsx` | `TableVirtuoso` table; signal-quality coloring; MType badges |
-| `src/components/FilterBar.tsx` | Device input, MType multi-select, direction/status/time selects |
-| `src/components/ColumnPicker.tsx` | Column visibility toggle (persisted to `localStorage`) |
-| `src/components/StatusBar.tsx` | WS status indicator, live/pause toggle, copyright notice |
-| `src/hooks/useWebSocket.ts` | WebSocket connection with auto-reconnect |
+| `src/App.tsx` | Layout shell; localStorage hooks; filtering/sorting logic (the device filter also matches labels); label dialog state; CSV export (with the last `label` column) |
+| `src/components/MessageTable.tsx` | `TableVirtuoso` table; signal-quality coloring; MType badges; Label column (`LabelCell`, clickable only on rows that have an identifier) |
+| `src/components/LabelDialog.tsx` | Modal to set, change or remove the label of one identifier (DevAddr or DevEUI): text field limited to 64 characters, Save / Delete (only when a label exists) / Cancel, Enter saves, Escape or a click outside cancels, shows the server's error |
+| `src/components/FilterBar.tsx` | Device input (also matches labels), MType multi-select, status/gateway/time selects |
+| `src/components/ColumnPicker.tsx` | Column visibility toggle (persisted to `localStorage`); the Label column is hidden by default |
+| `src/components/StatusBar.tsx` | Row counts, WS status indicator, version and copyright notice (version from `package.json` via Vite `define`), live/pause toggle |
+| `src/hooks/useWebSocket.ts` | WebSocket connection with auto-reconnect, generic over the path and the event handler (`/ws` for messages, `/ws/labels` for labels) |
+| `src/hooks/useLabels.ts` | Label state (`Record<identifier, label>`), fed only by `/ws/labels` (a snapshot replaces it, an event updates one entry); `saveLabel` / `removeLabel` call `PUT` / `DELETE /api/labels/{device}` and return success or the API's error message, never writing state themselves, so a late HTTP response cannot overwrite a newer event |
 | `src/styles/index.css` | **All styling** — pure CSS, no framework |
-| `src/types/messages.ts` | TypeScript types (`MessageRecord`, `WsMessage`, etc.) |
+| `src/types/messages.ts` | TypeScript types (`MessageRecord`, `WsMessage`, label snapshot and event types, etc.) and `deviceId()`, the identifier of a row (`dev_addr` ?? `dev_eui` ?? none) |
 
 ### CSS Design System
 

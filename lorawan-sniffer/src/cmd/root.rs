@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use serde::Deserialize;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -11,15 +12,28 @@ use tokio_util::sync::CancellationToken;
 use crate::core::eui::Eui64;
 use crate::core::filter::FilterRule;
 use crate::core::metadata::MessageRecord;
+use crate::core::ratelimit::RateLimitedLog;
+use crate::core::seen::SeenDevices;
 use crate::core::storage::Storage;
 
-use crate::api;
+use crate::api::labels::{LabelWriter, WriterError};
+use crate::api::{self, ApiContext};
 use crate::config::{self, Configuration, UdpMode};
 use crate::mqtt;
 use crate::proxy;
 
-/// How often the retention task sweeps the database for expired rows.
-const RETENTION_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Longest wait between two retention sweeps.
+const MAX_SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Shortest wait between two retention sweeps.  Also keeps `interval` away
+/// from a zero period, which it rejects.
+const MIN_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Buffered capacity of the label event channel.  Labels change when a person
+/// edits one or the retention sweep removes some, so a client only falls
+/// behind when a sweep removes many at once, and a client that does gets the
+/// full set again instead of the events it missed.
+const LABELS_CHANNEL_CAPACITY: usize = 64;
 
 /// Buffered capacity of the record channel (records/messages).
 /// LoRaWAN rates are << 1000/s, so 1024 is plenty.
@@ -86,12 +100,36 @@ pub async fn run(config: &Configuration) -> Result<()> {
 
     // Broadcast hub: proxy tasks → WebSocket clients (pre-serialised JSON).
     // Capacity 512: at LoRaWAN rates this is never hit; slow WS clients lag.
-    let (broadcast_tx, _broadcast_rx) = broadcast::channel::<Arc<String>>(512);
+    // The first receiver feeds the live device list (see `run_seen_listener`);
+    // like any other receiver it can only lag, never slow the senders down.
+    let (broadcast_tx, seen_rx) = broadcast::channel::<Arc<String>>(512);
+
+    // Label changes → `/ws/labels` clients (pre-serialised JSON).
+    let (labels_tx, _) = broadcast::channel::<Arc<String>>(LABELS_CHANNEL_CAPACITY);
 
     // Everywhere a captured record goes, behind one non-blocking `emit`.
     let outputs = proxy::Outputs::new(record_tx, broadcast_tx.clone());
 
     let cancel = CancellationToken::new();
+
+    // -----------------------------------------------------------------------
+    // Live device list and label writer
+    //
+    // The list records which device identifiers have been seen in live
+    // traffic, so that a device whose records the storage writer dropped can
+    // still be labelled.  It is fed from the record broadcast, off the
+    // forwarding path.  The label writer is the one task that changes labels.
+    // -----------------------------------------------------------------------
+    let retention = config.sniffer.database.retention;
+    let seen = SeenDevices::new();
+    tokio::spawn(run_seen_listener(seen_rx, seen.clone(), cancel.clone()));
+    let label_writer = LabelWriter::spawn(
+        storage.clone(),
+        seen.clone(),
+        retention,
+        labels_tx.clone(),
+        cancel.clone(),
+    );
 
     // MQTT publisher: the third consumer of every record, when enabled.
     let outputs = if config.sniffer.mqtt.enabled {
@@ -117,23 +155,27 @@ pub async fn run(config: &Configuration) -> Result<()> {
     // -----------------------------------------------------------------------
     let api_cancel = cancel.clone();
     let api_bind = config.sniffer.api.bind.clone();
-    let api_cors = config.sniffer.api.cors_origins.clone();
-    let api_broadcast = broadcast_tx.clone();
-    let api_storage = storage.clone();
+    let api_context = ApiContext {
+        broadcast_tx: broadcast_tx.clone(),
+        labels_tx,
+        storage: storage.clone(),
+        writer: label_writer.clone(),
+        cors_origins: config.sniffer.api.cors_origins.clone(),
+        allowed_hosts: config.sniffer.api.allowed_hosts.clone(),
+    };
     tokio::spawn(async move {
-        run_api(api_broadcast, api_storage, api_bind, api_cors, api_cancel).await;
+        run_api(api_context, api_bind, api_cancel).await;
     });
 
     // -----------------------------------------------------------------------
     // Retention cleanup task
     //
-    // Periodically deletes rows older than the configured TTL.
+    // Periodically deletes rows older than the configured TTL, and the labels
+    // of devices that have disappeared.
     // -----------------------------------------------------------------------
-    let retention_storage = storage.clone();
-    let retention = config.sniffer.database.retention;
     let retention_cancel = cancel.clone();
     tokio::spawn(async move {
-        run_retention(retention_storage, retention, retention_cancel).await;
+        run_retention(label_writer, seen, retention, retention_cancel).await;
     });
 
     // -----------------------------------------------------------------------
@@ -256,25 +298,33 @@ async fn run_writer(
     }
 }
 
-/// Periodically delete rows older than `retention` from the database.
-async fn run_retention(storage: Storage, retention: Duration, cancel: CancellationToken) {
-    let mut interval = tokio::time::interval(RETENTION_INTERVAL);
+/// How long to wait between retention sweeps.
+///
+/// Half the retention period, so expired rows never linger for much more
+/// than a period and a short retention (as in tests and demonstrations) is
+/// pruned promptly, but never more often than once a second and never less
+/// often than every five minutes.  For any retention of ten minutes or more
+/// that is the five minutes the sweep has always used.
+fn sweep_interval(retention: Duration) -> Duration {
+    (retention / 2).clamp(MIN_SWEEP_INTERVAL, MAX_SWEEP_INTERVAL)
+}
+
+/// Periodically delete rows older than `retention` from the database, and
+/// the labels of devices that are gone.
+async fn run_retention(
+    writer: LabelWriter,
+    seen: SeenDevices,
+    retention: Duration,
+    cancel: CancellationToken,
+) {
+    let started = Instant::now();
+    let mut interval = tokio::time::interval(sweep_interval(retention));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let s = storage.clone();
-                let cutoff = Utc::now()
-                    - chrono::Duration::from_std(retention)
-                        .unwrap_or(chrono::Duration::days(30));
-
-                match tokio::task::spawn_blocking(move || s.delete_older_than(cutoff)).await {
-                    Ok(Ok(0)) => {}
-                    Ok(Ok(n)) => info!("Retention: deleted {} expired message(s)", n),
-                    Ok(Err(e)) => error!("Retention cleanup error: {}", e),
-                    Err(e)    => error!("Retention task panicked: {}", e),
-                }
+                retention_tick(&writer, &seen, retention, started.elapsed()).await;
             }
             _ = cancel.cancelled() => {
                 debug!("Retention task stopped");
@@ -284,18 +334,113 @@ async fn run_retention(storage: Storage, retention: Duration, cancel: Cancellati
     }
 }
 
+/// One retention sweep.  `uptime` is how long the sniffer has been running.
+///
+/// Labels are judged against stored records and the live list, and the live
+/// list starts empty at every start.  A label whose device simply has not
+/// been heard since the start would look abandoned, so nothing is removed
+/// until the sniffer has run for a whole retention period: that gives every
+/// label's device that long to be stored or seen again.  The grace period
+/// restarts with each start, so a restart never removes a label.
+async fn retention_tick(
+    writer: &LabelWriter,
+    seen: &SeenDevices,
+    retention: Duration,
+    uptime: Duration,
+) {
+    let forgotten = seen.expire(retention);
+    let cutoff =
+        Utc::now() - chrono::Duration::from_std(retention).unwrap_or(chrono::Duration::days(30));
+    let keep_orphans = uptime < retention;
+
+    match writer.prune(cutoff, keep_orphans).await {
+        Ok(pruned) if pruned.messages == 0 && pruned.labels.is_empty() && forgotten == 0 => {}
+        Ok(pruned) => info!(
+            "Retention: deleted {} expired message(s) and {} label(s); \
+             forgot {} device(s) not seen live, {} still tracked",
+            pruned.messages,
+            pruned.labels.len(),
+            forgotten,
+            seen.len()
+        ),
+        // Only while the sniffer is stopping.
+        Err(WriterError::Stopped) => debug!("Retention sweep skipped: the label writer stopped"),
+        Err(e) => error!("Retention cleanup error: {}", e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live device list
+// ---------------------------------------------------------------------------
+
+/// The parts of a record envelope (`{"type":"message","data":{...}}`) that
+/// say which device it came from.  Everything else in it is skipped.
+#[derive(Deserialize)]
+struct Sighting {
+    data: SightingData,
+}
+
+#[derive(Deserialize)]
+struct SightingData {
+    dev_addr: Option<String>,
+    dev_eui: Option<String>,
+}
+
+/// Note every device identifier that goes by on the record broadcast.
+///
+/// This is how a device the storage writer dropped can still be labelled, and
+/// it stays off the forwarding path: a broadcast receiver never makes senders
+/// wait, it only falls behind.  When that happens the missed records are
+/// gone, a rate-limited warning says so, and the listener carries on; a
+/// device that was missed is noted again with its next record.
+pub(crate) async fn run_seen_listener(
+    mut rx: broadcast::Receiver<Arc<String>>,
+    seen: SeenDevices,
+    cancel: CancellationToken,
+) {
+    let lag_log = RateLimitedLog::new();
+    loop {
+        tokio::select! {
+            result = rx.recv() => match result {
+                Ok(envelope) => note_sighting(&seen, &envelope),
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    lag_log.warn(format_args!(
+                        "Live device tracking fell behind and skipped {} record(s); \
+                         those devices can be labelled again once they are next seen",
+                        missed
+                    ));
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            _ = cancel.cancelled() => break,
+        }
+    }
+    debug!("Live device tracking stopped");
+}
+
+/// Note the identifier(s) in one record envelope.  A record has a DevAddr or
+/// a DevEUI, never both, and records without either (join accepts, for one)
+/// are not a device that can be labelled.
+fn note_sighting(seen: &SeenDevices, envelope: &str) {
+    match serde_json::from_str::<Sighting>(envelope) {
+        Ok(sighting) => {
+            for device in [sighting.data.dev_addr, sighting.data.dev_eui]
+                .into_iter()
+                .flatten()
+            {
+                seen.note(&device);
+            }
+        }
+        Err(e) => debug!("Live device tracking skipped a record envelope: {}", e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // API server task
 // ---------------------------------------------------------------------------
 
-async fn run_api(
-    broadcast_tx: broadcast::Sender<Arc<String>>,
-    storage: Storage,
-    bind: String,
-    cors_origins: Vec<String>,
-    cancel: CancellationToken,
-) {
-    let app = api::router(broadcast_tx, storage, cors_origins);
+async fn run_api(context: ApiContext, bind: String, cancel: CancellationToken) {
+    let app = api::router(context);
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(l) => {
             info!("API server listening on http://{}", bind);
@@ -434,7 +579,13 @@ fn build_filters(config: &Configuration) -> Result<Vec<FilterRule>> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use serde_json::json;
+    use tokio::time::timeout;
+
     use super::*;
+    use crate::core::labels::MAX_LABELS;
 
     fn config_from(toml_text: &str) -> Configuration {
         toml::from_str(toml_text).unwrap()
@@ -605,5 +756,338 @@ mod tests {
         );
 
         assert!(build_filters(&config).is_err());
+    }
+
+    // -- retention sweep ----------------------------------------------------
+
+    #[test]
+    fn sweep_interval_is_half_the_retention() {
+        assert_eq!(
+            sweep_interval(Duration::from_secs(4)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            sweep_interval(Duration::from_secs(120)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            sweep_interval(Duration::from_secs(9 * 60)),
+            Duration::from_secs(270)
+        );
+    }
+
+    #[test]
+    fn sweep_interval_is_never_below_a_second() {
+        assert_eq!(
+            sweep_interval(Duration::from_secs(2)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            sweep_interval(Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            sweep_interval(Duration::from_millis(100)),
+            Duration::from_secs(1)
+        );
+        // tokio's `interval` panics on a zero period.
+        assert_eq!(sweep_interval(Duration::ZERO), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn sweep_interval_is_never_above_five_minutes() {
+        let five_minutes = Duration::from_secs(300);
+        assert_eq!(sweep_interval(Duration::from_secs(10 * 60)), five_minutes);
+        assert_eq!(sweep_interval(Duration::from_secs(3600)), five_minutes);
+        assert_eq!(
+            sweep_interval(Duration::from_secs(30 * 24 * 3600)),
+            five_minutes
+        );
+    }
+
+    /// A scratch directory for a database file, removed afterwards.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "lorawan-sniffer-{}-{}",
+                name,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+
+        fn db(&self) -> String {
+            self.0.join("sniffer.db").display().to_string()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const RETENTION: Duration = Duration::from_secs(3600);
+    const ORPHAN: &str = "00E8A80B";
+
+    /// A sniffer that has just been restarted on a database whose only
+    /// label belongs to a device with no stored record.
+    struct Restarted {
+        storage: Storage,
+        seen: SeenDevices,
+        events: broadcast::Receiver<Arc<String>>,
+        writer: LabelWriter,
+        _scratch: Scratch,
+    }
+
+    fn restarted(name: &str) -> Restarted {
+        let scratch = Scratch::new(name);
+        {
+            // The previous run: the device was heard live, labelled, and
+            // never stored.
+            let storage = Storage::open(&scratch.db()).unwrap();
+            storage
+                .set_label(ORPHAN, "Havana", true, MAX_LABELS)
+                .unwrap();
+        }
+        let storage = Storage::open(&scratch.db()).unwrap();
+        assert_eq!(storage.labels().unwrap().len(), 1, "the label survived");
+        let seen = SeenDevices::new();
+        let (labels_tx, events) = broadcast::channel(8);
+        let writer = LabelWriter::spawn(
+            storage.clone(),
+            seen.clone(),
+            RETENTION,
+            labels_tx,
+            CancellationToken::new(),
+        );
+        Restarted {
+            storage,
+            seen,
+            events,
+            writer,
+            _scratch: scratch,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restart_keeps_an_unheard_label_through_the_first_retention_period() {
+        let mut run = restarted("restart-keep");
+
+        // Not a single record since the start, but still inside the grace period.
+        for uptime in [
+            Duration::ZERO,
+            RETENTION / 2,
+            RETENTION - Duration::from_secs(1),
+        ] {
+            retention_tick(&run.writer, &run.seen, RETENTION, uptime).await;
+
+            assert_eq!(run.storage.labels().unwrap().len(), 1, "{uptime:?}");
+            assert!(run.events.try_recv().is_err(), "{uptime:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn after_the_first_period_a_label_that_was_never_heard_again_is_removed() {
+        let mut run = restarted("restart-remove");
+
+        retention_tick(
+            &run.writer,
+            &run.seen,
+            RETENTION,
+            RETENTION + Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(run.storage.labels().unwrap().is_empty());
+        let removal: serde_json::Value =
+            serde_json::from_str(&run.events.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            removal,
+            json!({"type": "label", "data": {"device": ORPHAN, "label": null}})
+        );
+        assert!(run.events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn after_the_first_period_a_label_heard_since_the_start_is_kept() {
+        let mut run = restarted("restart-heard");
+        run.seen.note(ORPHAN);
+
+        retention_tick(&run.writer, &run.seen, RETENTION, RETENTION * 2).await;
+
+        assert_eq!(run.storage.labels().unwrap().len(), 1);
+        assert!(run.events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_sweep_forgets_devices_not_seen_within_the_retention_period() {
+        let run = restarted("restart-forget");
+        run.seen.note(ORPHAN);
+
+        // A retention of zero makes every sighting too old.
+        retention_tick(&run.writer, &run.seen, Duration::ZERO, Duration::ZERO).await;
+
+        assert_eq!(run.seen.len(), 0);
+    }
+
+    // -- live device list ---------------------------------------------------
+
+    fn envelope(dev_addr: Option<&str>, dev_eui: Option<&str>) -> String {
+        json!({
+            "type": "message",
+            "data": {
+                "id": "x", "mtype": "UnconfirmedDataUp", "rssi": -50,
+                "dev_addr": dev_addr, "dev_eui": dev_eui, "fcnt": 1,
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_data_frame_notes_its_dev_addr() {
+        let seen = SeenDevices::new();
+
+        note_sighting(&seen, &envelope(Some("01ABCDEF"), None));
+
+        assert_eq!(seen.len(), 1);
+        assert!(seen.seen_within("01ABCDEF", RETENTION));
+    }
+
+    #[test]
+    fn a_join_request_notes_its_dev_eui() {
+        let seen = SeenDevices::new();
+
+        note_sighting(&seen, &envelope(None, Some("36:31:39:54:36:5D:05:39")));
+
+        assert_eq!(seen.len(), 1);
+        assert!(seen.seen_within("36:31:39:54:36:5D:05:39", RETENTION));
+    }
+
+    #[test]
+    fn a_record_with_both_identifiers_notes_both() {
+        let seen = SeenDevices::new();
+
+        note_sighting(
+            &seen,
+            &envelope(Some("01ABCDEF"), Some("36:31:39:54:36:5D:05:39")),
+        );
+
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
+    fn records_without_an_identifier_or_not_records_note_nothing() {
+        let seen = SeenDevices::new();
+
+        // A join accept: neither identifier.
+        note_sighting(&seen, &envelope(None, None));
+        // An envelope with no data, a record without the keys, and noise.
+        note_sighting(&seen, r#"{"type":"message"}"#);
+        note_sighting(&seen, r#"{"type":"message","data":{}}"#);
+        note_sighting(&seen, r#"{"type":"message","data":{"dev_addr":5}}"#);
+        note_sighting(&seen, "not json");
+        note_sighting(&seen, "");
+
+        assert_eq!(seen.len(), 0);
+    }
+
+    #[test]
+    fn the_listener_understands_the_envelope_the_api_produces() {
+        use crate::core::metadata::{CrcStatus, Direction, MType, Protocol, Status};
+        let record = MessageRecord {
+            id: "r".to_string(),
+            timestamp: Utc::now(),
+            direction: Direction::Up,
+            status: Status::Captured,
+            blocked_by: None,
+            source_protocol: Protocol::Udp,
+            freq_mhz: 868.1,
+            datarate: "SF7BW125".to_string(),
+            rssi: None,
+            snr: None,
+            crc_status: Some(CrcStatus::Ok),
+            mtype: MType::UnconfirmedDataUp,
+            dev_addr: Some("01ABCDEF".to_string()),
+            dev_eui: None,
+            fcnt: Some(1),
+            fport: Some(1),
+            payload_size: 4,
+            toa_ms: None,
+            gateway_eui: None,
+            join_eui: None,
+            dev_nonce: None,
+            adr: None,
+            adr_ack_req: None,
+            ack: None,
+            class_b: None,
+            f_pending: None,
+            f_opts_len: None,
+        };
+        let seen = SeenDevices::new();
+
+        note_sighting(&seen, &api::make_ws_json(&record).unwrap());
+
+        assert!(seen.seen_within("01ABCDEF", RETENTION));
+    }
+
+    #[tokio::test]
+    async fn the_listener_carries_on_after_falling_behind() {
+        let (tx, rx) = broadcast::channel::<Arc<String>>(2);
+        let seen = SeenDevices::new();
+        let cancel = CancellationToken::new();
+        // Five records before the listener has run: it missed the first three.
+        for i in 0..5 {
+            tx.send(Arc::new(envelope(Some(&format!("0000000{i}")), None)))
+                .unwrap();
+        }
+        let listener = tokio::spawn(run_seen_listener(rx, seen.clone(), cancel.clone()));
+
+        timeout(Duration::from_secs(10), async {
+            while seen.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the listener never noted the records that were left");
+
+        assert!(seen.seen_within("00000003", RETENTION));
+        assert!(seen.seen_within("00000004", RETENTION));
+        assert!(!seen.seen_within("00000000", RETENTION));
+        // And it still works afterwards.
+        tx.send(Arc::new(envelope(Some("0000000A"), None))).unwrap();
+        timeout(Duration::from_secs(10), async {
+            while !seen.seen_within("0000000A", RETENTION) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the listener stopped after falling behind");
+        cancel.cancel();
+        timeout(Duration::from_secs(10), listener)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_listener_stops_when_the_broadcast_closes() {
+        let (tx, rx) = broadcast::channel::<Arc<String>>(4);
+        let listener = tokio::spawn(run_seen_listener(
+            rx,
+            SeenDevices::new(),
+            CancellationToken::new(),
+        ));
+
+        drop(tx);
+
+        timeout(Duration::from_secs(10), listener)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

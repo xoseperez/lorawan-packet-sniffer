@@ -18,18 +18,38 @@
 //! written by older releases both take that same path, so there is only one
 //! way a schema can come about.
 //!
+//! - version 0: the `messages` table and its indexes ([`INIT_SQL`]);
+//! - version 1: gateway, join and frame-control columns on `messages`;
+//! - version 2: the `device_labels` table, one operator-chosen label per
+//!   device identifier.
+//!
+//! ## Device labels
+//!
+//! A label is keyed by the same text that message records carry in
+//! `dev_addr` or `dev_eui`, so the two kinds of identifier can never collide
+//! (8 against 16 hex digits).  Callers pass identifiers already normalised by
+//! [`crate::core::labels::parse_device_id`]; this module compares them
+//! verbatim.
+//!
+//! A label lives as long as its device has a stored message, or, failing
+//! that, as long as the rule given to [`OrphanPolicy::KeepIf`] says the
+//! device is still around.  [`Storage::delete_older_than`] applies that rule in the same
+//! transaction that expires the messages, so a label is never judged against
+//! a half-pruned table.
+//!
 //! ## Concurrency note
 //!
 //! `rusqlite::Connection` is `Send` but not `Sync`.  `Arc<Mutex<Connection>>`
 //! is both `Send` and `Sync`, so `Storage` can be cloned freely and passed
 //! into `spawn_blocking` closures.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use log::warn;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 
 use crate::core::error::SnifferError;
 use crate::core::metadata::{CrcStatus, Direction, MType, MessageRecord, Protocol, Status};
@@ -97,7 +117,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_mtype
 /// edit or reorder an entry that has shipped; append a new one instead.
 ///
 /// SQLite adds a nullable column without rewriting the table, so upgrading a
-/// large database is fast.  Booleans are stored as INTEGER 0/1.
+/// large database is fast.  Booleans are stored as INTEGER 0/1.  A new table
+/// does not touch `messages` at all.
 const MIGRATIONS: &[&str] = &[
     // 0 -> 1: gateway, join and frame-control fields.
     //
@@ -113,6 +134,16 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE messages ADD COLUMN class_b     INTEGER;
      ALTER TABLE messages ADD COLUMN f_pending   INTEGER;
      ALTER TABLE messages ADD COLUMN f_opts_len  INTEGER;",
+    // 1 -> 2: operator-chosen device labels.
+    //
+    // `device` is a DevAddr or a DevEUI exactly as message records spell it.
+    // There is no foreign key to `messages`: a label may outlive every stored
+    // message of its device (see `Storage::delete_older_than`).
+    "CREATE TABLE device_labels (
+         device     TEXT PRIMARY KEY,
+         label      TEXT NOT NULL,
+         updated_at TEXT NOT NULL
+     );",
 ];
 
 const INSERT_SQL: &str = "
@@ -130,9 +161,69 @@ INSERT OR REPLACE INTO messages (
     ?22, ?23, ?24, ?25, ?26, ?27
 )";
 
+/// Labels whose device has no stored message.
+///
+/// Two separate `NOT EXISTS` probes, one per identifier column, because each
+/// can use its own partial index (`idx_messages_dev_addr`,
+/// `idx_messages_dev_eui`).  Written as `dev_addr = x OR dev_eui = x` the
+/// planner may fall back to scanning `messages`, which on a large database
+/// would hold the storage lock for seconds.
+const ORPHAN_LABELS_SQL: &str = "
+SELECT device FROM device_labels
+WHERE NOT EXISTS (SELECT 1 FROM messages WHERE dev_addr = device_labels.device)
+  AND NOT EXISTS (SELECT 1 FROM messages WHERE dev_eui  = device_labels.device)";
+
+/// Does the device have a stored message as a DevAddr?
+const HAS_DEV_ADDR_SQL: &str = "SELECT EXISTS (SELECT 1 FROM messages WHERE dev_addr = ?1)";
+
+/// Does the device have a stored message as a DevEUI?
+const HAS_DEV_EUI_SQL: &str = "SELECT EXISTS (SELECT 1 FROM messages WHERE dev_eui = ?1)";
+
+/// Insert a label, or replace the existing one for the same device.
+const UPSERT_LABEL_SQL: &str = "
+INSERT INTO device_labels (device, label, updated_at) VALUES (?1, ?2, ?3)
+ON CONFLICT(device) DO UPDATE SET label = excluded.label, updated_at = excluded.updated_at";
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/// Outcome of [`Storage::set_label`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelWrite {
+    /// The label was saved (new, or replacing the previous one).
+    Set,
+    /// The device has no stored message and was not seen live, so there is
+    /// nothing to attach a label to.  Nothing was written.
+    UnknownDevice,
+    /// The device has no label yet and the table already holds the maximum
+    /// number.  Nothing was written.  Replacing an existing label never
+    /// returns this.
+    LimitReached,
+}
+
+/// What [`Storage::delete_older_than`] does with labels whose device has no
+/// stored message left.
+pub enum OrphanPolicy<'a> {
+    /// Leave every label alone.
+    Keep,
+    /// Keep an orphaned label when the predicate returns `true` for its
+    /// device, and delete it otherwise.
+    ///
+    /// The predicate runs while the storage lock and a write transaction are
+    /// held, once per orphaned label (at most the label limit).  It must be
+    /// quick and must not call back into [`Storage`], which would deadlock.
+    KeepIf(&'a dyn Fn(&str) -> bool),
+}
+
+/// What a [`Storage::delete_older_than`] sweep removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pruned {
+    /// Number of expired messages deleted.
+    pub messages: usize,
+    /// Devices whose label was deleted, in no particular order.
+    pub labels: Vec<String>,
+}
 
 /// Thread-safe, cheaply-cloneable SQLite storage handle.
 #[derive(Clone)]
@@ -207,16 +298,118 @@ impl Storage {
         Ok(())
     }
 
-    /// Delete all messages with a timestamp older than `cutoff`.
+    /// Delete all messages with a timestamp older than `cutoff`, then prune
+    /// orphaned labels according to `orphans`.
     ///
-    /// Returns the number of rows deleted.
-    pub fn delete_older_than(&self, cutoff: DateTime<Utc>) -> Result<usize, SnifferError> {
-        let conn = self.conn.lock().map_err(|_| SnifferError::LockPoisoned)?;
-        let n = conn.execute(
+    /// Everything happens in one transaction, so a label is judged against
+    /// the table as it is after the expired messages are gone: a device whose
+    /// last message just expired counts as an orphan in this same sweep.
+    ///
+    /// The label step reads at most [`crate::core::labels::MAX_LABELS`] rows
+    /// and probes two indexes for each, so the time it adds to the sweep is
+    /// bounded no matter how large `messages` is.  The set of devices a
+    /// predicate accepts is never turned into SQL: candidates come out of the
+    /// database and are filtered in Rust.
+    pub fn delete_older_than(
+        &self,
+        cutoff: DateTime<Utc>,
+        orphans: OrphanPolicy<'_>,
+    ) -> Result<Pruned, SnifferError> {
+        let mut conn = self.conn.lock().map_err(|_| SnifferError::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let messages = tx.execute(
             "DELETE FROM messages WHERE timestamp < ?1",
             params![cutoff.to_rfc3339()],
         )?;
-        Ok(n)
+
+        let mut labels = Vec::new();
+        if let OrphanPolicy::KeepIf(keep) = orphans {
+            let candidates = tx
+                .prepare(ORPHAN_LABELS_SQL)?
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut delete = tx.prepare("DELETE FROM device_labels WHERE device = ?1")?;
+            for device in candidates {
+                if !keep(&device) {
+                    delete.execute(params![device])?;
+                    labels.push(device);
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(Pruned { messages, labels })
+    }
+
+    /// Return every label, keyed by device identifier.
+    pub fn labels(&self) -> Result<BTreeMap<String, String>, SnifferError> {
+        let conn = self.conn.lock().map_err(|_| SnifferError::LockPoisoned)?;
+        let mut stmt = conn.prepare("SELECT device, label FROM device_labels")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<Result<BTreeMap<_, _>, _>>()?)
+    }
+
+    /// Set or replace the label of `device`.
+    ///
+    /// `device` and `label` must already be normalised and validated (see
+    /// [`crate::core::labels`]).  `seen_live` says whether the caller has seen
+    /// the device in live traffic; a device that was not seen live must have a
+    /// stored message, otherwise nothing is written and
+    /// [`LabelWrite::UnknownDevice`] is returned.
+    ///
+    /// A device without a label is refused with [`LabelWrite::LimitReached`]
+    /// once the table holds `max_labels` rows.  Production code passes
+    /// [`crate::core::labels::MAX_LABELS`]; the parameter exists so tests can
+    /// reach the limit with a handful of rows.
+    ///
+    /// The checks and the write share one transaction, so two callers racing
+    /// for the last free slot cannot both succeed.
+    pub fn set_label(
+        &self,
+        device: &str,
+        label: &str,
+        seen_live: bool,
+        max_labels: usize,
+    ) -> Result<LabelWrite, SnifferError> {
+        let mut conn = self.conn.lock().map_err(|_| SnifferError::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Dropping `tx` on an early return rolls back; nothing was written yet.
+        if !seen_live && !has_stored_record(&tx, device)? {
+            return Ok(LabelWrite::UnknownDevice);
+        }
+
+        let has_label: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM device_labels WHERE device = ?1)",
+            params![device],
+            |r| r.get(0),
+        )?;
+        if !has_label {
+            let count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM device_labels", [], |r| r.get(0))?;
+            if count as usize >= max_labels {
+                return Ok(LabelWrite::LimitReached);
+            }
+        }
+
+        tx.execute(
+            UPSERT_LABEL_SQL,
+            params![device, label, Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(LabelWrite::Set)
+    }
+
+    /// Remove the label of `device`.
+    ///
+    /// Returns `true` if a label was removed and `false` if there was none,
+    /// which is not an error.
+    pub fn delete_label(&self, device: &str) -> Result<bool, SnifferError> {
+        let conn = self.conn.lock().map_err(|_| SnifferError::LockPoisoned)?;
+        let n = conn.execute(
+            "DELETE FROM device_labels WHERE device = ?1",
+            params![device],
+        )?;
+        Ok(n > 0)
     }
 
     /// Return the total number of rows in the messages table.
@@ -295,6 +488,23 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         tx.commit()?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Label helpers
+// ---------------------------------------------------------------------------
+
+/// Does any stored message carry `device` as its DevAddr or DevEUI?
+///
+/// Two indexed probes rather than one `OR`, for the reason given on
+/// [`ORPHAN_LABELS_SQL`].  The first hit ends the search.
+fn has_stored_record(conn: &Connection, device: &str) -> rusqlite::Result<bool> {
+    for sql in [HAS_DEV_ADDR_SQL, HAS_DEV_EUI_SQL] {
+        if conn.query_row(sql, params![device], |r| r.get::<_, bool>(0))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +644,7 @@ fn mtype_str(m: &MType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::eui::Eui64;
     use crate::core::metadata::{CrcStatus, Direction, MType, MessageRecord, Protocol, Status};
     use chrono::Utc;
 
@@ -589,8 +800,9 @@ mod tests {
         assert_eq!(s.count().unwrap(), 2);
 
         let cutoff = Utc::now() - chrono::Duration::days(30);
-        let deleted = s.delete_older_than(cutoff).unwrap();
-        assert_eq!(deleted, 1);
+        let pruned = s.delete_older_than(cutoff, OrphanPolicy::Keep).unwrap();
+        assert_eq!(pruned.messages, 1);
+        assert!(pruned.labels.is_empty());
         assert_eq!(s.count().unwrap(), 1);
     }
 
@@ -601,8 +813,9 @@ mod tests {
         s.insert(&sample_record()).unwrap();
 
         let cutoff = Utc::now() - chrono::Duration::days(30);
-        let deleted = s.delete_older_than(cutoff).unwrap();
-        assert_eq!(deleted, 0);
+        let pruned = s.delete_older_than(cutoff, OrphanPolicy::Keep).unwrap();
+        assert_eq!(pruned.messages, 0);
+        assert!(pruned.labels.is_empty());
         assert_eq!(s.count().unwrap(), 2);
     }
 
@@ -615,8 +828,9 @@ mod tests {
             s.insert(&rec).unwrap();
         }
         let cutoff = Utc::now() - chrono::Duration::days(1);
-        let deleted = s.delete_older_than(cutoff).unwrap();
-        assert_eq!(deleted, 5);
+        let pruned = s.delete_older_than(cutoff, OrphanPolicy::Keep).unwrap();
+        assert_eq!(pruned.messages, 5);
+        assert!(pruned.labels.is_empty());
         assert_eq!(s.count().unwrap(), 0);
     }
 
@@ -817,6 +1031,14 @@ mod tests {
         }
         assert_eq!(columns.len(), 27);
 
+        // The labels table arrives with the same upgrade, empty and usable.
+        assert!(s.labels().unwrap().is_empty());
+        assert_eq!(
+            s.set_label("01ABCDEF", "upgraded", false, 10).unwrap(),
+            LabelWrite::Set
+        );
+        assert!(s.delete_label("01ABCDEF").unwrap());
+
         // Old rows survive intact; every new field reads as absent.
         let rows = s.query_recent(10).unwrap();
         assert_eq!(rows.len(), 2);
@@ -985,5 +1207,925 @@ mod tests {
             .query_row("SELECT status FROM messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(stored, "captured");
+    }
+
+    // -----------------------------------------------------------------------
+    // Device labels
+    // -----------------------------------------------------------------------
+
+    const HAVANA: &str = "00E8A80B";
+    const QINGPING_EUI: &str = "36:31:39:54:36:5D:05:39";
+
+    /// Store one message for `device`, in the column its shape implies: 8 hex
+    /// digits are a DevAddr, anything longer a DevEUI.
+    fn store_record(s: &Storage, device: &str, timestamp: DateTime<Utc>) {
+        let mut rec = sample_record();
+        rec.timestamp = timestamp;
+        if device.len() == 8 {
+            rec.dev_addr = Some(device.to_string());
+            rec.dev_eui = None;
+        } else {
+            rec.mtype = MType::JoinRequest;
+            rec.dev_addr = None;
+            rec.dev_eui = Some(device.to_string());
+        }
+        s.insert(&rec).unwrap();
+    }
+
+    fn days_ago(n: i64) -> DateTime<Utc> {
+        Utc::now() - chrono::Duration::days(n)
+    }
+
+    /// The `detail` column of `EXPLAIN QUERY PLAN` for `sql`.
+    fn query_plan(conn: &Connection, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let rows = stmt
+            .query_map(args, |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    /// The frozen layout of a 2.1.0 database: the 2.0.0 schema plus the
+    /// columns added by the first migration, marked as version 1.
+    const SCHEMA_V2_1_0_UPGRADE: &str = "
+    ALTER TABLE messages ADD COLUMN gateway_eui TEXT;
+    ALTER TABLE messages ADD COLUMN join_eui    TEXT;
+    ALTER TABLE messages ADD COLUMN dev_nonce   INTEGER;
+    ALTER TABLE messages ADD COLUMN adr         INTEGER;
+    ALTER TABLE messages ADD COLUMN adr_ack_req INTEGER;
+    ALTER TABLE messages ADD COLUMN ack         INTEGER;
+    ALTER TABLE messages ADD COLUMN class_b     INTEGER;
+    ALTER TABLE messages ADD COLUMN f_pending   INTEGER;
+    ALTER TABLE messages ADD COLUMN f_opts_len  INTEGER;
+    PRAGMA user_version = 1;
+    ";
+
+    #[test]
+    fn upgrades_v2_1_0_database_keeping_rows_and_adding_the_label_table() {
+        let tmp = TempDb::new("upgrade-labels");
+        let path = tmp.path();
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V2_0_0).unwrap();
+            conn.execute_batch(SCHEMA_V2_1_0_UPGRADE).unwrap();
+            let insert = "INSERT INTO messages (
+                id, timestamp, direction, status, source_protocol, freq_mhz,
+                datarate, mtype, dev_addr, dev_eui, payload_size, gateway_eui, adr
+            ) VALUES (?1, ?2, 'up', 'forwarded', 'udp', 868.1, 'SF7BW125', ?3, ?4, ?5, 23, ?6, ?7)";
+            conn.execute(
+                insert,
+                params![
+                    "data",
+                    "2026-03-01T10:00:00+00:00",
+                    "UnconfirmedDataUp",
+                    "01ABCDEF",
+                    None::<String>,
+                    "AA:BB:CC:DD:00:11:22:33",
+                    1
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                insert,
+                params![
+                    "join",
+                    "2026-03-01T10:00:05+00:00",
+                    "JoinRequest",
+                    None::<String>,
+                    QINGPING_EUI,
+                    "AA:BB:CC:DD:00:11:22:33",
+                    None::<i64>
+                ],
+            )
+            .unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 1, "fixture must look like a 2.1.0 database");
+            let has_labels: bool = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'device_labels')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!has_labels, "a 2.1.0 database has no label table");
+        }
+
+        let s = Storage::open(&path).unwrap();
+        assert_eq!(user_version(&s), 2);
+        assert_eq!(MIGRATIONS.len(), 2);
+
+        // The table exists with the documented columns.
+        let columns: Vec<String> = {
+            let conn = s.conn.lock().unwrap();
+            let mut stmt = conn.prepare("PRAGMA table_info(device_labels)").unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(columns, ["device", "label", "updated_at"]);
+        assert!(s.labels().unwrap().is_empty());
+
+        // The rows from before the upgrade are intact.
+        assert_eq!(s.count().unwrap(), 2);
+        let rows = s.query_recent(10).unwrap();
+        let data = rows.iter().find(|r| r.id == "data").unwrap();
+        assert_eq!(data.dev_addr.as_deref(), Some("01ABCDEF"));
+        assert_eq!(data.gateway_eui.as_deref(), Some("AA:BB:CC:DD:00:11:22:33"));
+        assert_eq!(data.adr, Some(true));
+        let join = rows.iter().find(|r| r.id == "join").unwrap();
+        assert_eq!(join.mtype, MType::JoinRequest);
+        assert_eq!(join.dev_eui.as_deref(), Some(QINGPING_EUI));
+
+        // Those rows make their devices labellable, and the label survives
+        // another open (the migration must not run twice).
+        assert_eq!(
+            s.set_label("01ABCDEF", "old sensor", false, 10).unwrap(),
+            LabelWrite::Set
+        );
+        assert_eq!(
+            s.set_label(QINGPING_EUI, "old join", false, 10).unwrap(),
+            LabelWrite::Set
+        );
+        drop(s);
+        let s = Storage::open(&path).unwrap();
+        assert_eq!(user_version(&s), 2);
+        assert_eq!(s.count().unwrap(), 2);
+        assert_eq!(s.labels().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn set_replace_get_and_delete_a_label() {
+        let s = Storage::open_in_memory().unwrap();
+        store_record(&s, HAVANA, Utc::now());
+        assert!(s.labels().unwrap().is_empty());
+
+        assert_eq!(
+            s.set_label(HAVANA, "Qingping T&H Havana", false, 10)
+                .unwrap(),
+            LabelWrite::Set
+        );
+        let labels = s.labels().unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[HAVANA], "Qingping T&H Havana");
+
+        // Replacing keeps one row and takes the new text.
+        assert_eq!(
+            s.set_label(HAVANA, "Havana kitchen", false, 10).unwrap(),
+            LabelWrite::Set
+        );
+        let labels = s.labels().unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[HAVANA], "Havana kitchen");
+
+        assert!(s.delete_label(HAVANA).unwrap());
+        assert!(s.labels().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_label_that_does_not_exist_is_not_an_error() {
+        let s = Storage::open_in_memory().unwrap();
+        assert!(!s.delete_label(HAVANA).unwrap());
+        s.set_label(HAVANA, "x", true, 10).unwrap();
+        assert!(s.delete_label(HAVANA).unwrap());
+        assert!(!s.delete_label(HAVANA).unwrap());
+    }
+
+    #[test]
+    fn deleting_one_label_leaves_the_others() {
+        let s = Storage::open_in_memory().unwrap();
+        s.set_label("00000001", "one", true, 10).unwrap();
+        s.set_label("00000002", "two", true, 10).unwrap();
+        assert!(s.delete_label("00000001").unwrap());
+        let labels = s.labels().unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels["00000002"], "two");
+    }
+
+    #[test]
+    fn updated_at_is_rfc3339_and_moves_forward_on_replace() {
+        let s = Storage::open_in_memory().unwrap();
+        s.set_label(HAVANA, "first", true, 10).unwrap();
+        let read = |s: &Storage| -> DateTime<Utc> {
+            let text: String = s
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT updated_at FROM device_labels WHERE device = ?1",
+                    params![HAVANA],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            DateTime::parse_from_rfc3339(&text)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let first = read(&s);
+        assert!((Utc::now() - first).num_seconds().abs() < 5);
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.set_label(HAVANA, "second", true, 10).unwrap();
+        assert!(read(&s) > first);
+    }
+
+    #[test]
+    fn a_device_never_seen_and_not_stored_is_refused() {
+        let s = Storage::open_in_memory().unwrap();
+        store_record(&s, "01ABCDEF", Utc::now());
+        store_record(&s, QINGPING_EUI, Utc::now());
+
+        // Not stored, not seen live: nothing is written.
+        assert_eq!(
+            s.set_label(HAVANA, "ghost", false, 10).unwrap(),
+            LabelWrite::UnknownDevice
+        );
+        // Close to a stored identifier is still a different identifier.
+        assert_eq!(
+            s.set_label("01ABCDE0", "ghost", false, 10).unwrap(),
+            LabelWrite::UnknownDevice
+        );
+        assert_eq!(
+            s.set_label("36:31:39:54:36:5D:05:3A", "ghost", false, 10)
+                .unwrap(),
+            LabelWrite::UnknownDevice
+        );
+        assert!(s.labels().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stored_devaddr_or_deveui_can_be_labelled_without_a_live_sighting() {
+        let s = Storage::open_in_memory().unwrap();
+        store_record(&s, "01ABCDEF", Utc::now());
+        store_record(&s, QINGPING_EUI, Utc::now());
+
+        assert_eq!(
+            s.set_label("01ABCDEF", "uplink node", false, 10).unwrap(),
+            LabelWrite::Set
+        );
+        assert_eq!(
+            s.set_label(QINGPING_EUI, "joining node", false, 10)
+                .unwrap(),
+            LabelWrite::Set
+        );
+        let labels = s.labels().unwrap();
+        assert_eq!(labels["01ABCDEF"], "uplink node");
+        assert_eq!(labels[QINGPING_EUI], "joining node");
+    }
+
+    #[test]
+    fn a_device_seen_only_live_can_be_labelled() {
+        let s = Storage::open_in_memory().unwrap();
+        assert_eq!(s.count().unwrap(), 0);
+
+        assert_eq!(
+            s.set_label(HAVANA, "live only", true, 10).unwrap(),
+            LabelWrite::Set
+        );
+        assert_eq!(
+            s.set_label(QINGPING_EUI, "live only eui", true, 10)
+                .unwrap(),
+            LabelWrite::Set
+        );
+        assert_eq!(s.labels().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn renaming_a_label_still_needs_the_device_to_be_known() {
+        // The "known device" rule applies to every write, not only to the
+        // first one: a label whose device has no stored message and is not
+        // vouched for as seen live cannot be changed, and stays as it was.
+        // (Removing it is always possible; see delete_label.)
+        let s = Storage::open_in_memory().unwrap();
+        s.set_label(HAVANA, "kept", true, 10).unwrap();
+        assert_eq!(
+            s.set_label(HAVANA, "renamed", false, 10).unwrap(),
+            LabelWrite::UnknownDevice
+        );
+        assert_eq!(s.labels().unwrap()[HAVANA], "kept");
+        assert!(s.delete_label(HAVANA).unwrap());
+    }
+
+    #[test]
+    fn the_limit_refuses_new_labels_but_not_replacing_or_removing() {
+        let s = Storage::open_in_memory().unwrap();
+        for n in 1..=3 {
+            let device = format!("0000000{n}");
+            assert_eq!(
+                s.set_label(&device, "x", true, 3).unwrap(),
+                LabelWrite::Set,
+                "label {n} fits"
+            );
+        }
+
+        // A fourth device is refused and nothing is written.
+        assert_eq!(
+            s.set_label("00000004", "x", true, 3).unwrap(),
+            LabelWrite::LimitReached
+        );
+        assert_eq!(s.labels().unwrap().len(), 3);
+        assert!(!s.labels().unwrap().contains_key("00000004"));
+
+        // Replacing an existing label still works at the limit.
+        assert_eq!(
+            s.set_label("00000002", "renamed", true, 3).unwrap(),
+            LabelWrite::Set
+        );
+        assert_eq!(s.labels().unwrap()["00000002"], "renamed");
+
+        // Removing one frees a slot.
+        assert!(s.delete_label("00000001").unwrap());
+        assert_eq!(
+            s.set_label("00000004", "x", true, 3).unwrap(),
+            LabelWrite::Set
+        );
+        assert_eq!(s.labels().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_limit_of_zero_refuses_every_new_label() {
+        let s = Storage::open_in_memory().unwrap();
+        assert_eq!(
+            s.set_label(HAVANA, "x", true, 0).unwrap(),
+            LabelWrite::LimitReached
+        );
+        assert!(s.labels().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deveui_and_devaddr_keys_sort_and_coexist() {
+        let s = Storage::open_in_memory().unwrap();
+        s.set_label(QINGPING_EUI, "eui", true, 10).unwrap();
+        s.set_label(HAVANA, "addr", true, 10).unwrap();
+
+        let labels = s.labels().unwrap();
+        let keys: Vec<&str> = labels.keys().map(String::as_str).collect();
+        assert_eq!(keys, [HAVANA, QINGPING_EUI]);
+        assert_eq!(labels[HAVANA], "addr");
+        assert_eq!(labels[QINGPING_EUI], "eui");
+    }
+
+    #[test]
+    fn label_text_is_stored_verbatim() {
+        let s = Storage::open_in_memory().unwrap();
+        let texts = [
+            "Qingping \"T&H\" Havana, ground floor",
+            "温度センサー 🌡 café",
+            "x'); DROP TABLE device_labels; --",
+            "=1+1",
+            "  inner  spaces  ",
+        ];
+        for (n, text) in texts.iter().enumerate() {
+            let device = format!("0000000{n}");
+            assert_eq!(
+                s.set_label(&device, text, true, 10).unwrap(),
+                LabelWrite::Set
+            );
+        }
+        let labels = s.labels().unwrap();
+        assert_eq!(labels.len(), texts.len());
+        for (n, text) in texts.iter().enumerate() {
+            assert_eq!(labels[&format!("0000000{n}")], *text);
+        }
+    }
+
+    #[test]
+    fn labels_survive_reopening_a_file_database() {
+        let tmp = TempDb::new("labels-reopen");
+        let path = tmp.path();
+        {
+            let s = Storage::open(&path).unwrap();
+            store_record(&s, HAVANA, Utc::now());
+            store_record(&s, QINGPING_EUI, Utc::now());
+            s.set_label(HAVANA, "Havana", false, 10).unwrap();
+            s.set_label(QINGPING_EUI, "Join sensor", false, 10).unwrap();
+            s.set_label("DEADBEEF", "live only", true, 10).unwrap();
+            assert!(s.delete_label("DEADBEEF").unwrap());
+        }
+
+        let s = Storage::open(&path).unwrap();
+        let labels = s.labels().unwrap();
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[HAVANA], "Havana");
+        assert_eq!(labels[QINGPING_EUI], "Join sensor");
+
+        // A sweep that keeps labels leaves them in place across the restart.
+        let pruned = s
+            .delete_older_than(Utc::now() + chrono::Duration::days(1), OrphanPolicy::Keep)
+            .unwrap();
+        assert_eq!(pruned.messages, 2);
+        assert!(pruned.labels.is_empty());
+        assert_eq!(s.labels().unwrap().len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Label lifetime
+    // -----------------------------------------------------------------------
+
+    /// Five labelled devices of one kind, in the states the lifetime rules
+    /// care about, swept with `Keep` and then with `KeepIf`.
+    ///
+    /// `devices` are, in order: stored, orphan the predicate accepts, orphan
+    /// the predicate rejects, expired-only the predicate rejects, expired-only
+    /// the predicate accepts.
+    fn check_lifetime_rules(devices: [&str; 5]) {
+        let [stored, live_orphan, dead_orphan, expired_dead, expired_live] = devices;
+        let accepted = [live_orphan, expired_live];
+
+        let build = || {
+            let s = Storage::open_in_memory().unwrap();
+            // `stored` has a record that survives the sweep and one that
+            // does not; the expired-only devices have nothing left after it.
+            store_record(&s, stored, days_ago(1));
+            store_record(&s, stored, days_ago(60));
+            store_record(&s, expired_dead, days_ago(60));
+            store_record(&s, expired_live, days_ago(61));
+            for d in devices {
+                assert_eq!(s.set_label(d, d, true, 10).unwrap(), LabelWrite::Set);
+            }
+            s
+        };
+        let cutoff = Utc::now() - chrono::Duration::days(30);
+        let all: Vec<String> = {
+            let mut v: Vec<String> = devices.iter().map(|d| d.to_string()).collect();
+            v.sort();
+            v
+        };
+        let label_keys = |s: &Storage| s.labels().unwrap().into_keys().collect::<Vec<_>>();
+
+        // Keep: every label stays, whatever became of its messages.
+        let s = build();
+        let pruned = s.delete_older_than(cutoff, OrphanPolicy::Keep).unwrap();
+        assert_eq!(pruned.messages, 3);
+        assert!(pruned.labels.is_empty());
+        assert_eq!(label_keys(&s), all);
+
+        // KeepIf: a stored device is kept without asking, an accepted orphan
+        // is kept, a rejected orphan is removed and reported.
+        let s = build();
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        let keep = |d: &str| {
+            asked.borrow_mut().push(d.to_string());
+            accepted.contains(&d)
+        };
+        let pruned = s
+            .delete_older_than(cutoff, OrphanPolicy::KeepIf(&keep))
+            .unwrap();
+        assert_eq!(pruned.messages, 3);
+        let mut removed = pruned.labels.clone();
+        removed.sort();
+        let mut expect_removed = vec![dead_orphan.to_string(), expired_dead.to_string()];
+        expect_removed.sort();
+        assert_eq!(removed, expect_removed);
+
+        let mut kept = vec![
+            stored.to_string(),
+            live_orphan.to_string(),
+            expired_live.to_string(),
+        ];
+        kept.sort();
+        assert_eq!(label_keys(&s), kept);
+
+        // The rule is consulted only for devices with no stored message.
+        let mut asked = asked.into_inner();
+        asked.sort();
+        let mut orphans: Vec<String> = [live_orphan, dead_orphan, expired_dead, expired_live]
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+        orphans.sort();
+        assert_eq!(asked, orphans);
+
+        // A second sweep has nothing more to remove and the survivors stay.
+        let again = s
+            .delete_older_than(cutoff, OrphanPolicy::KeepIf(&|d| accepted.contains(&d)))
+            .unwrap();
+        assert_eq!(again.messages, 0);
+        assert!(again.labels.is_empty());
+        assert_eq!(label_keys(&s), kept);
+
+        // Once the rule stops accepting an orphan, its label goes too.
+        let last = s
+            .delete_older_than(cutoff, OrphanPolicy::KeepIf(&|_| false))
+            .unwrap();
+        assert_eq!(last.messages, 0);
+        let mut last_removed = last.labels;
+        last_removed.sort();
+        let mut expect_last = vec![live_orphan.to_string(), expired_live.to_string()];
+        expect_last.sort();
+        assert_eq!(last_removed, expect_last);
+        assert_eq!(label_keys(&s), [stored.to_string()]);
+    }
+
+    #[test]
+    fn lifetime_rules_for_a_devaddr() {
+        check_lifetime_rules(["A0000001", "A0000002", "A0000003", "A0000004", "A0000005"]);
+    }
+
+    #[test]
+    fn lifetime_rules_for_a_deveui() {
+        check_lifetime_rules([
+            "70:B3:D5:7E:D0:00:00:01",
+            "70:B3:D5:7E:D0:00:00:02",
+            "70:B3:D5:7E:D0:00:00:03",
+            "70:B3:D5:7E:D0:00:00:04",
+            "70:B3:D5:7E:D0:00:00:05",
+        ]);
+    }
+
+    #[test]
+    fn a_stored_record_in_either_column_protects_a_label() {
+        // One DevAddr label and one DevEUI label, each backed by a message in
+        // its own column.  A rule that rejects everything must not touch
+        // either, which fails if only one column were consulted.
+        let s = Storage::open_in_memory().unwrap();
+        store_record(&s, HAVANA, days_ago(1));
+        store_record(&s, QINGPING_EUI, days_ago(1));
+        s.set_label(HAVANA, "addr", false, 10).unwrap();
+        s.set_label(QINGPING_EUI, "eui", false, 10).unwrap();
+
+        let pruned = s
+            .delete_older_than(
+                Utc::now() - chrono::Duration::days(30),
+                OrphanPolicy::KeepIf(&|_| false),
+            )
+            .unwrap();
+        assert_eq!(pruned.messages, 0);
+        assert!(pruned.labels.is_empty());
+        assert_eq!(s.labels().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_label_is_judged_after_its_last_message_expires_in_the_same_sweep() {
+        let s = Storage::open_in_memory().unwrap();
+        store_record(&s, HAVANA, days_ago(40));
+        s.set_label(HAVANA, "was stored", false, 10).unwrap();
+
+        // Before the sweep the device has a record, so no rule is asked; the
+        // same sweep expires it and then removes the label.
+        let pruned = s
+            .delete_older_than(days_ago(30), OrphanPolicy::KeepIf(&|_| false))
+            .unwrap();
+        assert_eq!(pruned.messages, 1);
+        assert_eq!(pruned.labels, [HAVANA]);
+        assert!(s.labels().unwrap().is_empty());
+    }
+
+    #[test]
+    fn keep_if_with_no_labels_only_deletes_messages() {
+        let s = Storage::open_in_memory().unwrap();
+        store_record(&s, HAVANA, days_ago(40));
+        let pruned = s
+            .delete_older_than(
+                days_ago(30),
+                OrphanPolicy::KeepIf(&|_| panic!("no label to ask about")),
+            )
+            .unwrap();
+        assert_eq!(pruned.messages, 1);
+        assert!(pruned.labels.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Query plans
+    // -----------------------------------------------------------------------
+
+    /// The label queries must use the partial indexes on `messages`; a full
+    /// scan of that table would hold the storage lock for as long as it takes
+    /// to read the whole database.
+    fn assert_uses_both_device_indexes(plan: &[String]) {
+        let text = plan.join("\n");
+        assert!(text.contains("idx_messages_dev_addr"), "plan:\n{text}");
+        assert!(text.contains("idx_messages_dev_eui"), "plan:\n{text}");
+        assert!(
+            !plan.iter().any(|line| line.starts_with("SCAN messages")),
+            "plan scans messages:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_orphan_query_uses_both_device_indexes() {
+        let s = Storage::open_in_memory().unwrap();
+        let conn = s.conn.lock().unwrap();
+        assert_uses_both_device_indexes(&query_plan(&conn, ORPHAN_LABELS_SQL, &[]));
+    }
+
+    #[test]
+    fn the_stored_record_probes_use_their_index() {
+        let s = Storage::open_in_memory().unwrap();
+        let conn = s.conn.lock().unwrap();
+        let addr = query_plan(&conn, HAS_DEV_ADDR_SQL, &[&HAVANA]);
+        assert!(
+            addr.iter().any(|l| l.contains("idx_messages_dev_addr")),
+            "plan: {addr:?}"
+        );
+        assert!(
+            !addr.iter().any(|l| l.starts_with("SCAN messages")),
+            "plan: {addr:?}"
+        );
+        let eui = query_plan(&conn, HAS_DEV_EUI_SQL, &[&QINGPING_EUI]);
+        assert!(
+            eui.iter().any(|l| l.contains("idx_messages_dev_eui")),
+            "plan: {eui:?}"
+        );
+        assert!(
+            !eui.iter().any(|l| l.starts_with("SCAN messages")),
+            "plan: {eui:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Large database
+    // -----------------------------------------------------------------------
+
+    /// Name of the `d`-th synthetic device: every fourth is a DevEUI, the
+    /// rest are DevAddrs, so both identifier indexes carry weight.
+    fn large_device(d: u32) -> String {
+        if d.is_multiple_of(4) {
+            Eui64((0x70B3_D57E_D000_0000u64 + d as u64).to_be_bytes()).to_string()
+        } else {
+            format!("{:08X}", 0x0100_0000 + d)
+        }
+    }
+
+    /// Time a retention sweep over a million messages and 10,000 labels.
+    ///
+    /// Run on its own, in release mode:
+    /// `cargo test --release -- --ignored large_db --nocapture`.
+    ///
+    /// The message deletion and the label step are timed separately by running
+    /// them one after the other on one copy of the database (the second sweep
+    /// then has no messages left to expire), and the combined single-
+    /// transaction sweep is timed on an identical copy.
+    ///
+    /// The same message deletion takes very different times on byte-identical
+    /// copies (about 1.5 s to 7 s on the development machine, with no pattern
+    /// in which copy is slow), so the message-only figure is taken twice and
+    /// the label step is compared with the faster one.  The label step itself
+    /// is a few milliseconds either way.
+    #[test]
+    #[ignore = "builds a million-row database; run with --release"]
+    fn large_db_retention_sweep() {
+        use crate::core::labels::MAX_LABELS;
+        use crate::core::seen::{SeenDevices, MAX_SEEN};
+        use std::time::{Duration, Instant};
+
+        const MESSAGES: u32 = 1_000_000;
+        // Distinct devices that have messages.
+        const DEVICES: u32 = 100_000;
+        // Labelled devices 0..5_000 keep recent messages and so survive.
+        const STORED: u32 = 5_000;
+        // Labelled devices 5_000..7_500 have only expired messages.
+        const EXPIRED_ONLY: u32 = 2_500;
+        // Labelled devices DEVICES..DEVICES+2_500 never had a message.
+        const ABSENT: u32 = 2_500;
+        // Every device sends 10 messages, in 10 passes; in the first 6 passes
+        // the messages are old enough to expire.
+        const OLD_PASSES: u32 = 6;
+
+        let tmp = TempDb::new("large");
+        let path_a = tmp.path();
+        let cutoff = Utc::now() - chrono::Duration::days(30);
+        let names: Vec<String> = (0..DEVICES + ABSENT).map(large_device).collect();
+
+        // ---- Build ---------------------------------------------------------
+        let t = Instant::now();
+        let s = Storage::open(&path_a).unwrap();
+        let mut expected_expired = 0usize;
+        {
+            let old_ts: Vec<String> = (0..3600)
+                .map(|k| {
+                    (cutoff - chrono::Duration::hours(1) - chrono::Duration::seconds(k))
+                        .to_rfc3339()
+                })
+                .collect();
+            let new_ts: Vec<String> = (0..3600)
+                .map(|k| {
+                    (cutoff + chrono::Duration::hours(1) + chrono::Duration::seconds(k))
+                        .to_rfc3339()
+                })
+                .collect();
+            let mut conn = s.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            {
+                let mut insert = tx
+                    .prepare(
+                        "INSERT INTO messages (
+                            id, timestamp, direction, status, source_protocol, freq_mhz,
+                            datarate, mtype, dev_addr, dev_eui, payload_size
+                        ) VALUES (?1, ?2, 'up', 'forwarded', 'udp', 868.1, 'SF7BW125', ?3, ?4, ?5, 23)",
+                    )
+                    .unwrap();
+                for i in 0..MESSAGES {
+                    let d = i % DEVICES;
+                    let pass = i / DEVICES;
+                    let expired = (STORED..STORED + EXPIRED_ONLY).contains(&d) || pass < OLD_PASSES;
+                    if expired {
+                        expected_expired += 1;
+                    }
+                    let ts = if expired { &old_ts } else { &new_ts };
+                    let name = &names[d as usize];
+                    let (mtype, addr, eui) = if d.is_multiple_of(4) {
+                        ("JoinRequest", None, Some(name))
+                    } else {
+                        ("UnconfirmedDataUp", Some(name), None)
+                    };
+                    insert
+                        .execute(params![
+                            format!("m{i}"),
+                            ts[(i % 3600) as usize],
+                            mtype,
+                            addr,
+                            eui
+                        ])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let build_messages = t.elapsed();
+
+        // ---- Labels, through the public API at the real limit ---------------
+        let t = Instant::now();
+        let labelled: Vec<u32> = (0..STORED + EXPIRED_ONLY)
+            .chain(DEVICES..DEVICES + ABSENT)
+            .collect();
+        assert_eq!(labelled.len(), MAX_LABELS);
+        for &d in &labelled {
+            let name = &names[d as usize];
+            assert_eq!(
+                s.set_label(name, &format!("device {d}"), true, MAX_LABELS)
+                    .unwrap(),
+                LabelWrite::Set
+            );
+        }
+        assert_eq!(
+            s.set_label("FFFFFFFF", "one too many", true, MAX_LABELS)
+                .unwrap(),
+            LabelWrite::LimitReached
+        );
+        // Replacing at the limit still works.
+        assert_eq!(
+            s.set_label(&names[0], "device 0", true, MAX_LABELS)
+                .unwrap(),
+            LabelWrite::Set
+        );
+        let build_labels = t.elapsed();
+        assert_eq!(s.count().unwrap(), MESSAGES as i64);
+        assert_eq!(expected_expired, 610_000);
+
+        // Fold the write-ahead log into the main file and copy it, so that
+        // every sweep starts from a byte-identical database.
+        s.conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+        drop(s);
+        let path_b = format!("{path_a}.b");
+        let path_c = format!("{path_a}.c");
+        std::fs::copy(&path_a, &path_b).unwrap();
+        std::fs::copy(&path_a, &path_c).unwrap();
+        let size_mb = std::fs::metadata(&path_a).unwrap().len() as f64 / 1_048_576.0;
+
+        // The rule: a live list as full as it can get, none of it labelled
+        // orphans, so every orphan is rejected.
+        let seen = SeenDevices::new();
+        for d in (STORED + EXPIRED_ONLY)..DEVICES {
+            seen.note(&names[d as usize]);
+        }
+        let mut extra = 0u32;
+        while seen.len() < MAX_SEEN {
+            seen.note(&format!("EE{extra:06X}"));
+            extra += 1;
+        }
+        assert_eq!(seen.len(), MAX_SEEN);
+        let window = Duration::from_secs(3600);
+        let rule = |d: &str| seen.seen_within(d, window);
+
+        let remaining = (MESSAGES as usize - expected_expired) as i64;
+        let orphans = (EXPIRED_ONLY + ABSENT) as usize;
+        let survivors: Vec<String> = {
+            let mut v: Vec<String> = (0..STORED).map(|d| names[d as usize].clone()).collect();
+            v.sort();
+            v
+        };
+        let check_end_state = |store: &Storage| {
+            assert_eq!(store.count().unwrap(), remaining);
+            assert_eq!(
+                store.labels().unwrap().into_keys().collect::<Vec<_>>(),
+                survivors
+            );
+        };
+
+        // ---- Copy 1: messages first, then the label step on its own ---------
+        let one = Storage::open(&path_a).unwrap();
+        let t = Instant::now();
+        let first = one.delete_older_than(cutoff, OrphanPolicy::Keep).unwrap();
+        let messages_only = t.elapsed();
+        assert_eq!(first.messages, expected_expired);
+        assert!(first.labels.is_empty());
+        assert_eq!(one.count().unwrap(), remaining);
+
+        // The orphan query alone, and its plan, on the post-deletion table.
+        let (orphan_query, plan) = {
+            let conn = one.conn.lock().unwrap();
+            let t = Instant::now();
+            let n = conn
+                .prepare(ORPHAN_LABELS_SQL)
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .count();
+            let took = t.elapsed();
+            assert_eq!(n, orphans);
+            (took, query_plan(&conn, ORPHAN_LABELS_SQL, &[]))
+        };
+        assert_uses_both_device_indexes(&plan);
+
+        let t = Instant::now();
+        let second = one
+            .delete_older_than(cutoff, OrphanPolicy::KeepIf(&rule))
+            .unwrap();
+        let labels_only = t.elapsed();
+        assert_eq!(second.messages, 0);
+        assert_eq!(second.labels.len(), orphans);
+        check_end_state(&one);
+
+        // ---- Copy 2: both steps in one transaction --------------------------
+        let two = Storage::open(&path_b).unwrap();
+        let t = Instant::now();
+        let both = two
+            .delete_older_than(cutoff, OrphanPolicy::KeepIf(&rule))
+            .unwrap();
+        let combined = t.elapsed();
+        assert_eq!(both.messages, expected_expired);
+        assert_eq!(both.labels.len(), orphans);
+        check_end_state(&two);
+
+        // ---- Copy 3: messages only again ------------------------------------
+        // The first sweep of a process pays for growing the page cache and the
+        // write-ahead log, so the message-only figure is taken a second time
+        // after the combined sweep; the two are shown side by side.
+        let three = Storage::open(&path_c).unwrap();
+        let t = Instant::now();
+        let repeat = three.delete_older_than(cutoff, OrphanPolicy::Keep).unwrap();
+        let messages_only_again = t.elapsed();
+        assert_eq!(repeat.messages, expected_expired);
+        assert_eq!(three.count().unwrap(), remaining);
+
+        // Both ways of labelling ended on the same labels.
+        let mut removed_split = second.labels.clone();
+        let mut removed_combined = both.labels.clone();
+        removed_split.sort();
+        removed_combined.sort();
+        assert_eq!(removed_split, removed_combined);
+
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        println!();
+        println!(
+            "large_db: {MESSAGES} messages, {MAX_LABELS} labels ({STORED} stored, {EXPIRED_ONLY} expired-only, \
+             {ABSENT} absent), {DEVICES} devices with messages, live list holding {} identifiers",
+            seen.len()
+        );
+        println!(
+            "large_db: database file {size_mb:.0} MiB; build: messages {:.1} s, labels {:.1} s",
+            build_messages.as_secs_f64(),
+            build_labels.as_secs_f64()
+        );
+        println!(
+            "large_db: delete {} expired messages only (OrphanPolicy::Keep): {:.0} ms on one copy, {:.0} ms on another",
+            first.messages,
+            ms(messages_only),
+            ms(messages_only_again)
+        );
+        println!(
+            "large_db: label step alone (KeepIf, nothing left to expire): {:.1} ms, removed {} labels \
+             (orphan query alone: {:.1} ms)",
+            ms(labels_only),
+            second.labels.len(),
+            ms(orphan_query)
+        );
+        println!(
+            "large_db: both steps in one transaction on a second copy: {:.0} ms (messages {}, labels {})",
+            ms(combined),
+            both.messages,
+            both.labels.len()
+        );
+        println!(
+            "large_db: label step is {:.2}% of the combined sweep and {:.2}% of the message deletion",
+            100.0 * ms(labels_only) / ms(combined),
+            100.0 * ms(labels_only) / ms(messages_only.min(messages_only_again))
+        );
+        println!("large_db: EXPLAIN QUERY PLAN for the orphan query:");
+        for line in &plan {
+            println!("large_db:   {line}");
+        }
     }
 }

@@ -31,7 +31,9 @@ export function StatusBar({ total, shown, blocked, wsStatus, isLive, onToggleLiv
         {WS_LABEL[wsStatus]}
       </span>
 
-      <span className="status-copyright">&copy; RAKwireless 2026</span>
+      <span className="status-copyright">
+        v{__APP_VERSION__} | &copy; Xose Pérez for RAKwireless 2026
+      </span>
 
       <button
         className={`live-toggle ${isLive ? 'live' : 'paused'}`}

@@ -7,8 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Upgrade note:** a WebUI or API reached by host name, rather than by IP
+> address or `localhost`, now needs that name in `allowed_hosts`. See
+> "Changed" below.
+
 ### Added
 
+- **Device labels.** Give a device a name from the WebUI, such as "Qingping
+  T&H Havana" for `00E8A80B`. A label belongs to the identifier the Device
+  column shows: the DevAddr on data frames, the DevEUI on join requests.
+  - A **Label** column (hidden by default) shows it on every row with that
+    identifier, past and live. Clicking a cell opens a dialog to set, change
+    or remove the label (Enter saves, Escape cancels, an empty label removes).
+  - Changes appear at once in every open WebUI, without a reload.
+  - The device filter also matches labels.
+  - The CSV export has a `label` column, always quoted; a label starting with
+    `=`, `+`, `-` or `@` gets a leading apostrophe so a spreadsheet does not
+    read it as a formula.
+  - Labels are stored in the database (a new `device_labels` table, added to
+    existing databases in place), at most 64 characters each and 10,000 in
+    all. They live as long as their identifier has a stored record or was
+    seen live within the retention period, and nothing is removed during the
+    first retention period after a start, so a restart never removes a label.
+  - The sniffer keeps a best-effort, in-memory list of identifiers seen live
+    (at most 100,000), so rows that were never written to the database can be
+    labelled too.
+  - Labels follow identifiers, not devices: a device that rejoins gets a new
+    DevAddr, and its DevEUI label and DevAddr label are separate. Labels are
+    not added to MQTT payloads, and there is no authentication on label
+    editing.
+- **Label API and `/ws/labels`.** `GET /api/labels` returns every label,
+  `PUT /api/labels/{device}` (JSON body `{"label": "..."}`) sets or replaces
+  one and `DELETE /api/labels/{device}` removes it. The new WebSocket
+  `/ws/labels` sends the full set on connect, then one event per change in the
+  order the changes were saved, and a fresh full set to a client that falls
+  behind. `/api/messages` and `/ws` are unchanged. Writes follow the same
+  Origin rule as WebSocket handshakes, and origins listed in `cors_origins`
+  may now also use `PUT` and `DELETE`.
+- **`allowed_hosts`** in `[sniffer.api]` (`SNIFFER_API_ALLOWED_HOSTS` in
+  Docker): the host names the WebUI and API may be reached by. IP addresses and
+  `localhost` always work. `["*"]` turns the check off, and with it the
+  protection against DNS rebinding, so it is unsafe. The README describes both
+  ways to set this up behind a reverse proxy, with nginx examples.
 - **Release archives** for x86_64 and aarch64 Linux (`make dist`), with a
   `SHA256SUMS` file. Each holds the static binary, a systemd service, an
   install script and the configuration templates, and is reproducible.
@@ -36,9 +76,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly `$NAME` with no such variable set is logged at startup by key (never
   by value), instead of the text being used silently, for example as an MQTT
   password.
+- **`tools/gwsim.py --joins N` and `--random-devaddr`:** simulated gateways
+  that also send JoinRequests (a fixed DevEUI per gateway, printed at start)
+  and data uplinks from a new random DevAddr each time. The fake LNS now
+  counts the frames it receives by message type.
 
 ### Changed
 
+- **Breaking: a WebUI or API reached by host name, rather than by IP address
+  or `localhost`, needs that name in `allowed_hosts`.** The sniffer now checks
+  the `Host` header of every request (WebUI, REST and both WebSockets) to stop
+  DNS rebinding, where a web page points its own domain name at the sniffer so
+  that its requests look same-origin. A request for any other host name gets
+  `403` with a plain-text message that names the setting. Access by IP address
+  or `localhost` is not affected. Add the name under `[sniffer.api]`, or set
+  `SNIFFER_API_ALLOWED_HOSTS` in Docker. Behind a reverse proxy, either pass
+  the original `Host` through and list the public name, or let the proxy send
+  an IP address as `Host` and list the public origin in `cors_origins`.
 - **Same-origin API by default.** With `cors_origins` empty the API sends no
   CORS headers (it used to allow every origin), and the WebSocket feed refuses
   handshakes from other sites. Before, any web page open in a browser that
@@ -48,6 +102,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Concentratord commands are no longer logged at INFO, which filled the
   journal on busy servers; startup, gateway sessions and warnings still are.
 - Docker images are based on Alpine 3.23 (3.20 is no longer supported).
+- **WebUI filter bar without the direction filter**, so the filters fit an
+  800-pixel-wide screen. The Dir column still shows each message's direction.
+  A direction filter saved in the browser by an earlier version no longer
+  applies.
+- **The WebUI footer shows the version**, as
+  "v2.1.0 | © Xose Pérez for RAKwireless 2026". The version comes from
+  `webui/package.json`, and a test fails if it differs from the crate's.
 
 ### Fixed
 

@@ -3,6 +3,7 @@ export interface ColumnConfig {
   dir: boolean;
   mtype: boolean;
   device: boolean;
+  label: boolean;
   gateway: boolean;
   joinEui: boolean;
   devNonce: boolean;
@@ -24,6 +25,8 @@ export const DEFAULT_COLUMNS: ColumnConfig = {
   dir: true,
   mtype: true,
   device: true,
+  // Opt-in like the other wide columns: it would push the table past 800 px.
+  label: false,
   // The short gateway form fits in the width left over at 800 px; the other
   // new columns are opt-in because they would push the table past it.
   gateway: true,
@@ -47,6 +50,7 @@ const LABELS: Record<keyof ColumnConfig, string> = {
   dir: 'Dir',
   mtype: 'Type',
   device: 'Device',
+  label: 'Label',
   gateway: 'Gateway',
   joinEui: 'JoinEUI',
   devNonce: 'DevNonce',

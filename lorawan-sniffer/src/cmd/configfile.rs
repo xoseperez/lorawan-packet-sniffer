@@ -25,6 +25,17 @@ const TEMPLATE: &str = r##"
     # Allowed CORS origins (optional).
     # cors_origins = ["https://example.com"]
 
+    # Host names the WebUI and API answer to. IP addresses and "localhost"
+    # always work and need no entry; a request for any other name is refused
+    # with 403. This protects against DNS rebinding, where a web page points
+    # its own domain name at this machine to read the captured traffic from
+    # the visitor's browser. To open the WebUI by name, list the name without
+    # a port, for example ["sniffer.example.com"]. Behind a reverse proxy
+    # that passes the Host header on, list the public name. ["*"] turns the
+    # check off and is unsafe. In Docker, set SNIFFER_API_ALLOWED_HOSTS to a
+    # comma-separated list.
+    allowed_hosts = [{{#each sniffer.api.allowed_hosts}}"{{this}}"{{#unless @last}}, {{/unless}}{{/each}}]
+
   [sniffer.database]
     # Path to the SQLite database file.
     path = "{{ sniffer.database.path }}"
@@ -205,6 +216,8 @@ mod tests {
         config.sniffer.log_to_syslog = true;
         config.sniffer.api.bind = "127.0.0.1:9000".to_string();
         config.sniffer.api.cors_origins = vec!["https://example.com".to_string()];
+        config.sniffer.api.allowed_hosts =
+            vec!["sniffer.example.com".to_string(), "lab-pc".to_string()];
         config.sniffer.database.path = r#"C:\data\"quoted" & <odd>=it's.db"#.to_string();
         config.sniffer.database.retention = Duration::from_secs(7 * 24 * 3600);
 
@@ -268,6 +281,84 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains(r#"mode = "listen""#), "{rendered}");
+    }
+
+    #[test]
+    fn allowed_hosts_are_written_as_an_array() {
+        let render_hosts = |hosts: &[&str]| {
+            let mut config = Configuration::default();
+            config.sniffer.api.allowed_hosts = hosts.iter().map(|h| h.to_string()).collect();
+            render(&config)
+        };
+
+        let rendered = render_hosts(&[]);
+        assert!(
+            rendered.contains("\n    allowed_hosts = []\n"),
+            "{rendered}"
+        );
+        assert!(parse(&rendered).sniffer.api.allowed_hosts.is_empty());
+
+        let rendered = render_hosts(&["sniffer.example.com"]);
+        assert!(
+            rendered.contains("\n    allowed_hosts = [\"sniffer.example.com\"]\n"),
+            "{rendered}"
+        );
+
+        let rendered = render_hosts(&["a.example", "b.example", "c.example"]);
+        assert!(
+            rendered
+                .contains("\n    allowed_hosts = [\"a.example\", \"b.example\", \"c.example\"]\n"),
+            "{rendered}"
+        );
+        let reloaded = parse(&rendered);
+        assert_eq!(
+            reloaded.sniffer.api.allowed_hosts,
+            ["a.example", "b.example", "c.example"]
+        );
+        config::validate(&reloaded).unwrap();
+
+        // The unsafe opt-out survives a round trip as it is written.
+        let reloaded = parse(&render_hosts(&["*"]));
+        assert_eq!(reloaded.sniffer.api.allowed_hosts, ["*"]);
+        config::validate(&reloaded).unwrap();
+    }
+
+    #[test]
+    fn allowed_hosts_comment_explains_the_setting() {
+        let rendered = render(&Configuration::default());
+        let comment: String = rendered
+            .lines()
+            .take_while(|line| !line.trim_start().starts_with("allowed_hosts"))
+            .skip_while(|line| !line.contains("Host names the WebUI"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for phrase in [
+            "IP addresses",
+            "localhost",
+            "DNS rebinding",
+            "reverse proxy",
+            "Host header",
+            "unsafe",
+            "SNIFFER_API_ALLOWED_HOSTS",
+        ] {
+            assert!(comment.contains(phrase), "no '{phrase}' in:\n{comment}");
+        }
+    }
+
+    #[test]
+    fn awkward_allowed_hosts_stay_inside_their_strings() {
+        // Validation rejects such entries, but the template must not let one
+        // break out of its string if one is ever rendered.
+        let mut config = Configuration::default();
+        config.sniffer.api.allowed_hosts = vec![r#"a"b\c"#.to_string(), "d&e'f".to_string()];
+
+        let reloaded = parse(&render(&config));
+
+        assert_eq!(
+            reloaded.sniffer.api.allowed_hosts,
+            config.sniffer.api.allowed_hosts
+        );
     }
 
     #[test]

@@ -36,6 +36,15 @@
     # Allowed CORS origins (optional).
     # cors_origins = ["https://example.com"]
 
+    # Host names the WebUI and API answer to. IP addresses and "localhost"
+    # always work and need no entry; a request for any other name gets a 403.
+    # This stops DNS rebinding, where a web page points its own domain name
+    # at this machine to read the captured traffic from the visitor's browser.
+    # Uncomment and list the name, without a port, to open the WebUI by host
+    # name. Behind a reverse proxy that passes the Host header on, list the
+    # public name. ["*"] turns the check off and is unsafe.
+    # allowed_hosts = ["sniffer.example.com"]
+
   [sniffer.database]
     # Path to the SQLite database file. The service owns /var/lib/lorawan-sniffer.
     path = "/var/lib/lorawan-sniffer/sniffer.db"

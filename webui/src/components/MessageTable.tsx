@@ -1,5 +1,6 @@
+import { useMemo } from 'react';
 import { TableVirtuoso, TableComponents } from 'react-virtuoso';
-import { MessageRecord, MType, Status, shortEui } from '../types/messages';
+import { MessageRecord, MType, Status, deviceId, shortEui } from '../types/messages';
 import { ColumnConfig } from './ColumnPicker';
 
 type SortDir = 'asc' | 'desc';
@@ -10,6 +11,19 @@ interface Props {
   sortDir: SortDir;
   onToggleSort: () => void;
   isLive: boolean;
+  /** Label text by device identifier. */
+  labels: Record<string, string>;
+  /** Opens the label dialog for an identifier. */
+  onEditLabel: (device: string) => void;
+}
+
+// Handed to react-virtuoso as `context`. Virtuoso only re-renders the visible
+// rows when one of its own inputs changes, and it may keep the item renderer it
+// was given earlier, so values that change over time (the labels) go through
+// `context` instead of being captured by a closure.
+interface TableContext {
+  labels: Record<string, string>;
+  onEditLabel: (device: string) => void;
 }
 
 function formatTime(ts: string): string {
@@ -110,30 +124,37 @@ function FlagsCell({ msg }: { msg: MessageRecord }) {
   );
 }
 
-function makeComponents(columns: ColumnConfig): TableComponents<MessageRecord> {
-  return {
-    TableRow: ({ item, ...props }) => (
-      <tr
-        {...props}
-        className={item.status === 'Blocked' ? 'row-blocked' : undefined}
-      />
-    ),
-    Table: ({ style, ...props }) => (
-      <table {...props} style={{ ...style, tableLayout: 'fixed', width: '100%' }} />
-    ),
-  };
-  void columns;
-}
+// Defined once at module level. Virtuoso treats a new component function as a
+// new component type, so rebuilding this object on every render would unmount
+// and remount every row each time a message arrives, dropping keyboard focus
+// from a label cell the user had just tabbed to.
+//
+// Virtuoso passes `context` to custom components. It is taken out here so it is
+// not spread onto the DOM element.
+const COMPONENTS: TableComponents<MessageRecord, TableContext> = {
+  TableRow: ({ item, context: _context, ...props }) => (
+    <tr
+      {...props}
+      className={item.status === 'Blocked' ? 'row-blocked' : undefined}
+    />
+  ),
+  Table: ({ style, context: _context, ...props }) => (
+    <table {...props} style={{ ...style, tableLayout: 'fixed', width: '100%' }} />
+  ),
+};
 
-export function MessageTable({ messages, columns, sortDir, onToggleSort, isLive }: Props) {
-  const components = makeComponents(columns);
+export function MessageTable({
+  messages, columns, sortDir, onToggleSort, isLive, labels, onEditLabel,
+}: Props) {
+  const context = useMemo<TableContext>(() => ({ labels, onEditLabel }), [labels, onEditLabel]);
 
   return (
-    <TableVirtuoso<MessageRecord>
+    <TableVirtuoso<MessageRecord, TableContext>
       data={messages}
+      context={context}
       style={{ height: '100%' }}
       followOutput={isLive ? 'smooth' : false}
-      components={components}
+      components={COMPONENTS}
       fixedHeaderContent={() => (
         <tr>
           {columns.time && (
@@ -144,6 +165,7 @@ export function MessageTable({ messages, columns, sortDir, onToggleSort, isLive 
           {columns.dir     && <th className="col-dir">Dir</th>}
           {columns.mtype   && <th className="col-mtype">Type</th>}
           {columns.device  && <th className="col-device">Device</th>}
+          {columns.label   && <th className="col-label">Label</th>}
           {columns.gateway && <th className="col-gateway">Gateway</th>}
           {columns.joinEui && <th className="col-joineui">JoinEUI</th>}
           {columns.devNonce && <th className="col-devnonce" title="DevNonce">Nonce</th>}
@@ -160,13 +182,41 @@ export function MessageTable({ messages, columns, sortDir, onToggleSort, isLive 
           {columns.status  && <th className="col-status">S</th>}
         </tr>
       )}
-      itemContent={(_, msg) => <RowCells msg={msg} columns={columns} />}
+      itemContent={(_, msg, ctx) => <RowCells msg={msg} columns={columns} ctx={ctx} />}
     />
   );
 }
 
-function RowCells({ msg, columns }: { msg: MessageRecord; columns: ColumnConfig }) {
-  const device    = msg.dev_addr ?? msg.dev_eui ?? '';
+// The label of the row's device. The whole cell is the button, so the touch
+// target is as large as the cell, and Enter and Space work as on any button.
+// Rows without an identifier (join accepts, rejoin requests, proprietary and
+// truncated frames) get an empty, inert cell. The label is rendered as text,
+// never as HTML.
+function LabelCell({ msg, ctx }: { msg: MessageRecord; ctx: TableContext }) {
+  const device = deviceId(msg);
+  if (device === null) return <td className="col-label" />;
+
+  const label: string | undefined = ctx.labels[device];
+
+  return (
+    <td className="col-label">
+      <button
+        type="button"
+        className={`label-cell ${label ? 'label-set' : 'label-empty'}`}
+        title={label ?? 'Add a label'}
+        aria-label={label ? `Label ${label} of ${device}, edit` : `Add a label for ${device}`}
+        onClick={() => ctx.onEditLabel(device)}
+      >
+        {label ?? '+'}
+      </button>
+    </td>
+  );
+}
+
+function RowCells({
+  msg, columns, ctx,
+}: { msg: MessageRecord; columns: ColumnConfig; ctx: TableContext }) {
+  const device    = deviceId(msg) ?? '';
   const mcat      = MTYPE_CAT[msg.mtype] ?? 'other';
 
   return (
@@ -187,6 +237,7 @@ function RowCells({ msg, columns }: { msg: MessageRecord; columns: ColumnConfig 
         </td>
       )}
       {columns.device  && <td className="col-device mono">{device}</td>}
+      {columns.label   && <LabelCell msg={msg} ctx={ctx} />}
       {columns.gateway && (
         <td className="col-gateway mono" title={msg.gateway_eui ?? undefined}>
           {msg.gateway_eui ? shortEui(msg.gateway_eui) : ''}

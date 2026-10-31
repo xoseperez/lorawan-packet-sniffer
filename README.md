@@ -15,7 +15,8 @@ Sits between one or more gateways and a LoRaWAN Network Server (LNS), capturing 
 - **MQTT publishing** — optionally publish every captured message as JSON to an MQTT broker over TCP or TLS (including mutual TLS), with a configurable topic template
 - **Self-forwarding protection** — refuses to start with an upstream that is its own port, and cuts any packet loop that still happens at runtime
 - **Persistent storage** — SQLite database with configurable retention; databases from earlier versions are upgraded in place
-- **Real-time WebUI** — React 19 SPA with WebSocket feed, live/pause toggle, client-side filters (device, gateway, MType, direction, status, time range), sortable table, column visibility, color-coded signal quality (SNR thresholds are spreading-factor-aware), dark/light theme, CSV export
+- **Real-time WebUI** — React 19 SPA with WebSocket feed, live/pause toggle, client-side filters (device or label, gateway, MType, status, time range), sortable table, column visibility, color-coded signal quality (SNR thresholds are spreading-factor-aware), dark/light theme, CSV export
+- **Device labels** — give a device a name from the WebUI ("Qingping T&H Havana" instead of `00E8A80B`); the label is stored in the database, shown on every row of that device, found by the device filter, included in the CSV export, and updated in every open WebUI at once
 - **Single binary** — React frontend is embedded at compile time; no separate web server needed
 - **Self-contained** — ZeroMQ and SQLite are compiled into the binary; no runtime system dependencies
 
@@ -74,7 +75,7 @@ sudo systemctl enable --now lorawan-sniffer
 journalctl -u lorawan-sniffer -f
 ```
 
-The WebUI is then at `http://<host>:8888`. It has no authentication, so anyone who can reach that port sees all captured traffic; on a machine reachable from untrusted networks, set `bind = "127.0.0.1:8888"` in `[sniffer.api]` and use an SSH tunnel or a reverse proxy.
+The WebUI is then at `http://<host>:8888`. It has no authentication, so anyone who can reach that port sees all captured traffic and can edit [device labels](#device-labels); on a machine reachable from untrusted networks, set `bind = "127.0.0.1:8888"` in `[sniffer.api]` and use an SSH tunnel or a reverse proxy. Reach it by IP address or `localhost`; to use a host name, list the name in `allowed_hosts` first (see [Host check](#host-check)).
 
 ### Next to the LNS on the same machine
 
@@ -232,6 +233,7 @@ When running with Docker, the sniffer can be configured entirely via environment
 |---|---|---|
 | `SNIFFER_LOG_LEVEL` | Log verbosity (`TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`) | `INFO` |
 | `SNIFFER_API_BIND` | Address and port for the WebUI / HTTP API | `0.0.0.0:8888` |
+| `SNIFFER_API_ALLOWED_HOSTS` | Comma-separated host names (not IP addresses, which always work) the WebUI and API may be reached by, e.g. `sniffer.example.com,sniffer.lan`; see [Host check](#host-check) | empty |
 | `SNIFFER_DATABASE_PATH` | Path to the SQLite database file | `/var/lib/lorawan-sniffer/sniffer.db` |
 | `SNIFFER_DATABASE_RETENTION` | How long to keep messages (e.g. `30days`, `12hours`) | `30days` |
 | `GATEWAY_PROTOCOL` | Backend protocol (`udp` or `concentratord`) | `udp` |
@@ -291,6 +293,8 @@ The sniffer is configured via a TOML file. Run `lorawan-sniffer configfile` to p
 [sniffer.api]
   bind = "0.0.0.0:8888"
   # cors_origins = ["https://example.com"]   # default: only the sniffer's own WebUI
+  # allowed_hosts = ["sniffer.example.com"]  # host names the WebUI may be reached by;
+                                             # IP addresses and localhost always work
 
 [sniffer.database]
   path      = "/var/lib/lorawan-sniffer/sniffer.db"
@@ -431,6 +435,52 @@ Concentratord runs on the gateway itself, so this mode always handles one gatewa
 
 When running in Docker, the sniffer container must share the host IPC namespace or a tmpfs volume with concentratord so the ZMQ IPC sockets are accessible. See the comments in `docker-compose.yml`.
 
+## Device labels
+
+The WebUI shows a device only by its DevAddr (`00E8A80B`), or by its DevEUI on join requests. A label is a short name you attach to that identifier, such as "Qingping T&H Havana", so you do not have to remember which hex address belongs to which device. Labels are set from the WebUI and stored in the sniffer's database, so they survive restarts. They are not part of the captured records: `/api/messages`, the `/ws` feed and the MQTT payloads are unchanged, and nothing about labels touches forwarding.
+
+### What can be labelled
+
+A label belongs to the identifier the Device column shows:
+
+- the **DevAddr** on data frames, uplinks and downlinks alike (`00E8A80B`);
+- the **DevEUI** on join requests (`36:31:39:54:36:5D:05:39`).
+
+A record never has both. Rows with no identifier have an empty Label cell that cannot be edited: join accepts, rejoin requests, proprietary frames, and join or data frames too short to decode. A join accept is encrypted, so the sniffer cannot tell which DevEUI got which DevAddr, and it does not decode the DevEUI of rejoin requests.
+
+### Editing a label
+
+1. Switch the **Label** column on in the column picker. It is hidden by default, and the browser remembers the choice.
+2. Click or tap the Label cell of a row. A dialog opens with the identifier, a text field with the current label, and Save, Delete (only when the device has a label) and Cancel buttons.
+3. Press Enter or Save to save. Escape, Cancel or a click outside the dialog closes it without saving. Saving an empty label removes it. If saving fails (network error, invalid label, limit reached), the dialog stays open and says why.
+
+Every row with that identifier changes at once, past and live, in this browser and in every other open WebUI, with no reload. A WebUI that loses its connection gets the current labels again when it reconnects. If two people edit the same label at almost the same time, the last write wins everywhere.
+
+The **device filter** also matches labels: typing `havana` keeps the rows whose label, DevAddr or DevEUI contains it, in any case. The **CSV export** has a `label` column after the existing ones, filled for labelled rows even when the Label column is hidden. The label is always written in double quotes, with inner quotes doubled. A label that starts with `=`, `+`, `-` or `@` gets a leading apostrophe in the CSV (`'=1+1`), so a spreadsheet opens it as text and not as a formula; the apostrophe may be visible there. The label itself is not changed in the WebUI or the API.
+
+Labels are not added to MQTT payloads. Other programs can read them from `GET /api/labels` (see [Label endpoints](#label-endpoints)).
+
+### Limits
+
+A label is Unicode text, trimmed, at most 64 characters and with no control characters. At most 10,000 labels exist at once. A label too long for its cell is cut off with an ellipsis, and the full text shows as a tooltip.
+
+### How long a label lives
+
+- A label is kept as long as its identifier has a record in the database.
+- A label whose identifier has no stored record is kept while the identifier was seen in live traffic within the retention period (`retention` in `[sniffer.database]`).
+- Otherwise the retention sweep removes it, and the removal reaches every open WebUI.
+- Nothing is removed during the first retention period after the sniffer starts, so a restart never removes a label: each one gets a full retention period for its device to be stored or heard again. That period starts again with every start, so a sniffer restarted more often than once per retention period keeps labels whose identifier has no stored record indefinitely. The 10,000-label limit bounds how many of these can pile up.
+
+An identifier can be labelled if it has a record in the database or was seen live within the retention period. The second case covers rows that reached the WebUI but were never saved, because the database writer drops records under load rather than slow forwarding down. To allow it, the sniffer keeps an in-memory list of the identifiers it has seen live, with the time each was last seen. The list is not saved, and it is best effort: under extreme load it can miss an identifier, which becomes labellable again with its next stored or observed record. It holds at most 100,000 identifiers; beyond that, new ones are not added until older ones expire, and a warning is logged. An identifier that is neither stored nor in the list is refused with `404`.
+
+### Labels follow identifiers, not devices
+
+An OTAA device gets a new DevAddr every time it joins, and a DevAddr can later be reused by another device. The label stays with the DevAddr, not with the physical device, so after a rejoin the device shows up unlabelled and has to be labelled again. A device's DevEUI label (on its join requests) and its DevAddr label (on its data frames) are also separate labels; set both if you want to see the name on both kinds of row.
+
+### Who can edit labels
+
+There is no authentication. Anyone who can open the WebUI can add, change and remove labels, just as they can already read all the captured traffic. The [Host and Origin checks](#cross-origin-access) only keep other web sites out; they are not a login.
+
 ## Architecture
 
 ```
@@ -452,9 +502,56 @@ All messages are normalized into a unified `MessageRecord` before storage and br
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/ws` | WebSocket — real-time message feed |
+| `GET` | `/ws` | WebSocket — real-time message feed (`message` events only) |
+| `GET` | `/ws/labels` | WebSocket — the device labels, then every change |
 | `GET` | `/api/messages` | REST — historical messages (`since`, `limit` query params) |
+| `GET` | `/api/labels` | REST — every device label |
+| `PUT` | `/api/labels/{device}` | REST — set or replace a device label |
+| `DELETE` | `/api/labels/{device}` | REST — remove a device label |
 | `GET` | `/*` | Embedded React SPA |
+
+Every request, including the WebSockets, must pass the [Host check](#host-check).
+
+### Label endpoints
+
+`{device}` is an identifier in the same text form as the records: `00E8A80B` for a DevAddr, `36:31:39:54:36:5D:05:39` for a DevEUI. On input, upper or lower case is accepted, and a DevEUI may be written with colons, dashes or no separators. Responses and the label list always use the record form.
+
+```bash
+# every label, as {"<device>": "<label>", ...}
+curl http://localhost:8888/api/labels
+
+# set or replace a label (an empty label removes it)
+curl -X PUT -H 'Content-Type: application/json' \
+     -d '{"label": "Qingping T&H Havana"}' \
+     http://localhost:8888/api/labels/00E8A80B
+
+# remove a label
+curl -X DELETE http://localhost:8888/api/labels/00E8A80B
+```
+
+`PUT` takes a JSON body, `{"label": "..."}`. The label is trimmed and checked against the [limits](#limits). It answers:
+
+| Status | Meaning |
+|---|---|
+| `200` | Saved. Body `{"device": "00E8A80B", "label": "Qingping T&H Havana"}`, with `"label": null` when an empty label removed it |
+| `400` | Malformed identifier, a body that is not `{"label": "<text>"}`, or a label longer than 64 characters or containing control characters |
+| `403` | The request's `Origin` names another site (see [Cross-origin access](#cross-origin-access)) |
+| `404` | The identifier has no stored record and was not seen live within the retention period |
+| `409` | 10,000 labels already exist and this identifier has none; replacing or removing a label always works |
+| `415` | The request has no `Content-Type: application/json` |
+| `500` | The database failed |
+
+`DELETE` answers `204` with no body, also when the label did not exist, and `400` or `403` as above. Error bodies are `{"error": "<message>"}`; a refused Host is plain text instead.
+
+**`/ws/labels`** keeps a WebUI in step with the database. Messages from the server:
+
+```json
+{"type": "labels", "data": {"00E8A80B": "Qingping T&H Havana", "36:31:39:54:36:5D:05:39": "Havana sensor"}}
+{"type": "label",  "data": {"device": "00E8A80B", "label": "Qingping T&H Havana"}}
+{"type": "label",  "data": {"device": "00E8A80B", "label": null}}
+```
+
+On connect it sends the full set as a `labels` message. After that it sends one `label` message per change, in the order the changes were saved, with `"label": null` for a removal. That includes changes made by the API and labels removed by the retention sweep. A change that reached the server is always published, even if the client that sent it gave up waiting for the answer. A client that falls behind receives a fresh `labels` message instead of the changes it missed, so it always ends up matching the database. The `/ws` feed is unchanged and carries no label messages.
 
 ### Message records
 
@@ -478,16 +575,95 @@ The WebUI has matching Gateway (last 8 hex digits, full EUI in the tooltip), Joi
 
 ### Cross-origin access
 
-The API and the live feed have no authentication, so by default only the sniffer's own WebUI can use them from a browser: the API sends no CORS headers, and a WebSocket handshake whose `Origin` names another site is refused with 403. Without this, any web page open in a browser that can reach the sniffer could read the captured traffic. Clients that are not browsers (curl, scripts) send no `Origin` and are not affected.
+The API and the live feeds have no authentication, so by default only the sniffer's own WebUI can use them from a browser:
 
-To let a dashboard on another origin use the API and the live feed, list it:
+- The API sends no CORS headers, so other sites cannot read it.
+- A WebSocket handshake (`/ws`, `/ws/labels`) or a label write (`PUT`, `DELETE`) must carry no `Origin`, an `Origin` that names the host the request was sent to (one of the sniffer's own pages), or one listed in `cors_origins`. Anything else is refused with 403.
+- Writes use `PUT` (with a JSON body) and `DELETE`, which no HTML form can send; a `PUT` without `Content-Type: application/json` gets 415.
+
+Without this, any web page open in a browser that can reach the sniffer could read the captured traffic or change labels. Clients that are not browsers (curl, scripts) send no `Origin`; they are accepted on purpose, and only the Host check below applies to them.
+
+To let a dashboard on another origin use the API and both live feeds, list it. A listed origin may also write labels: the CORS response allows `GET`, `PUT` and `DELETE` with a JSON `Content-Type`.
 
 ```toml
 [sniffer.api]
   cors_origins = ["https://dashboard.example.com"]
 ```
 
-Behind a reverse proxy, either pass the original `Host` header through (nginx: `proxy_set_header Host $host;`) or list the public origin in `cors_origins`; otherwise the WebUI's live feed is refused.
+#### Host check
+
+Those rules do not stop DNS rebinding: a web page points its own domain name at the sniffer's address, so the browser treats the page as same-origin and lets it read the captured traffic and change labels. The sniffer therefore also checks the `Host` of every request to the WebUI, the REST API and both WebSockets:
+
+- An IP address (IPv4 or IPv6, any port) or `localhost` always works.
+- A host name works only when it is listed in `allowed_hosts` in `[sniffer.api]`.
+- Any other `Host` gets a `403` with a plain-text message that names the host and the setting to change, for example: `Host 'sniffer.lan:8888' is not allowed. Add "sniffer.lan" to [sniffer.api] allowed_hosts (SNIFFER_API_ALLOWED_HOSTS in Docker); IP addresses and localhost always work.`
+
+```toml
+[sniffer.api]
+  allowed_hosts = ["sniffer.example.com", "sniffer.lan"]
+```
+
+In Docker, set `SNIFFER_API_ALLOWED_HOSTS=sniffer.example.com,sniffer.lan`; the setting also accepts a comma-separated string in the TOML file. Entries are bare host names, with no scheme, port or path. The port of a request is ignored, so `sniffer.lan` covers `sniffer.lan:8888`. An invalid entry stops the sniffer at startup.
+
+**Upgrading:** versions before this one answered to any `Host`. If you open the WebUI by IP address or `localhost`, nothing changes. If you use a host name, add it to `allowed_hosts`.
+
+`allowed_hosts = ["*"]` turns the check off, and with it the protection against DNS rebinding. It is **unsafe**: use it only when neither of the reverse-proxy set-ups below fits.
+
+**Behind a reverse proxy**, what matters is which `Host` reaches the sniffer. There are two ways to do it, shown here for nginx.
+
+*Set-up A: pass the original `Host` through and list the public name.* The Host the sniffer sees is the public name, which also matches the browser's `Origin`, so no `cors_origins` entry is needed.
+
+```toml
+[sniffer.api]
+  allowed_hosts = ["sniffer.example.com"]
+```
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name sniffer.example.com;
+    # ssl_certificate / ssl_certificate_key ...
+
+    location / {
+        proxy_pass http://127.0.0.1:8888;
+        proxy_set_header Host $http_host;    # the client's Host, port included
+    }
+
+    location /ws {                           # also covers /ws/labels
+        proxy_pass http://127.0.0.1:8888;
+        proxy_set_header Host $http_host;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 1h;               # /ws/labels is silent between edits
+    }
+}
+```
+
+*Set-up B: let the proxy send an IP address as `Host` and list the public origin in `cors_origins`.* An IP `Host` always passes the check, and the browser's `Origin` no longer matches it, so the public origin has to be listed.
+
+```toml
+[sniffer.api]
+  cors_origins = ["https://sniffer.example.com"]
+```
+
+```nginx
+    location / {
+        proxy_pass http://127.0.0.1:8888;
+        proxy_set_header Host 127.0.0.1:8888;
+    }
+
+    location /ws {                           # also covers /ws/labels
+        proxy_pass http://127.0.0.1:8888;
+        proxy_set_header Host 127.0.0.1:8888;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 1h;
+    }
+```
+
+These two `location` blocks replace the ones in set-up A's `server` block. Without a `proxy_set_header Host` line, nginx sends the address from `proxy_pass`, which is set-up B when that is an IP address; if `proxy_pass` uses a host name (a Docker service name, say), that name is what the sniffer sees and it has to be listed. In set-up B the sniffer sees only the IP address, so it can no longer tell names apart: the proxy must answer only for its own `server_name`, so keep this `server` block from being the `default_server`.
 
 ## Known limitations
 
@@ -496,6 +672,7 @@ Behind a reverse proxy, either pass the original `Host` header through (nginx: `
 - In proxy mode all gateways are forwarded to the one configured LNS.
 - Listen mode never sends downlinks and cannot block anything.
 - FOpts MAC commands are not decoded; only their length is exported.
+- **Label editing has no authentication.** Anyone who can open the WebUI can add, change and remove [device labels](#device-labels). The Host and Origin checks keep other web sites out, not other people. Restrict who can reach the port (bind to `127.0.0.1`, a firewall, a VPN, or a reverse proxy that asks for a login).
 
 ## Testing
 
@@ -507,7 +684,7 @@ The tests include loopback tests for multi-gateway routing, listen mode and the 
 
 Two helper scripts live in `tools/`:
 
-- `tools/gwsim.py` — a Semtech UDP simulator (Python 3, standard library only): N simulated gateways, each with separate push and pull sockets like a real packet forwarder, plus a fake LNS that sends ACKs and downlinks. Use it to try the sniffer without hardware or to run a 100-gateway load test; the usage examples are at the top of the file.
+- `tools/gwsim.py` — a Semtech UDP simulator (Python 3, standard library only): N simulated gateways, each with separate push and pull sockets like a real packet forwarder, plus a fake LNS that sends ACKs and downlinks. Use it to try the sniffer without hardware or to run a 100-gateway load test; the usage examples are at the top of the file. `--joins N` makes each gateway also send a JoinRequest every N uplinks, from a fixed DevEUI per gateway that is printed at start, so there are DevEUI rows to label. `--random-devaddr` gives every data uplink a new random DevAddr, which fills the sniffer's list of identifiers seen live. The fake LNS counts the frames it receives by message type, so a run can show that the JoinRequests arrived.
 - `tools/procstat.sh` — prints the peak and current memory (`VmHWM`, `VmRSS`) and the open file descriptors of a running process, for example `tools/procstat.sh "$(pidof lorawan-sniffer)" 10`.
 
 ## License

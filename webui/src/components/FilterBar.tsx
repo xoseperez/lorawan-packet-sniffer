@@ -3,7 +3,6 @@ import { MType, Status, shortEui } from '../types/messages';
 export interface FilterState {
   device: string;
   mtype: MType[];
-  direction: 'all' | 'up' | 'down';
   status: 'all' | Status;
   gateway: string; // gateway EUI, '' = all gateways
   timePreset: '5m' | '15m' | '1h' | '24h' | 'all';
@@ -12,7 +11,6 @@ export interface FilterState {
 export const DEFAULT_FILTERS: FilterState = {
   device: '',
   mtype: [],
-  direction: 'all',
   status: 'all',
   gateway: '',
   timePreset: '5m',
@@ -99,18 +97,6 @@ export function FilterBar({ filters, onChange, gateways }: Props) {
           ))}
         </div>
       </details>
-
-      <select
-        className="filter-select"
-        value={filters.direction}
-        onChange={e =>
-          update({ direction: e.target.value as FilterState['direction'] })
-        }
-      >
-        <option value="all">Dir: All</option>
-        <option value="up">Up ▲</option>
-        <option value="down">Down ▼</option>
-      </select>
 
       <select
         className="filter-select"
