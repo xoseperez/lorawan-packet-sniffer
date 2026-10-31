@@ -4,6 +4,10 @@ A transparent MITM monitoring proxy for LoRaWAN gateways.
 
 Sits between one or more gateways and a LoRaWAN Network Server (LNS), capturing and decoding all uplinks and downlinks in real time, with an optional selective message-blocking engine. It can also run without any LNS, just recording what the gateways send.
 
+Version 2 is a rewrite in Rust. The original version 1 (v0.x releases) lives on the [`v1` branch](https://github.com/xoseperez/lorawan-packet-sniffer/tree/v1).
+
+![The WebUI showing live traffic from three gateways, with device labels](docs/images/webui.png)
+
 ## Features
 
 - **Dual-protocol support** — Semtech UDP Packet Forwarder and ChirpStack Concentratord (ZMQ/Protobuf)
@@ -45,7 +49,7 @@ Each release has an archive for x86_64 and one for aarch64 (arm64) Linux, holdin
 ```bash
 VERSION=2.1.0
 ARCH=$(uname -m)    # x86_64 or aarch64
-BASE=https://github.com/xoseperez/lorawan-packet-sniffer-rs/releases/download/v$VERSION
+BASE=https://github.com/xoseperez/lorawan-packet-sniffer/releases/download/v$VERSION
 curl -LO $BASE/lorawan-sniffer-$VERSION-linux-$ARCH.tar.gz
 curl -LO $BASE/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
@@ -221,7 +225,7 @@ Releases are built by GitHub Actions (`.github/workflows/release.yml`) when a ve
 The workflow refuses to release if the tag is not exactly `v` plus the version in `Cargo.toml`, if the tagged commit is not on `master`, if `CHANGELOG.md` has no section for the version, or if the tests fail. It then publishes:
 
 - a GitHub Release `vX.Y.Z` whose notes are the changelog section, with `lorawan-sniffer-X.Y.Z-linux-x86_64.tar.gz`, `lorawan-sniffer-X.Y.Z-linux-aarch64.tar.gz` and `SHA256SUMS`;
-- the multi-arch (amd64 + arm64) image `ghcr.io/xoseperez/lorawan-packet-sniffer-rs` tagged `X.Y.Z`, `X.Y` and `latest`.
+- the multi-arch (amd64 + arm64) image `ghcr.io/xoseperez/lorawan-packet-sniffer` tagged `X.Y.Z`, `X.Y` and `latest`.
 
 A version with a suffix (`2.2.0-rc.1`) is published as a pre-release and only gets its full-version image tag. To test the pipeline without releasing anything, run the workflow by hand (Actions > Release > Run workflow): it builds and packages everything, builds the image without pushing it, and keeps the archives as the `release-files` artifact of the run.
 

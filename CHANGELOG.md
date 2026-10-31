@@ -68,7 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Automated releases.** Pushing a `vX.Y.Z` tag on `master` builds the x86_64
   and aarch64 Linux archives, publishes them with a `SHA256SUMS` file as a
   GitHub Release (notes taken from this changelog), and pushes a multi-arch
-  (amd64 + arm64) image to `ghcr.io/xoseperez/lorawan-packet-sniffer-rs`.
+  (amd64 + arm64) image to `ghcr.io/xoseperez/lorawan-packet-sniffer`.
   Versions with a suffix such as `-rc.1` are published as pre-releases and do
   not move the `latest` image tag. The workflow can also be run by hand as a
   dry run that publishes nothing.
@@ -83,6 +83,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **New home: `github.com/xoseperez/lorawan-packet-sniffer`.** The Rust
+  version now lives in the original project's repository, on `master`; the
+  original version 1 is on the `v1` branch, with its full history and tags.
+  The Docker image is `ghcr.io/xoseperez/lorawan-packet-sniffer`.
 - **Breaking: a WebUI or API reached by host name, rather than by IP address
   or `localhost`, needs that name in `allowed_hosts`.** The sniffer now checks
   the `Host` header of every request (WebUI, REST and both WebSockets) to stop
@@ -112,6 +116,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The WebUI opened on its oldest rows.** With the table sorted newest
+  first (the default), loading the history scrolled it to the end, so the
+  page showed the oldest loaded messages until scrolled back up. It now opens
+  at the newest. Sorting oldest first also orders timestamps by time rather
+  than as text, which misplaced some of them.
 - An upstream given by name, such as `localhost`, could resolve to `::1`
   first, and the sniffer forwarded there even when the LNS or multiplexer
   only listened on IPv4, so nothing arrived. IPv4 addresses are now
@@ -285,6 +294,6 @@ protocols (Semtech UDP and ChirpStack Concentratord).
 - **Docker support** — single-stage `Dockerfile`; `make docker-buildx` pushes
   a multi-arch image (amd64 + arm64).
 
-[Unreleased]: https://github.com/xoseperez/lorawan-packet-sniffer-rs/compare/v2.1.0...HEAD
-[2.1.0]: https://github.com/xoseperez/lorawan-packet-sniffer-rs/compare/v2.0.0...v2.1.0
-[2.0.0]: https://github.com/xoseperez/lorawan-packet-sniffer-rs/releases/tag/v2.0.0
+[Unreleased]: https://github.com/xoseperez/lorawan-packet-sniffer/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/xoseperez/lorawan-packet-sniffer/compare/v2.0.0...v2.1.0
+[2.0.0]: https://github.com/xoseperez/lorawan-packet-sniffer/releases/tag/v2.0.0

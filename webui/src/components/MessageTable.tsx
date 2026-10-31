@@ -153,7 +153,11 @@ export function MessageTable({
       data={messages}
       context={context}
       style={{ height: '100%' }}
-      followOutput={isLive ? 'smooth' : false}
+      // Follow new rows only when they arrive at the bottom (oldest first).
+      // Newest first, they appear at the top on their own; following there
+      // would scroll to the end, and since an empty table counts as "at the
+      // end", the history loaded on start would open on its oldest rows.
+      followOutput={isLive && sortDir === 'asc' ? 'smooth' : false}
       components={COMPONENTS}
       fixedHeaderContent={() => (
         <tr>

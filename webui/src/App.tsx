@@ -179,7 +179,9 @@ export function App() {
     }
 
     if (sortDir === 'asc') {
-      result = [...result].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+      // Compare as times, not text: the sniffer writes as many fractional
+      // digits as a timestamp needs, so ".5Z" would sort after ".500001Z".
+      result = [...result].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
     } else {
       // desc — messages arrive in ascending order; reverse in place is fast
       result = sortDir === 'desc' ? [...result].reverse() : result;

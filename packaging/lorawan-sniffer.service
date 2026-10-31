@@ -1,6 +1,6 @@
 [Unit]
 Description=LoRaWAN Packet Sniffer
-Documentation=https://github.com/xoseperez/lorawan-packet-sniffer-rs
+Documentation=https://github.com/xoseperez/lorawan-packet-sniffer
 After=network-online.target
 Wants=network-online.target
 
