@@ -15,11 +15,13 @@ use crate::core::eui::Eui64;
 use crate::core::filter::FilterRule;
 use crate::core::linelog::error_line;
 use crate::core::metadata::MessageRecord;
+use crate::core::random::{random_bytes, RandomSource, SystemRandomSource};
 use crate::core::ratelimit::RateLimitedLog;
 use crate::core::seen::SeenDevices;
-use crate::core::storage::Storage;
+use crate::core::storage::{SecretError, Storage};
 use crate::core::writer::WriterItem;
 
+use crate::api::auth::Auth;
 use crate::api::labels::{LabelWriter, WriterError};
 use crate::api::{self, ApiContext};
 use crate::config::{self, Configuration, UdpMode};
@@ -99,6 +101,12 @@ pub async fn run(config: &Configuration) -> Result<()> {
     })?;
     info!("Database opened at '{}'", config.sniffer.database.path);
 
+    // The login's key is read, or made on the first start, before anything
+    // listens: a sniffer that cannot make it must not come up serving the
+    // API without the login the operator asked for.
+    let random: Arc<dyn RandomSource> = Arc::new(SystemRandomSource::new());
+    let login = start_login(config, &storage, &random)?;
+
     // Channel: proxy tasks → storage writer.  The API keeps a weak handle to
     // queue markers on, so that it never holds the queue open once the proxy
     // has stopped.
@@ -176,6 +184,7 @@ pub async fn run(config: &Configuration) -> Result<()> {
         allowed_hosts: config.sniffer.api.allowed_hosts.clone(),
         writer_queue,
         write_failures,
+        login,
     };
     tokio::spawn(async move {
         run_api(api_context, api_bind, api_cancel).await;
@@ -498,6 +507,49 @@ fn note_sighting(seen: &SeenDevices, envelope: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// WebUI login
+// ---------------------------------------------------------------------------
+
+/// Set up the WebUI login if the configuration turns it on: read the session
+/// secret from the database, or make it on the first start, then build the
+/// [`Auth`] around it and the token.
+///
+/// With login off this touches neither the random source nor the database, so
+/// turning the login off never needs either to work.  Every failure is an
+/// error that stops startup, with a message that says what to do; none of
+/// them holds the token or the secret.
+fn start_login(
+    config: &Configuration,
+    storage: &Storage,
+    random: &Arc<dyn RandomSource>,
+) -> Result<Option<Arc<Auth>>> {
+    let api = &config.sniffer.api;
+    if !api.login {
+        info!("WebUI login is off");
+        return Ok(None);
+    }
+    let path = &config.sniffer.database.path;
+    let secret = storage
+        .session_secret(|| random_bytes::<32>(&**random))
+        .map_err(|e| match e {
+            SecretError::Random(e) => {
+                anyhow!("cannot read random bytes for the WebUI login: {e}")
+            }
+            SecretError::Storage(e) => {
+                anyhow!("cannot store the WebUI session key in the database at '{path}': {e}")
+            }
+            SecretError::Damaged => anyhow!(
+                "the WebUI session key in the database is damaged; delete the row in its \
+                 session_secret table to make a new one (every browser will have to log in \
+                 again)"
+            ),
+        })?;
+    let auth = Auth::new(&api.token, &secret, Arc::clone(random))?;
+    info!("WebUI login is on");
+    Ok(Some(Arc::new(auth)))
+}
+
+// ---------------------------------------------------------------------------
 // API server task
 // ---------------------------------------------------------------------------
 
@@ -515,7 +567,11 @@ async fn run_api(context: ApiContext, bind: String, cancel: CancellationToken) {
     };
 
     tokio::select! {
-        result = axum::serve(listener, app) => {
+        // The address of each client is what the login's failure lines name.
+        result = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        ) => {
             if let Err(e) = result {
                 error!("API server error: {}", e);
             }
@@ -1250,5 +1306,201 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    // -- WebUI login at startup ---------------------------------------------
+
+    /// A token of the shape the login asks for.
+    const LOGIN_TOKEN: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+
+    /// A configuration with the login `on` or off, for the database at `path`.
+    fn login_config(path: &str, on: bool) -> Configuration {
+        config_from(&format!(
+            "[sniffer.api]\nlogin = {on}\ntoken = \"{LOGIN_TOKEN}\"\n\
+             [sniffer.database]\npath = \"{path}\"\n"
+        ))
+    }
+
+    /// Every row of `session_secret`, read through a connection that cannot
+    /// write: the secret and when it was made.
+    fn stored_secrets(path: &str) -> Vec<(Vec<u8>, String)> {
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let mut statement = conn
+            .prepare("SELECT secret, created_at FROM session_secret ORDER BY id")
+            .unwrap();
+        let rows = statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        rows
+    }
+
+    fn system_random() -> Arc<dyn RandomSource> {
+        Arc::new(SystemRandomSource::new())
+    }
+
+    /// A source that serves `fills` requests and then fails.
+    struct FailsAfter(std::sync::atomic::AtomicUsize);
+
+    impl RandomSource for FailsAfter {
+        fn fill(&self, out: &mut [u8]) -> Result<(), crate::core::random::RandomError> {
+            let served = self
+                .0
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if !served {
+                return Err(crate::core::random::RandomError);
+            }
+            SystemRandomSource::new().fill(out)
+        }
+    }
+
+    /// A source that counts the requests it serves.
+    struct CountingRandom(std::sync::atomic::AtomicUsize);
+
+    impl RandomSource for CountingRandom {
+        fn fill(&self, out: &mut [u8]) -> Result<(), crate::core::random::RandomError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            SystemRandomSource::new().fill(out)
+        }
+    }
+
+    /// The error startup stops with, which it must not hold the token in.
+    fn startup_error(
+        config: &Configuration,
+        storage: &Storage,
+        random: &Arc<dyn RandomSource>,
+    ) -> String {
+        let error = start_login(config, storage, random)
+            .err()
+            .expect("startup should have stopped");
+        let text = format!("{error:#}");
+        assert!(!text.contains(LOGIN_TOKEN), "{text}");
+        text
+    }
+
+    #[test]
+    fn login_on_with_a_failing_random_source_stops_startup_and_stores_nothing() {
+        let tmp = crate::core::storage::TempDb::new("login-no-random");
+        let path = tmp.path();
+        let storage = Storage::open(&path).unwrap();
+        let random: Arc<dyn RandomSource> = Arc::new(crate::core::random::testing::FailingRandom);
+
+        let error = startup_error(&login_config(&path, true), &storage, &random);
+
+        assert!(
+            error.starts_with("cannot read random bytes for the WebUI login: "),
+            "{error}"
+        );
+        assert!(stored_secrets(&path).is_empty());
+    }
+
+    #[test]
+    fn login_on_stops_startup_when_the_source_fails_after_the_secret_was_made() {
+        // The secret takes one request and the login's own key another.
+        let tmp = crate::core::storage::TempDb::new("login-no-key");
+        let path = tmp.path();
+        let storage = Storage::open(&path).unwrap();
+        let random: Arc<dyn RandomSource> =
+            Arc::new(FailsAfter(std::sync::atomic::AtomicUsize::new(1)));
+
+        let error = startup_error(&login_config(&path, true), &storage, &random);
+
+        assert!(
+            error.starts_with("cannot read random bytes for the WebUI login: "),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn login_on_with_a_database_that_cannot_be_written_stops_startup_naming_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = crate::core::storage::TempDb::new("login-read-only");
+        let path = tmp.path();
+        drop(Storage::open(&path).unwrap());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&path).is_ok() {
+            eprintln!("skipped: file permissions do not bind this user");
+            return;
+        }
+        let storage = Storage::open(&path).unwrap();
+
+        let error = startup_error(&login_config(&path, true), &storage, &system_random());
+
+        assert!(
+            error.starts_with(&format!(
+                "cannot store the WebUI session key in the database at '{path}': "
+            )),
+            "{error}"
+        );
+        assert!(stored_secrets(&path).is_empty());
+    }
+
+    #[test]
+    fn login_on_with_a_damaged_secret_says_how_to_make_a_new_one() {
+        let tmp = crate::core::storage::TempDb::new("login-damaged");
+        let path = tmp.path();
+        let storage = Storage::open(&path).unwrap();
+        storage.session_secret(|| Ok([9; 32])).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "ignore_check_constraints", "ON")
+                .unwrap();
+            conn.execute("UPDATE session_secret SET secret = zeroblob(16)", [])
+                .unwrap();
+        }
+
+        let error = startup_error(&login_config(&path, true), &storage, &system_random());
+
+        assert_eq!(
+            error,
+            "the WebUI session key in the database is damaged; delete the row in its \
+             session_secret table to make a new one (every browser will have to log in again)"
+        );
+    }
+
+    #[test]
+    fn a_second_start_reads_the_same_secret_and_writes_nothing() {
+        let tmp = crate::core::storage::TempDb::new("login-twice");
+        let path = tmp.path();
+        let config = login_config(&path, true);
+        let source = Arc::new(CountingRandom(std::sync::atomic::AtomicUsize::new(0)));
+        let random: Arc<dyn RandomSource> = source.clone();
+
+        let storage = Storage::open(&path).unwrap();
+        let first = start_login(&config, &storage, &random).unwrap().unwrap();
+        let session = first.new_session(Utc::now()).unwrap();
+        // The secret, and the login's own key.
+        assert_eq!(source.0.load(Ordering::SeqCst), 2 + 1, "plus the session");
+        let made = stored_secrets(&path);
+        assert_eq!(made.len(), 1);
+        drop(storage);
+
+        let storage = Storage::open(&path).unwrap();
+        source.0.store(0, Ordering::SeqCst);
+        let second = start_login(&config, &storage, &random).unwrap().unwrap();
+
+        // Only the login's own key was asked for; the stored row is as it was
+        // and signs the same sessions.
+        assert_eq!(source.0.load(Ordering::SeqCst), 1);
+        assert_eq!(stored_secrets(&path), made);
+        assert!(second.session_valid(&session));
+    }
+
+    #[test]
+    fn login_off_needs_neither_random_bytes_nor_the_database() {
+        let tmp = crate::core::storage::TempDb::new("login-off");
+        let path = tmp.path();
+        let storage = Storage::open(&path).unwrap();
+        let random: Arc<dyn RandomSource> = Arc::new(crate::core::random::testing::FailingRandom);
+
+        let login = start_login(&login_config(&path, false), &storage, &random).unwrap();
+
+        assert!(login.is_none());
+        assert!(stored_secrets(&path).is_empty());
     }
 }

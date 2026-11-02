@@ -23,6 +23,7 @@ Version 2 is a rewrite in Rust. The original version 1 (v0.x releases) lives on 
 - **Real-time WebUI** — React 19 SPA with WebSocket feed, live/pause toggle, filters that search the database (device or label, gateway, MType, status, time range), sortable table, column visibility, color-coded signal quality (SNR thresholds are spreading-factor-aware), dark/light theme, CSV export
 - **History from the database** — a time range loads the newest 5,000 matching records from the database, with the exact count of what matches; live records are merged in, and every reconnect reloads the range so the table has no hole (see [WebUI history](#webui-history))
 - **Device labels** — give a device a name from the WebUI ("Qingping T&H Havana" instead of `00E8A80B`); the label is stored in the database, shown on every row of that device, found by the device filter, included in the CSV export, and updated in every open WebUI at once
+- **Optional login** — one shared token in `sniffer.toml` puts a login page in front of the WebUI and the whole API; a browser stays logged in until it is closed, scripts send the token as a Bearer header, and a limit on wrong tokens keeps guessing out (see [WebUI login](#webui-login)). Off by default
 - **Single binary** — React frontend is embedded at compile time; no separate web server needed
 - **Self-contained** — ZeroMQ and SQLite are compiled into the binary; no runtime system dependencies
 
@@ -43,6 +44,8 @@ xdg-open http://localhost:8888
 ```
 
 Point your LoRaWAN gateway at `<host>:1700` instead of the LNS directly. Set `GATEWAY_UDP_UPSTREAM_SERVER` to your LNS to forward the traffic; leave it unset to run in [listen mode](#listen-mode-no-lns) instead.
+
+The WebUI asks for nothing unless you turn on the [login](#webui-login) (`SNIFFER_API_LOGIN` and `SNIFFER_API_TOKEN`).
 
 ## Install as a service (bare metal)
 
@@ -69,7 +72,7 @@ sudo ./install.sh
 |---|---|
 | `/usr/local/bin/lorawan-sniffer` | the program |
 | `/etc/systemd/system/lorawan-sniffer.service` | the service |
-| `/etc/lorawan-sniffer/sniffer.toml` | configuration; an existing one is kept, and the new template is written next to it as `sniffer.toml.new` |
+| `/etc/lorawan-sniffer/sniffer.toml` | configuration; an existing one is kept, and the new template is written next to it as `sniffer.toml.new`. A new `sniffer.toml` and the `sniffer.toml.new` template each carry a freshly generated [login token](#where-the-generated-token-is); the login stays off until you turn it on |
 | `/etc/lorawan-sniffer/sniffer.env` | secrets, readable by root only; kept on upgrade |
 | `/var/lib/lorawan-sniffer/` | the database, created by the service |
 
@@ -81,7 +84,7 @@ sudo systemctl enable --now lorawan-sniffer
 journalctl -u lorawan-sniffer -f
 ```
 
-The WebUI is then at `http://<host>:8888`. It has no authentication, so anyone who can reach that port sees all captured traffic and can edit [device labels](#device-labels); on a machine reachable from untrusted networks, set `bind = "127.0.0.1:8888"` in `[sniffer.api]` and use an SSH tunnel or a reverse proxy. Reach it by IP address or `localhost`; to use a host name, list the name in `allowed_hosts` first (see [Host check](#host-check)).
+The WebUI is then at `http://<host>:8888`. Unless you turn on the [login](#webui-login) it asks for nothing, so anyone who can reach that port sees all captured traffic and can edit [device labels](#device-labels). On a machine reachable from untrusted networks, turn the login on (a fresh install has already put a generated token in `sniffer.toml`: set `login = true` in `[sniffer.api]` and restart), or set `bind = "127.0.0.1:8888"` and use an SSH tunnel or a reverse proxy. Reach it by IP address or `localhost`; to use a host name, list the name in `allowed_hosts` first (see [Host check](#host-check)).
 
 ### Next to the LNS on the same machine
 
@@ -106,6 +109,8 @@ MQTT_PASSWORD='p@ss"word\with$symbols'
 
 and refer to it from `sniffer.toml` as `password = "$MQTT_PASSWORD"`. Single-quoted values are taken literally.
 
+The same goes for the [login token](#who-can-read-the-token): `install.sh` writes a generated one into `sniffer.toml`, where every local user can read it, and `sniffer.env` is the place for it on a host with local users you do not trust.
+
 ### About the service
 
 - It runs as an unprivileged user that systemd creates on the fly, inside a sandbox: it can write only to `/var/lib/lorawan-sniffer`, holds no capabilities and sees a private `/tmp`. Ports below 1024 are therefore not available.
@@ -124,6 +129,8 @@ diff /etc/lorawan-sniffer/sniffer.toml /etc/lorawan-sniffer/sniffer.toml.new   #
 # Remove the program and the service (configuration and database are kept)
 sudo ./install.sh --uninstall
 ```
+
+`sniffer.toml.new` holds a login token generated for that run, so the `diff` always shows the `token` line as different; it is there to be copied if you [turn the login on](#where-the-generated-token-is). Your `sniffer.toml` is never edited.
 
 ## Deployment (Semtech UDP)
 
@@ -240,6 +247,8 @@ When running with Docker, the sniffer can be configured entirely via environment
 | `SNIFFER_LOG_LEVEL` | Log verbosity (`TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`) | `INFO` |
 | `SNIFFER_API_BIND` | Address and port for the WebUI / HTTP API | `0.0.0.0:8888` |
 | `SNIFFER_API_ALLOWED_HOSTS` | Comma-separated host names (not IP addresses, which always work) the WebUI and API may be reached by, e.g. `sniffer.example.com,sniffer.lan`; see [Host check](#host-check) | empty |
+| `SNIFFER_API_LOGIN` | `true` asks for the token before the WebUI and the API answer anything; see [WebUI login](#webui-login) | `false` |
+| `SNIFFER_API_TOKEN` | The login token: at least 32 hexadecimal characters, generated (`openssl rand -hex 16`). Used only when `SNIFFER_API_LOGIN` is `true`; the sniffer then refuses to start without a valid one | empty |
 | `SNIFFER_DATABASE_PATH` | Path to the SQLite database file | `/var/lib/lorawan-sniffer/sniffer.db` |
 | `SNIFFER_DATABASE_RETENTION` | How long to keep messages (e.g. `30days`, `12hours`) | `30days` |
 | `GATEWAY_PROTOCOL` | Backend protocol (`udp` or `concentratord`) | `udp` |
@@ -301,6 +310,9 @@ The sniffer is configured via a TOML file. Run `lorawan-sniffer configfile` to p
   # cors_origins = ["https://example.com"]   # default: only the sniffer's own WebUI
   # allowed_hosts = ["sniffer.example.com"]  # host names the WebUI may be reached by;
                                              # IP addresses and localhost always work
+  login = false                              # true: the WebUI and API ask for the token below
+  token = ""                                 # a generated token of 32+ hex characters, needed
+                                             # when login = true (see "WebUI login")
 
 [sniffer.database]
   path      = "/var/lib/lorawan-sniffer/sniffer.db"
@@ -505,7 +517,7 @@ A gateway passes on packets that failed their CRC check only when it is set to. 
 
 ### Existing databases: the first start after the upgrade
 
-The database goes to schema version 3 on the first start. The upgrade runs in place and keeps every row; it adds the `malformed` column and an internal flag that says whether a row has been checked.
+The database goes to schema version 4 on the first start. The upgrade runs in place and keeps every row; version 3 adds the `malformed` column and an internal flag that says whether a row has been checked, and version 4 an empty table for the [WebUI login](#sessions)'s secret.
 
 The sniffer then checks the rows already stored, **before it starts forwarding**, and marks those that are malformed:
 
@@ -515,12 +527,12 @@ The sniffer then checks the rows already stored, **before it starts forwarding**
 - **Log.** Before the check starts the sniffer says how much it will do, so a long first start is not mistaken for a hang:
 
   ```
-  Database schema upgraded from version 2 to 3
+  Database schema upgraded from version 2 to 4
   Checking every stored row for malformed frames (about N rows); forwarding starts when this is done
   Checked N stored rows, M malformed, in T ms
   ```
 
-  A new database logs "Database created at schema version 3" instead of the first line.
+  A new database logs "Database created at schema version 4" instead of the first line.
 - **If the check fails** (a full disk, for example), the sniffer logs `Could not check stored rows for malformed frames: <error>; will retry at the next start`, starts and forwards anyway, and tries again on the next start. Until one succeeds, old rows keep their made-up identifiers in the WebUI, the API and the label checks.
 - **If only the clean-up fails.** The check grows the write-ahead log and shrinks it again once it is saved. If the shrinking fails, the check stays done and is not repeated. The sniffer logs the warning `Checked the stored rows, but could not shrink the write-ahead log: <error>; it is removed when the sniffer next stops cleanly`, and the `-wal` file next to the database keeps its space until the sniffer next stops cleanly.
 - Rows this version stores are checked as they are recorded, so every later start, including one after a crash or a power cut, has nothing to check and adds no measurable delay.
@@ -546,7 +558,7 @@ A malformed frame has no identifier, so it never enters the list of identifiers 
 
 ### Editing a label
 
-1. Switch the **Label** column on in the column picker. It is hidden by default, and the browser remembers the choice.
+1. Switch the **Label** column on in the ⚙ Settings menu. It is hidden by default, and the browser remembers the choice.
 2. Click or tap the Label cell of a row. A dialog opens with the identifier, a text field with the current label, and Save, Delete (only when the device has a label) and Cancel buttons.
 3. Press Enter or Save to save. Escape, Cancel or a click outside the dialog closes it without saving. Saving an empty label removes it. If saving fails (network error, invalid label, limit reached), the dialog stays open and says why.
 
@@ -575,7 +587,7 @@ An OTAA device gets a new DevAddr every time it joins, and a DevAddr can later b
 
 ### Who can edit labels
 
-There is no authentication. Anyone who can open the WebUI can add, change and remove labels, just as they can already read all the captured traffic. The [Host and Origin checks](#cross-origin-access) only keep other web sites out; they are not a login.
+Anyone who can open the WebUI can add, change and remove labels, just as they can already read all the captured traffic. By default there is no login, and the [Host and Origin checks](#cross-origin-access) only keep other web sites out, not other people. To keep other people out, turn on the [WebUI login](#webui-login): one token then grants everything the WebUI can do, labels included. There are no separate rights for reading and for editing.
 
 ## WebUI history
 
@@ -590,7 +602,7 @@ The time selector (Last 5m, 15m, 1h, 24h, All time) and the filters ask the snif
 - **While a load runs,** the table keeps its rows and Matching reads "Loading…". A newer load cancels the older one and ignores its answer. A failed load keeps the rows and says why in the strip below the table.
 - **Live records** that match the filters are added to the loaded rows without duplicates, by `id`. A record that is in both is kept as the database holds it. Rows leave as they age out of the range, checked every 5 s even when nothing arrives. The table holds at most **10,000** rows, the oldest dropped first. A row that retention deletes from the database stays until it leaves the range or the next load.
 - **Pause.** While paused, live records wait in a buffer. Changing the range or a filter still loads and replaces the rows. A reload the WebUI starts by itself (after a reconnect, or a retry, see below) is held until you resume, then applied together with the live records received after it was sent. A buffer that overflowed (10,000 records) is replaced by a full load on resume.
-- **The CSV export** covers the rows shown.
+- **The CSV export** (⚙ Settings → Export CSV) covers the rows shown.
 
 ### The strip and the footer
 
@@ -649,6 +661,193 @@ On a development machine, with 1,000,000 records over 7 days, the newest 5,000 o
 
 On a RAK7391 (Compute Module 4, eMMC), with the same 1,000,000 records over 7 days: the last 24 h load in about 0.3 s; "Last 7 days" with malformed rows hidden in about 1.7 s; a device search over 7 days in about 2.5 s; every filter combined in about 4 s. A single gateway's database is usually several times smaller, and the times shrink with it. The writer still never waits for the lock, but while a long query reads the eMMC a single write can take a second or two; at one gateway's traffic that only delays saving by that much.
 
+## WebUI login
+
+By default the WebUI and the API ask for nothing: anyone who can reach the port sees every captured record and can edit [device labels](#device-labels). The login is an optional lock in front of them, with one shared **token** written in `sniffer.toml`. It is off by default, and with it off nothing changes: no cookie is set, no login page appears, and every existing route answers as before.
+
+With the login on:
+
+- the WebUI shows a login page, and the right token starts a session that lasts until the browser is closed;
+- `/ws`, `/ws/labels` and everything under `/api/` answer `401` without a session, and scripts pass the token as `Authorization: Bearer <token>`;
+- the WebUI's own files (the page and its scripts) stay public, because they are what asks for the token;
+- ten wrong tokens in a minute lock new logins and Bearer use out until the minute ends;
+- the [Host check](#host-check) still runs first.
+
+There are no user names, roles or separate rights: one token grants everything the WebUI can do, labels included. Forwarding, the gateway-facing ports and MQTT are not affected.
+
+### Turning it on
+
+```toml
+[sniffer.api]
+  login = true
+  token = "<32 hexadecimal characters>"   # yours, generated: see "The token" below
+```
+
+| Setting | Docker variable | Default | Meaning |
+|---|---|---|---|
+| `login` | `SNIFFER_API_LOGIN` | `false` | `true` asks for the token. With `false` the token is ignored and not even checked |
+| `token` | `SNIFFER_API_TOKEN` | empty | The shared secret. Written in the file, or as a `$VAR` reference like any other setting |
+
+The settings are read when the sniffer starts, so restart it (`sudo systemctl restart lorawan-sniffer`). The log then says `WebUI login is on`. The token is never written to the log.
+
+With the login on and no usable token the sniffer **refuses to start**, with a message that names `[sniffer.api] token` and says how to generate one. It never makes a token for you and never writes its configuration. The same goes for a `token = "$SNIFFER_API_TOKEN"` whose variable is not set.
+
+In Docker you set the two variables yourself; there is no installer. Keep the database on a volume (`/var/lib/lorawan-sniffer`, as the image declares), or every browser has to log in again whenever the container is recreated (see [Sessions](#sessions)):
+
+```yaml
+environment:
+  SNIFFER_API_LOGIN: "true"                 # true or false, in lower case
+  SNIFFER_API_TOKEN: "<the output of: openssl rand -hex 16>"
+```
+
+### The token
+
+The token must be at least 32 hexadecimal characters (`0-9`, `a-f`, either case) with at least 8 different ones. That is what `openssl rand -hex 16` and `lorawan-sniffer configfile` produce: 128 random bits. A token that does not match stops the sniffer at startup.
+
+This is a **format check**. It catches typos, short tokens and obvious repetitions such as `0000…` or `abab…`, but it cannot tell a generated token from one a person typed: `0123456789abcdef0123456789abcdef` passes. **Always generate the token.** The [lockout](#wrong-tokens-and-the-lockout) limits guessing either way, but only a random token is out of reach for an attacker who also has a copy of the database (see [Sessions](#sessions)).
+
+Generate one with either of these:
+
+```bash
+openssl rand -hex 16
+
+# a fresh token on the "token" line of the annotated template (the rest is the template)
+lorawan-sniffer configfile | grep '^ *token'
+```
+
+### Where the generated token is
+
+- **A fresh `install.sh` install:** in the new `/etc/lorawan-sniffer/sniffer.toml`, with `login = false`. The installer says so when it ends. Turning the login on is one line, `login = true`, and a restart.
+- **An `install.sh` upgrade:** your `sniffer.toml` is kept and never edited. The template `sniffer.toml.new` next to it carries a freshly generated token (a new one on every run) that you can copy into `[sniffer.api]` together with `login = true`.
+- **`lorawan-sniffer configfile`** prints the template with a freshly generated token, for manual and Docker set-ups. Two runs print two tokens.
+- **Docker:** you generate it and set `SNIFFER_API_TOKEN`.
+- **The Debian package (not released yet).** It will install `/etc/lorawan-sniffer/sniffer.toml` and `sniffer.env` as ordinary conffiles with the login off and `token = ""`, and it will generate no token. To turn the login on, edit the conffile: set `login = true` and a token from one of the commands above, or put `SNIFFER_API_TOKEN=…` in `sniffer.env` and write `token = "$SNIFFER_API_TOKEN"` in `sniffer.toml`. As for any edited conffile, dpkg keeps your version on upgrades and asks what to do when the package's own version changed too (or follows `--force-confold` / `--force-confnew`). `apt remove` keeps the database, so the sessions; a purge deletes it, and every browser has to log in again.
+
+After the install the token is yours: the sniffer reads it and never writes it.
+
+### Who can read the token
+
+| Deployment | Who can read the token |
+|---|---|
+| Packaged service or `install.sh` | Every local user of the host: `sniffer.toml` is installed `0644`, because the service's unprivileged user cannot read a root-only file |
+| Docker | Whoever can inspect or control the container, which already means controlling the Docker daemon |
+| A manual run | Whoever the file modes of your configuration allow; nothing is promised |
+
+On a host with local users you do not trust, keep the token out of `sniffer.toml`: put it in `/etc/lorawan-sniffer/sniffer.env` (readable by root only, which systemd reads before it starts the sniffer) and refer to it, as for the MQTT password in [Secrets](#secrets):
+
+```bash
+# /etc/lorawan-sniffer/sniffer.env (mode 0600)
+SNIFFER_API_TOKEN='<the output of: openssl rand -hex 16>'
+```
+
+```toml
+[sniffer.api]
+  login = true
+  token = "$SNIFFER_API_TOKEN"
+```
+
+That `token` line replaces the literal token `install.sh` wrote into `sniffer.toml`, which would otherwise stay readable by every local user, even while the login is off.
+
+### If an install is interrupted
+
+`install.sh` writes the token into a file that only root can read, renames it into place, and only then makes it readable by everyone (`0644`), so the token is never world-readable under a temporary name. If the install fails, or is stopped by a signal it can catch (Ctrl-C, `kill`), it exits with an error and leaves no temporary file and no half-written `sniffer.toml`; a file it did not create, such as an existing `sniffer.toml.new`, is never touched.
+
+Nothing can catch `kill -9` or a power cut. One of those can leave either of these:
+
+- A root-only `sniffer.toml.tmp.<number>` (or `sniffer.toml.new.tmp.<number>`) in `/etc/lorawan-sniffer`. The next run of `install.sh` removes it.
+- A complete `sniffer.toml` that is still readable by root only. The service cannot read it and does not start. Make it readable: `sudo chmod 0644 /etc/lorawan-sniffer/sniffer.toml`. Running `install.sh` again does not fix this, because it keeps an existing `sniffer.toml`.
+
+If only the last step fails, the `chmod` that makes the file readable by everyone, `install.sh` stops with an error that says the file is complete but readable by root only, and gives the command that fixes it: `chmod 0644 <the file>`.
+
+### The login page
+
+With the login on, any request for the WebUI without a session gets the login page, in the light or dark theme of the browser and sized for the 800×600 touchscreen. It has one field for the token (a password field, so the token is not shown) and a **Log in** button; Enter also submits. There is no user name.
+
+- A **wrong token** shows "Wrong token", and the text stays in the field for another try.
+- A **blank field** is not sent: the page says "Enter the token". Spaces around a pasted token are removed.
+- After ten wrong tokens in a minute the page shows "Too many wrong tokens; try again in N s" (see [the lockout](#wrong-tokens-and-the-lockout)).
+- If the sniffer accepts the token but the browser does not keep the cookie, the page says to allow cookies for this address.
+- If a reverse proxy changes the `Host` header, the page says the login was refused because of that (see [below](#plain-http-and-reverse-proxies)).
+
+The right token starts a session and the page becomes the WebUI as it is without a login.
+
+**Log out** is the last item of the ⚙ Settings menu, shown only when the login is on. It ends the session in that browser and returns to the login page; if the sniffer cannot be told, an alert says so and the session stays. Sessions are not kept on the server, so logging out removes this browser's cookie but cannot recall a cookie copied before; to end every session, [change the token](#sessions).
+
+If the session ends while the WebUI is open (the token was changed, the database replaced, or you logged out in another tab), the next request or reconnect shows the login page. The WebUI then stops trying to reconnect: it does not retry forever.
+
+### Sessions
+
+- **The cookie** is called `lorawan_sniffer_session`, with `HttpOnly`, `SameSite=Strict` and `Path=/`, and no expiry date, so it ends when the browser closes. A browser set to restore its previous session may keep it longer; that is the browser's choice. It is not `Secure` (see [Plain HTTP and reverse proxies](#plain-http-and-reverse-proxies)).
+- **The sniffer keeps nothing per session.** The cookie carries the time it was made and a random value, signed with a key made from two things: the token and a random 32-byte secret stored in the database. So memory does not grow with logins, and there is no server-side limit on a session's age: it ends when the browser closes, the token changes or the database is replaced.
+- **They survive a restart** of the sniffer, as long as the database is kept.
+- **A new token logs every browser out** (at the restart that reads it), and so does **a new database**: deleting or replacing it. `install.sh --uninstall` keeps the database, and with it the sessions.
+- **The secret** is in the `session_secret` table of the database, never in the configuration or the log. It is made once, at the first start with the login on, and only read at every later start, so a sniffer with the login off never writes it. If it cannot be made, the sniffer does not start and says why: no random bytes, a database that cannot be written (read-only, or full) at the first start, or another process holding the database's write lock for more than 5 seconds. A stored secret that is damaged (only editing the database by hand does that) also stops it, with the instruction to delete its row, which logs every browser out. The first start of this version adds the empty table, schema version 4, whether or not the login is on.
+- **Without the secret, a cookie cannot be forged, and a guessed token is not enough to build one,** so trying tokens by building cookies gets nowhere.
+
+**Who can read the secret.** Whoever can read the database, which already shows them every captured record: under the packaged service or `install.sh`, only root and the service (`/var/lib/private/lorawan-sniffer`); in Docker, whoever can read the database volume or its backups; in a manual run, whoever your file modes allow. With the secret alone they still cannot make a cookie, because the token is needed too. But with the secret **and** a captured cookie (a copy of the database, such as a backup, and a cookie taken from a browser or from plain HTTP) they can test token guesses offline, as fast as their hardware allows, since nothing limits them. A generated token makes that infeasible; the format check cannot promise that the token is one.
+
+### Wrong tokens and the lockout
+
+The token is only as strong as whoever made it, so the sniffer limits guessing whatever the token is:
+
+- **At most 10 wrong tokens are checked per one-minute window,** counted across all clients, on the login page and as Bearer tokens alike. A wrong token is answered at once with `401`; nothing is delayed or queued.
+- **Once ten are used,** every request that presents a token gets `429` with a `Retry-After` header until the window ends. The token is not checked during the lockout, so the answer tells nothing, and even the right token waits.
+- **The windows are fixed,** not a rolling minute: the first starts when the sniffer starts, each later one at the first token attempt after the previous one ended. Ten wrong tokens at the end of one window and ten at the start of the next can fall close together: at most 20 in any 60 seconds, never more.
+- **Right tokens are never counted,** so any number of right tokens arriving together are accepted outside a lockout.
+- **Browsers that are already logged in keep working:** session cookies are neither counted nor locked out. A request with a cookie that is not valid gets `401` and is not counted either.
+- **The price:** someone who can reach the port can keep new logins and Bearer use locked out by sending ten wrong tokens a minute. Open WebUIs go on working. That is what a limit that does not depend on the quality of the token costs.
+
+The log has one `WARN` for each window that locks (`WebUI login locked for N s after 10 wrong tokens`), and one for failed attempts (`WebUI login failed from <address>: wrong token`), at most one line every 10 seconds (it says how many were held back since the last one), never with what was typed. A successful login is logged at `INFO` (`WebUI login from <address>`). Behind a reverse proxy the address is the proxy's: `X-Forwarded-For` is never trusted. A browser that still holds a cookie from before a token change is logged as `invalid session` until it logs in again.
+
+### Scripts: the Bearer token
+
+Send the token in an `Authorization` header on any `/api/` route and on both WebSockets:
+
+```bash
+export TOKEN='<the token from sniffer.toml>'
+
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8888/api/messages
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8888/api/labels
+```
+
+```bash
+# any WebSocket client that can set a request header will do; with Node.js 24 the
+# built-in WebSocket takes a headers option:
+node -e 'new WebSocket("ws://localhost:8888/ws", { headers: { Authorization: `Bearer ${process.env.TOKEN}` } })
+  .onmessage = e => console.log(e.data)'
+```
+
+A browser's `WebSocket` cannot set headers; a web page uses the session cookie instead. The scheme name is case-insensitive. A header with another scheme, such as the `Authorization: Basic …` that browsers send to a reverse proxy that asks for its own password, is ignored, so the session cookie still works behind such a proxy. A `Bearer` header that is unusable (no token, spaces in it, repeated) counts as no credential, even if a valid cookie comes with it.
+
+What the sniffer answers with the login on:
+
+| Request | Answer |
+|---|---|
+| `/ws`, `/ws/labels` or `/api/…` with no credential, a wrong Bearer token or a cookie that is not valid | `401`, plain text: `Log in to the sniffer first: open the WebUI, or send Authorization: Bearer <token>.` No redirect and no `WWW-Authenticate` header (which would make a browser open its own password dialog). A wrong Bearer token is counted |
+| A token while locked out | `429` with `Retry-After` (whole seconds) and the text `Too many wrong tokens; try again in N s`, JSON `{"error": …}` on `/api/login` |
+| `POST /api/login`, body `{"token": "…"}` | `204` and the `Set-Cookie`; `400` for a body that is not that; `401` `{"error": "Wrong token"}`; `403` for another site or a proxy that changed `Host`; `413` for a body over 4 KiB; `415` when it is not JSON; `429`; `500` when the sniffer could not make a session (see its log) |
+| `POST /api/logout` | `204` and a cookie that has expired; `403` and `415` as for login |
+| `GET /api/session` | `{"login": true}` for a request with a credential, `401` without. With the login off, `{"login": false}` for anyone. The WebUI asks it to decide between the login page and the table |
+| `/` and the WebUI's files | The page and its scripts, with no credential. Every path outside `/ws`, `/ws/…` and `/api/…` is public and answers with the page, which holds no data; an odd spelling of an API path (`//api/…`, `/%61pi/…`) either needs a credential or returns only that page |
+
+`/api/login` and `/api/logout` exist only with the login on; with it off they are unknown paths and the page answers.
+
+### Plain HTTP and reverse proxies
+
+The sniffer serves plain HTTP only. Over plain HTTP the token, when it is typed on the login page or sent as a Bearer header, and the session cookie travel in clear, as all captured traffic already does. For anything beyond a network you trust, put an HTTPS reverse proxy in front (the examples under [Host check](#host-check) are for nginx).
+
+- **Bind the sniffer to `127.0.0.1` behind an HTTPS proxy.** The cookie is not `Secure`, because the sniffer itself speaks plain HTTP and a browser would not keep a `Secure` cookie for it. A browser sends a cookie without `Secure` over plain HTTP whenever it reaches the sniffer that way, even if an HTTPS proxy is also in front, so the sniffer's own port must be out of the browsers' reach: `bind = "127.0.0.1:8888"`, or in Docker `ports: ["127.0.0.1:8888:8888"]`.
+- **The proxy must pass the browser's `Host` header exactly, port included,** and that name must be in [`allowed_hosts`](#host-check) (an IP address always works). With nginx, `proxy_set_header Host $http_host;`, as in set-up A. `$host` drops the port, which only works on the default port, and without a `proxy_set_header Host` line nginx sends the address from `proxy_pass`. Login and logout accept only a request whose `Origin`, if it has one, carries the same host and port as its `Host`; a proxy that changes `Host` makes them fail closed with `403`, a message on the login page, and a log line that names both hosts (cut to a short length and stripped of unprintable characters). A name that is not in `allowed_hosts` never gets that far: the Host check refuses it first, with its own `403`. `X-Forwarded-Host` and the other forwarded headers are never trusted.
+- **Set-up B does not work with the login,** for the reason above: use set-up A.
+- **The scheme is not compared.** Behind a proxy that ends TLS the sniffer cannot know the browser's scheme, and browsers leave default ports out of both `Origin` and `Host`, so `http://sniffer.example` and `https://sniffer.example` look the same to it. Login and logout therefore also require `Content-Type: application/json`, which a form, a `no-cors` request or a beacon from another page cannot send.
+- **A proxy that asks for its own password** (basic authentication) can sit in front: the sniffer ignores `Authorization: Basic …`, so the session cookie works. A script has only one `Authorization` header, so it cannot pass both the proxy's password and the sniffer's token.
+
+**Two sniffers on one host.** Cookies are kept per host name, not per port, so `host:8888` and `host:8889` share one cookie name: logging in to one replaces the cookie of the other, and that one asks for its login again. They work independently, but only one at a time is logged in for a given host name. Reach them under different names (or one by IP address and one by name) to stay logged in to both.
+
+### Going back to a version without the login
+
+A version from before the login opens the same database (it ignores the new table, and the schema version stays) but has no login and ignores the `login` setting. **While it runs, its WebUI and API answer anyone who can reach them,** whatever your configuration says; this is a security downgrade. Before you start it, restrict access to the port: bind to `127.0.0.1`, or firewall it. Coming back to this version restores the login and the sessions, since the secret and the token are where you left them.
+
 ## Architecture
 
 ```
@@ -676,9 +875,12 @@ All messages are normalized into a unified `MessageRecord` before storage and br
 | `GET` | `/api/labels` | REST — every device label |
 | `PUT` | `/api/labels/{device}` | REST — set or replace a device label |
 | `DELETE` | `/api/labels/{device}` | REST — remove a device label |
+| `GET` | `/api/session` | REST — `{"login": true}` or `{"login": false}`. With the login on it needs a credential like the other `/api` routes, so a `200` means "logged in" and a `401` "log in first" (see [WebUI login](#webui-login)) |
+| `POST` | `/api/login` | REST — start a session: body `{"token": "..."}`. Exists only with the login on |
+| `POST` | `/api/logout` | REST — end the session in this browser. Exists only with the login on |
 | `GET` | `/*` | Embedded React SPA |
 
-Every request, including the WebSockets, must pass the [Host check](#host-check).
+Every request, including the WebSockets, must pass the [Host check](#host-check). With the [login](#webui-login) on, `/ws`, `/ws/labels` and everything under `/api/` except `/api/login` and `/api/logout` also need a session cookie or `Authorization: Bearer <token>`, and answer `401` without one; the files of the WebUI itself stay public. With the login on, add `-H "Authorization: Bearer $TOKEN"` to the `curl` examples below.
 
 ### Message history
 
@@ -709,7 +911,7 @@ Every filter must match (they are combined with AND), by the same rules the WebU
 | `X-History-Settled` | with `settle=true` | `true` when the storage writer had processed everything queued before the request, `false` when the 5 s wait ran out, or the storage writer had stopped, and the answer comes from what is saved |
 | `X-Storage-Write-Failures` | on every response of this route | How many records the database has failed to store since the sniffer started. It is 0 again after a restart |
 
-"Processed" means saved, or its failure was logged and counted. It does not mean that everything queued was saved, which is why the failure count has a header of its own. `X-Storage-Write-Failures` is also on `400`, `500` and `503` answers and on requests rejected for a bad parameter such as `limit=abc`, with their status and body unchanged. A request refused by the [Host check](#host-check) does not carry it: that check runs before any route. A script in another origin can read the four headers: the CORS response for a listed origin exposes them.
+"Processed" means saved, or its failure was logged and counted. It does not mean that everything queued was saved, which is why the failure count has a header of its own. `X-Storage-Write-Failures` is also on `400`, `500` and `503` answers and on requests rejected for a bad parameter such as `limit=abc`, with their status and body unchanged. A request refused by the [Host check](#host-check) does not carry it: that check runs before any route. Neither does the login's own `401` or `429`, which are answered before the route is reached. A script in another origin can read the four headers: the CORS response for a listed origin exposes them.
 
 **Answers**
 
@@ -772,13 +974,14 @@ curl -X DELETE http://localhost:8888/api/labels/00E8A80B
 |---|---|
 | `200` | Saved. Body `{"device": "00E8A80B", "label": "Qingping T&H Havana"}`, with `"label": null` when an empty label removed it |
 | `400` | Malformed identifier, a body that is not `{"label": "<text>"}`, or a label longer than 64 characters or containing control characters |
+| `401` | The [login](#webui-login) is on and the request has no valid session or token. Plain text, not JSON |
 | `403` | The request's `Origin` names another site (see [Cross-origin access](#cross-origin-access)) |
 | `404` | The identifier has no stored record and was not seen live within the retention period |
 | `409` | 10,000 labels already exist and this identifier has none; replacing or removing a label always works |
 | `415` | The request has no `Content-Type: application/json` |
 | `500` | The database failed |
 
-`DELETE` answers `204` with no body, also when the label did not exist, and `400` or `403` as above. Error bodies are `{"error": "<message>"}`; a refused Host is plain text instead.
+`DELETE` answers `204` with no body, also when the label did not exist, and `400`, `401` or `403` as above. Error bodies are `{"error": "<message>"}`; a refused Host and a `401` are plain text instead.
 
 **`/ws/labels`** keeps a WebUI in step with the database. Messages from the server:
 
@@ -813,7 +1016,7 @@ The WebUI has matching Gateway (last 8 hex digits, full EUI in the tooltip), Joi
 
 ### Cross-origin access
 
-The API and the live feeds have no authentication, so by default only the sniffer's own WebUI can use them from a browser:
+Whether or not the [login](#webui-login) is on, by default only the sniffer's own WebUI can use the API and the live feeds from a browser:
 
 - The API sends no CORS headers, so other sites cannot read it.
 - A WebSocket handshake (`/ws`, `/ws/labels`) or a label write (`PUT`, `DELETE`) must carry no `Origin`, an `Origin` that names the host the request was sent to (one of the sniffer's own pages), or one listed in `cors_origins`. Anything else is refused with 403.
@@ -821,12 +1024,14 @@ The API and the live feeds have no authentication, so by default only the sniffe
 
 Without this, any web page open in a browser that can reach the sniffer could read the captured traffic or change labels. Clients that are not browsers (curl, scripts) send no `Origin`; they are accepted on purpose, and only the Host check below applies to them.
 
-To let a dashboard on another origin use the API and both live feeds, list it. A listed origin may also write labels: the CORS response allows `GET`, `PUT` and `DELETE` with a JSON `Content-Type`.
+To let a dashboard on another origin use the API and both live feeds, list it. A listed origin may also write labels: the CORS response allows `GET`, `PUT` and `DELETE` with a JSON `Content-Type`, and the `Authorization` header.
 
 ```toml
 [sniffer.api]
   cors_origins = ["https://dashboard.example.com"]
 ```
+
+**With the login on,** a script on a listed origin sends the token as `Authorization: Bearer <token>`, which the CORS response allows. It cannot use the session cookie: that is `SameSite=Strict`, so a browser never sends it with a request another site makes. A listed origin does not open the login itself: `POST /api/login` and `POST /api/logout` accept only a request addressed to the sniffer's own host (an `Origin`, if there is one, must carry the request's host and port, and `cors_origins` is not consulted) that declares `Content-Type: application/json`. A form, a `no-cors` request or a beacon from another site cannot send that type, and a script that can needs a CORS preflight, which never allows `POST`. Another site therefore cannot log a browser in or out, whatever `cors_origins` says.
 
 #### Host check
 
@@ -903,7 +1108,7 @@ Leave `proxy_ignore_client_abort` at its default, `off`: nginx then closes its c
     }
 ```
 
-These two `location` blocks replace the ones in set-up A's `server` block. Without a `proxy_set_header Host` line, nginx sends the address from `proxy_pass`, which is set-up B when that is an IP address; if `proxy_pass` uses a host name (a Docker service name, say), that name is what the sniffer sees and it has to be listed. In set-up B the sniffer sees only the IP address, so it can no longer tell names apart: the proxy must answer only for its own `server_name`, so keep this `server` block from being the `default_server`.
+These two `location` blocks replace the ones in set-up A's `server` block. **Set-up B does not work with the [login](#webui-login):** the proxy changes `Host`, so the browser's `Origin` no longer matches it, and login and logout are refused with `403`. Use set-up A. Without a `proxy_set_header Host` line, nginx sends the address from `proxy_pass`, which is set-up B when that is an IP address; if `proxy_pass` uses a host name (a Docker service name, say), that name is what the sniffer sees and it has to be listed. In set-up B the sniffer sees only the IP address, so it can no longer tell names apart: the proxy must answer only for its own `server_name`, so keep this `server` block from being the `default_server`.
 
 ## Known limitations
 
@@ -918,7 +1123,8 @@ These two `location` blocks replace the ones in set-up A's `server` block. Witho
 - **History filters need the database in WAL mode.** Without it only the time range works, and the default view may show fewer than 5,000 rows (see [Databases without WAL](#databases-without-wal)).
 - **A reload has no hole only once the live connection has opened,** and not for a record the sniffer never stored: the storage queue was full, or the database failed to write it. Such a record is shown live until the next load that replaces the rows (see [After a reconnect](#after-a-reconnect-no-hole)).
 - **Many WebUI pages at once.** The sniffer is meant for one or two people watching at a time. History queries run one at a time, every reconnect reloads up to 5,000 records, and at most three large responses are sent at once. As a stress test, 10 pages reloading "Last 24h" together after a restart, on 1,000,000 records, were all answered within 0.15 s, with the sniffer peaking at about 52 MB; most of that was the label list each page receives, at the 10,000-label maximum (about 28 MB with 100 labels). Pages on slow links hold their place until they have downloaded their answer, so with several of those open, other pages' loads wait; past 30 s the WebUI shows an error and the next load tries again.
-- **Label editing has no authentication.** Anyone who can open the WebUI can add, change and remove [device labels](#device-labels). The Host and Origin checks keep other web sites out, not other people. Restrict who can reach the port (bind to `127.0.0.1`, a firewall, a VPN, or a reverse proxy that asks for a login).
+- **Without the login, the WebUI and API have no authentication.** Anyone who can open the WebUI can read every captured record and add, change and remove [device labels](#device-labels). The Host and Origin checks keep other web sites out, not other people. Turn on the [WebUI login](#webui-login), or restrict who can reach the port (bind to `127.0.0.1`, a firewall, a VPN, or a reverse proxy that asks for a login).
+- **The login is one shared token.** There are no user names or roles, and a session cannot be revoked one by one: to end every session, change the token. Over plain HTTP the token and the session cookie travel in clear (see [Plain HTTP and reverse proxies](#plain-http-and-reverse-proxies)).
 
 ## Testing
 
@@ -927,7 +1133,7 @@ cargo test
 cd webui && npm test
 ```
 
-The tests include loopback tests for multi-gateway routing, listen mode and the loop protection, MQTT tests against an in-process fake broker, and history queries on in-memory and file databases.
+The tests include loopback tests for multi-gateway routing, listen mode and the loop protection, MQTT tests against an in-process fake broker, history queries on in-memory and file databases, and for the [WebUI login](#webui-login) the session and lockout logic (the lockout also with 64 requests started at the same moment), the stored secret, and every route through the built router with and without a credential.
 
 `npm test` runs the WebUI's history logic with Node alone, no browser: the request rules, merging, counts and back-off. It also checks the filter vectors in `webui/test/history-vectors.json`, which a Rust test sends through the real `/api/messages` router too, so the server and the browser agree on which records match. `make test` runs both suites.
 

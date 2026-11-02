@@ -1,13 +1,17 @@
 use handlebars::Handlebars;
+use serde_json::Value;
 
 use crate::config;
+use crate::core::random::{self, RandomError, RandomSource};
 
 /// The annotated configuration template; `{{ .. }}` marks where a setting of
 /// the loaded configuration is filled in.
 ///
-/// The MQTT password has no placeholder on purpose: this output gets saved,
-/// copied around and pasted into bug reports, so a secret that came from a
-/// configuration file or the environment must never be written into it.
+/// Neither the MQTT password nor the loaded login token has a placeholder, on
+/// purpose: this output gets saved, copied around and pasted into bug reports,
+/// so a secret that came from a configuration file or the environment must
+/// never be written into it.  The `token` line holds `generated_token`
+/// instead, a fresh value made for this output alone.
 const TEMPLATE: &str = r##"
 # LoRaWAN Packet Sniffer configuration.
 
@@ -35,6 +39,18 @@ const TEMPLATE: &str = r##"
     # check off and is unsafe. In Docker, set SNIFFER_API_ALLOWED_HOSTS to a
     # comma-separated list.
     allowed_hosts = [{{#each sniffer.api.allowed_hosts}}"{{this}}"{{#unless @last}}, {{/unless}}{{/each}}]
+
+    # Ask for the token below before the WebUI and the API answer anything
+    # (the WebUI shows a login page; scripts send "Authorization: Bearer
+    # <token>"). When false, the token is ignored.
+    login = {{ sniffer.api.login }}
+
+    # The shared login token: a random token of at least 32 hexadecimal
+    # characters. The sniffer checks only its format, so always generate it,
+    # for example with `openssl rand -hex 16`; this one was generated for
+    # this output. Changing it logs every browser out at the next restart.
+    # In Docker, set SNIFFER_API_LOGIN and SNIFFER_API_TOKEN instead.
+    token = "{{ generated_token }}"
 
   [sniffer.database]
     # Path to the SQLite database file.
@@ -138,8 +154,27 @@ const TEMPLATE: &str = r##"
 #   gateways    = ["AA:BB:CC:DD:00:11:22:33"]
 "##;
 
-/// Render the template for `config`.
-fn render(config: &config::Configuration) -> String {
+/// The values the template is rendered from: the configuration as JSON, with
+/// `generated_token` added at the top level.
+///
+/// The loaded `sniffer.api.token` is taken out. The template has no placeholder
+/// for it, but with it gone a placeholder added by mistake fails the strict
+/// rendering below instead of printing a secret.
+fn template_values(config: &config::Configuration, generated_token: &str) -> Value {
+    let mut values = serde_json::to_value(config).expect("configuration is valid JSON");
+    if let Some(api) = values
+        .pointer_mut("/sniffer/api")
+        .and_then(Value::as_object_mut)
+    {
+        api.remove("token");
+    }
+    values["generated_token"] = Value::String(generated_token.to_string());
+    values
+}
+
+/// Render the template for `config`, with `generated_token` as the value of
+/// the `token` setting.
+fn render(config: &config::Configuration, generated_token: &str) -> String {
     let mut reg = Handlebars::new();
     // Every substituted value sits inside a TOML string or is a number or a
     // boolean, so escape for TOML rather than for HTML: the default would turn
@@ -147,7 +182,7 @@ fn render(config: &config::Configuration) -> String {
     reg.register_escape_fn(toml_escape);
     // A mistyped setting name should fail loudly, not render as nothing.
     reg.set_strict_mode(true);
-    reg.render_template(TEMPLATE, config)
+    reg.render_template(TEMPLATE, &template_values(config, generated_token))
         .expect("render configfile error")
 }
 
@@ -157,8 +192,24 @@ fn toml_escape(value: &str) -> String {
     out
 }
 
-pub fn run(config: &config::Configuration) {
-    println!("{}", render(config));
+/// The whole output: a login token read from `random`, then the template.
+///
+/// The token comes first so that a failed read leaves nothing to print.
+/// A template without a token, or with a short one, would look finished and
+/// be refused later (or worse, be edited by hand into something guessable).
+fn output(
+    config: &config::Configuration,
+    random: &dyn RandomSource,
+) -> Result<String, RandomError> {
+    let token = random::generate_token(random)?;
+    Ok(render(config, &token))
+}
+
+/// Print the annotated template for `config`, with a freshly generated login
+/// token.  Prints nothing and returns the error when no token can be made.
+pub fn run(config: &config::Configuration, random: &dyn RandomSource) -> Result<(), RandomError> {
+    println!("{}", output(config, random)?);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -169,15 +220,27 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::config::{Configuration, Protocol, UdpMode};
+    use crate::config::{token_shape_ok, Configuration, Protocol, UdpMode};
+    use crate::core::random::testing::FailingRandom;
+    use crate::core::random::{generate_token, SystemRandomSource};
 
     /// Not every setting is written out by the template, and `Configuration`
     /// has no `PartialEq`, so compare the settings as JSON with these dropped.
-    const NOT_RENDERED: [&str; 3] = [
+    /// The loaded token is one of them on purpose: the output carries a new
+    /// one, never the loaded one.
+    const NOT_RENDERED: [&str; 4] = [
         "filters",
         "sniffer.api.cors_origins",
+        "sniffer.api.token",
         "sniffer.mqtt.password",
     ];
+
+    /// The token the tests render with, where its value does not matter.
+    const TOKEN: &str = "5f0c9a3e7b1d48c6a2e9d4b7f3a18c05";
+
+    fn new_token() -> String {
+        generate_token(&SystemRandomSource::new()).unwrap()
+    }
 
     fn parse(rendered: &str) -> Configuration {
         toml::from_str(rendered)
@@ -222,6 +285,8 @@ mod tests {
         config.sniffer.api.cors_origins = vec!["https://example.com".to_string()];
         config.sniffer.api.allowed_hosts =
             vec!["sniffer.example.com".to_string(), "lab-pc".to_string()];
+        config.sniffer.api.login = true;
+        config.sniffer.api.token = "canary-token-2d8f".to_string();
         config.sniffer.database.path = r#"C:\data\"quoted" & <odd>=it's.db"#.to_string();
         config.sniffer.database.retention = Duration::from_secs(7 * 24 * 3600);
 
@@ -260,7 +325,7 @@ mod tests {
     #[test]
     fn default_configuration_round_trips() {
         let defaults = Configuration::default();
-        let reloaded = parse(&render(&defaults));
+        let reloaded = parse(&render(&defaults, TOKEN));
         assert_eq!(rendered_settings(&reloaded), rendered_settings(&defaults));
     }
 
@@ -276,7 +341,7 @@ mod tests {
             assert_ne!(value, &defaults[path], "{path} is still at its default");
         }
 
-        let rendered = render(&customised());
+        let rendered = render(&customised(), TOKEN);
         assert_eq!(rendered_settings(&parse(&rendered)), custom);
 
         // Spot-check the two kinds of value that need converting.
@@ -292,7 +357,7 @@ mod tests {
         let render_hosts = |hosts: &[&str]| {
             let mut config = Configuration::default();
             config.sniffer.api.allowed_hosts = hosts.iter().map(|h| h.to_string()).collect();
-            render(&config)
+            render(&config, TOKEN)
         };
 
         let rendered = render_hosts(&[]);
@@ -329,7 +394,7 @@ mod tests {
 
     #[test]
     fn allowed_hosts_comment_explains_the_setting() {
-        let rendered = render(&Configuration::default());
+        let rendered = render(&Configuration::default(), TOKEN);
         let comment: String = rendered
             .lines()
             .take_while(|line| !line.trim_start().starts_with("allowed_hosts"))
@@ -357,7 +422,7 @@ mod tests {
         let mut config = Configuration::default();
         config.sniffer.api.allowed_hosts = vec![r#"a"b\c"#.to_string(), "d&e'f".to_string()];
 
-        let reloaded = parse(&render(&config));
+        let reloaded = parse(&render(&config, TOKEN));
 
         assert_eq!(
             reloaded.sniffer.api.allowed_hosts,
@@ -370,7 +435,7 @@ mod tests {
         for password in ["canary-7f3e", r#"p@ss"w0rd\$HOME"#, ""] {
             let mut config = customised();
             config.sniffer.mqtt.password = password.to_string();
-            let rendered = render(&config);
+            let rendered = render(&config, TOKEN);
 
             if !password.is_empty() {
                 assert!(!rendered.contains(password), "password in the output");
@@ -394,8 +459,142 @@ mod tests {
     }
 
     #[test]
+    fn login_and_token_are_written_after_allowed_hosts() {
+        let rendered = render(&Configuration::default(), TOKEN);
+
+        let hosts = rendered.find("\n    allowed_hosts = ").unwrap();
+        let login = rendered.find("\n    login = false\n").unwrap();
+        let token = rendered
+            .find(&format!("\n    token = \"{TOKEN}\"\n"))
+            .unwrap();
+        let database = rendered.find("[sniffer.database]").unwrap();
+        assert!(
+            hosts < login && login < token && token < database,
+            "{rendered}"
+        );
+
+        let reloaded = parse(&rendered);
+        assert!(!reloaded.sniffer.api.login);
+        assert_eq!(reloaded.sniffer.api.token, TOKEN);
+
+        let mut config = Configuration::default();
+        config.sniffer.api.login = true;
+        let rendered = render(&config, TOKEN);
+        assert!(rendered.contains("\n    login = true\n"), "{rendered}");
+        assert!(parse(&rendered).sniffer.api.login);
+    }
+
+    #[test]
+    fn login_comments_explain_the_settings() {
+        let rendered = render(&Configuration::default(), TOKEN);
+        let comment: String = rendered
+            .lines()
+            .skip_while(|line| !line.contains("Ask for the token below"))
+            .take_while(|line| !line.starts_with("  [sniffer.database]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for phrase in [
+            "Authorization: Bearer",
+            "When false, the token is ignored",
+            "at least 32 hexadecimal",
+            "checks only its format",
+            "openssl rand -hex 16",
+            "generated for\n    # this output",
+            "logs every browser out",
+            "SNIFFER_API_LOGIN",
+            "SNIFFER_API_TOKEN",
+        ] {
+            assert!(comment.contains(phrase), "no '{phrase}' in:\n{comment}");
+        }
+    }
+
+    #[test]
+    fn output_is_valid_once_login_is_turned_on() {
+        let out = output(&Configuration::default(), &SystemRandomSource::new()).unwrap();
+        let mut config = parse(&out);
+        assert!(!config.sniffer.api.login);
+        assert!(token_shape_ok(&config.sniffer.api.token));
+
+        config.sniffer.api.login = true;
+        config::validate(&config).unwrap();
+
+        // Written with login on, it is valid as it stands.
+        let mut loaded = Configuration::default();
+        loaded.sniffer.api.login = true;
+        let config = parse(&output(&loaded, &SystemRandomSource::new()).unwrap());
+        assert!(config.sniffer.api.login);
+        config::validate(&config).unwrap();
+    }
+
+    #[test]
+    fn every_output_has_its_own_token() {
+        let source = SystemRandomSource::new();
+        let first = parse(&output(&Configuration::default(), &source).unwrap());
+        let second = parse(&output(&Configuration::default(), &source).unwrap());
+
+        let (first, second) = (first.sniffer.api.token, second.sniffer.api.token);
+        assert!(token_shape_ok(&first) && token_shape_ok(&second));
+        assert_eq!(first.len(), 32);
+        assert!(first
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_loaded_token_is_never_rendered() {
+        let hex_looking = new_token();
+        for canary in [
+            "canary-token-2d8f",
+            r#"ca"na\ry&<'>"#,
+            hex_looking.as_str(),
+            "$SNIFFER_API_TOKEN",
+        ] {
+            for login in [false, true] {
+                let mut config = customised();
+                config.sniffer.api.login = login;
+                config.sniffer.api.token = canary.to_string();
+                let out = output(&config, &SystemRandomSource::new()).unwrap();
+
+                assert!(!out.contains(canary), "the token is in the output:\n{out}");
+                let mut escaped = String::new();
+                config::push_toml_escaped(&mut escaped, canary);
+                assert!(
+                    !out.contains(&escaped),
+                    "the escaped token is in the output:\n{out}"
+                );
+                assert_ne!(parse(&out).sniffer.api.token, canary);
+            }
+        }
+    }
+
+    #[test]
+    fn the_loaded_token_is_not_among_the_template_values() {
+        let mut config = Configuration::default();
+        config.sniffer.api.token = "canary-token-2d8f".to_string();
+
+        let values = template_values(&config, TOKEN);
+
+        assert!(!values.to_string().contains("canary-token-2d8f"));
+        assert_eq!(values["generated_token"], TOKEN);
+        assert_eq!(values["sniffer"]["api"]["login"], false);
+    }
+
+    #[test]
+    fn a_failing_random_source_gives_no_output() {
+        let mut config = Configuration::default();
+        config.sniffer.api.login = true;
+
+        // No text is produced at all, so there is nothing a caller could
+        // print: not even a template with an empty or short token.
+        assert_eq!(output(&config, &FailingRandom), Err(RandomError));
+        assert_eq!(run(&config, &FailingRandom), Err(RandomError));
+    }
+
+    #[test]
     fn filter_example_is_valid_once_uncommented() {
-        let rendered = render(&Configuration::default());
+        let rendered = render(&Configuration::default(), TOKEN);
         let example: Vec<&str> = rendered
             .lines()
             .skip_while(|line| *line != "# [[filters]]")

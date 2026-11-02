@@ -10,6 +10,9 @@
 //! | GET    | `/api/labels`          | REST: every device label                     |
 //! | PUT    | `/api/labels/{device}` | REST: set or replace a device label          |
 //! | DELETE | `/api/labels/{device}` | REST: remove a device label                  |
+//! | GET    | `/api/session`         | REST: `{"login": true}` or `{"login": false}` |
+//! | POST   | `/api/login`           | REST: start a session (login on only)        |
+//! | POST   | `/api/logout`          | REST: end the session in this browser (login on only) |
 //! | GET    | `/*`                   | Serve embedded React SPA                     |
 //!
 //! ## WebSocket protocol
@@ -51,6 +54,38 @@
 //! 500 (storage).  Every change is made by the label writer ([`labels`]),
 //! which publishes it on `/ws/labels` in the order it was saved.
 //!
+//! ## Login
+//!
+//! With `[sniffer.api] login = true`, everything under `/ws` and `/api/` needs
+//! a credential ([`auth`]): the session cookie that `POST /api/login` sets, or
+//! `Authorization: Bearer <token>` (curl, scripts).  The WebUI bundle stays
+//! public, because it is the page that asks for the token.  A request without
+//! a credential, or with a wrong one, gets `401` with a plain-text body and no
+//! `WWW-Authenticate` header (that header would make a browser show its own
+//! password dialog), and a token that is presented once the wrong-token limit
+//! is reached gets `429` with `Retry-After` whatever it is.  `/api/session`
+//! needs the credential too: a `200` from it is how the page learns that it is
+//! logged in, and a `401` that it must log in.  With login off it answers
+//! `{"login": false}` without one, and `/api/login` and `/api/logout` do not
+//! exist.
+//!
+//! `POST /api/login` takes `{"token": "<token>"}` and answers `204` with the
+//! cookie (`HttpOnly; SameSite=Strict; Path=/`, so it ends with the browser
+//! session), `401 {"error": "Wrong token"}`, `429` with `Retry-After`, or `500`
+//! when the sniffer cannot make a session.  `POST /api/logout` answers `204`
+//! with an expired cookie.  Both accept only a request that declares exactly
+//! one `Content-Type: application/json` and, when it carries an `Origin`, one
+//! whose host and port are those of its `Host` header: a form or a script on
+//! another site can do neither.  `cors_origins` do not widen this, and neither
+//! does `X-Forwarded-Host`, which is never read.  A reverse proxy must
+//! therefore pass the browser's `Host` header on unchanged.
+//!
+//! The login layer sits inside CORS (a preflight needs no credential, and the
+//! CORS layer lists `Authorization` among the headers a listed origin may
+//! send) and inside the Host check, which still answers first.  Its refusals
+//! come from outside the `/api/messages` route, so they do not carry
+//! `X-Storage-Write-Failures`.
+//!
 //! ## Host check
 //!
 //! Every request, WebSockets included, must be addressed to the sniffer by an
@@ -60,16 +95,19 @@
 //!
 //! ## Cross-origin access
 //!
-//! The API has no authentication, so it must not be readable from other web
-//! sites the operator happens to open.  By default it sends no CORS headers,
-//! so browsers only let the sniffer's own pages read it.  Browsers never
-//! subject WebSocket handshakes to CORS, and a form can be made to send some
-//! kinds of write, so those are checked against the `Origin` header
+//! Whether or not the login is on, the API must not be readable from other
+//! web sites the operator happens to open.  By default it sends no CORS
+//! headers, so browsers only let the sniffer's own pages read it.  Browsers
+//! never subject WebSocket handshakes to CORS, and a form can be made to send
+//! some kinds of write, so those are checked against the `Origin` header
 //! ([`origin_allowed`]): the handshakes of `/ws` and `/ws/labels` and the
 //! `PUT` and `DELETE` label endpoints accept a request with no `Origin`
 //! (curl and scripts), with an `Origin` naming the host the request was sent
 //! to, or with one listed in `cors_origins`.  Origins listed in
-//! `cors_origins` may also read the API through CORS, and write labels.
+//! `cors_origins` may also read the API through CORS, and write labels.  With
+//! the login on they must send the token as `Authorization: Bearer`: the
+//! session cookie is `SameSite=Strict`, which a browser never sends along with
+//! a request that another site makes.
 //!
 //! ## `/api/messages`
 //!
@@ -110,7 +148,7 @@
 //! - `X-Storage-Write-Failures`: inserts that failed since the sniffer
 //!   started (the count restarts at 0 with it).  On every answer of this
 //!   route, errors from the query string included; not on the Host check's
-//!   403, which is answered before any route.
+//!   403 or the login's 401 and 429, which are answered before any route.
 //!
 //! The 503s are `{"error": "<message>", "code": "<code>"}`: `no_wal` when a
 //! filter is asked of a database that is not in WAL mode (a request with only
@@ -125,6 +163,7 @@
 //! exactly what it always did: `?limit=N` the newest N, `?since=T&limit=N` the
 //! oldest N after T.
 
+pub mod auth;
 pub mod host;
 pub mod labels;
 mod messages;
@@ -145,7 +184,7 @@ use axum::{
     http::{header, HeaderMap, Method, StatusCode, Uri},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use rust_embed::RustEmbed;
@@ -154,6 +193,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, Semaphore};
 use tower_http::cors::CorsLayer;
 
+use self::auth::{require_login, Auth, LOGIN_BODY_LIMIT};
 use self::host::{check_host, AllowedHosts};
 use self::labels::{LabelWriter, WriterError};
 use crate::core::labels::{normalize_label, parse_device_id};
@@ -229,6 +269,9 @@ pub struct ApiContext {
     pub writer_queue: mpsc::WeakSender<WriterItem>,
     /// Inserts that did not save, counted by the writer.
     pub write_failures: Arc<AtomicU64>,
+    /// The login, when it is on: every `/ws` and `/api` request then needs a
+    /// session or the token.  `None` leaves the API open, as before.
+    pub login: Option<Arc<Auth>>,
 }
 
 #[derive(Clone)]
@@ -297,6 +340,36 @@ fn build_router(ctx: ApiContext) -> (Router, AppState) {
         )
         .fallback(frontend_handler);
 
+    // Whether the WebUI has to log in is the first thing it asks, so the
+    // route exists either way.  With login on, `require_login` stands in
+    // front of it like any other `/api` path.
+    app = app.route(
+        "/api/session",
+        if ctx.login.is_some() {
+            get(auth::session_open)
+        } else {
+            get(auth::session_closed)
+        },
+    );
+
+    // Login and logout exist only when there is a login.  Without one the
+    // paths are unknown and the page answers, as for any other path.
+    if let Some(login) = &ctx.login {
+        let login_routes: Router<AppState> = Router::<Arc<Auth>>::new()
+            .route(
+                "/api/login",
+                post(auth::login).layer(DefaultBodyLimit::max(LOGIN_BODY_LIMIT)),
+            )
+            .route("/api/logout", post(auth::logout))
+            .with_state(login.clone());
+        // The layer comes after the merge so that it covers every route and
+        // the page's fallback, and before CORS and the Host check, so that a
+        // preflight needs no credential and a foreign host is refused first.
+        app = app
+            .merge(login_routes)
+            .layer(middleware::from_fn_with_state(login.clone(), require_login));
+    }
+
     // Without CORS headers a browser only lets pages served by the sniffer
     // read the API.  Answering every origin would let any web site the
     // operator visits read the captured traffic from their browser.
@@ -312,7 +385,16 @@ fn build_router(ctx: ApiContext) -> (Router, AppState) {
                 // A label write is a PUT or DELETE with a JSON body, and
                 // browsers ask permission for both before sending it.
                 .allow_methods([Method::GET, Method::PUT, Method::DELETE])
-                .allow_headers([header::CONTENT_TYPE])
+                // With login on, `Authorization` carries the token for a
+                // script on a listed origin, which cannot use the session
+                // cookie: it is `SameSite=Strict`, so a cross-site request
+                // never carries it.  With login off nothing reads the header,
+                // and the answer stays what it was before there was a login.
+                .allow_headers(if ctx.login.is_some() {
+                    vec![header::CONTENT_TYPE, header::AUTHORIZATION]
+                } else {
+                    vec![header::CONTENT_TYPE]
+                })
                 // A script on a listed origin can only read the headers the
                 // server names; these carry the counts and the flags of the
                 // history answer.
@@ -821,12 +903,14 @@ fn make_labels_json(labels: &BTreeMap<String, String>) -> String {
 #[cfg(test)]
 mod label_tests;
 #[cfg(test)]
+mod login_tests;
+#[cfg(test)]
 mod message_tests;
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use axum::body::Body;
@@ -837,12 +921,14 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
 
+    use super::auth::{Clock, Comparer, SESSION_COOKIE};
     use super::labels::Gate;
     use super::*;
     use crate::cmd::root::{run_writer, CHANNEL_CAPACITY};
     use crate::core::decoder;
     use crate::core::labels::MAX_LABELS;
     use crate::core::metadata::{CrcStatus, Direction, MType, Malformed, Protocol, Status};
+    use crate::core::random::{RandomError, RandomSource, SystemRandomSource};
     use crate::core::seen::SeenDevices;
     use crate::proxy::frame_fields;
 
@@ -869,6 +955,47 @@ mod tests {
     /// so the Host check lets it through.
     pub(super) const DEFAULT_HOST: &str = "127.0.0.1:8888";
 
+    /// The stored session secret of a router built with a login, unless the
+    /// test chooses another with [`Setup::secret`].
+    pub(super) const LOGIN_SECRET: [u8; 32] = *b"router-tests session secret 0001";
+
+    /// A random source that serves `fills` requests and then fails.  Setting
+    /// up the login takes one, so `FailsAfter::new(1)` gives a login that
+    /// works until the first session has to be made.
+    pub(super) struct FailsAfter {
+        left: AtomicUsize,
+    }
+
+    impl FailsAfter {
+        pub(super) fn new(fills: usize) -> Arc<Self> {
+            Arc::new(FailsAfter {
+                left: AtomicUsize::new(fills),
+            })
+        }
+    }
+
+    impl RandomSource for FailsAfter {
+        fn fill(&self, out: &mut [u8]) -> Result<(), RandomError> {
+            let served = self
+                .left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if !served {
+                return Err(RandomError);
+            }
+            SystemRandomSource::new().fill(out)
+        }
+    }
+
+    /// The login of a router under test.
+    struct LoginSetup {
+        token: String,
+        secret: [u8; 32],
+        random: Arc<dyn RandomSource>,
+        clock: Arc<dyn Clock>,
+        compare: Option<Comparer>,
+    }
+
     /// How the API under test is assembled.
     pub(super) struct Setup {
         max_labels: usize,
@@ -879,6 +1006,7 @@ mod tests {
         allowed_hosts: Vec<String>,
         storage: Option<Storage>,
         record_writer: bool,
+        login: Option<LoginSetup>,
     }
 
     impl Setup {
@@ -892,7 +1020,54 @@ mod tests {
                 allowed_hosts: vec![],
                 storage: None,
                 record_writer: true,
+                login: None,
             }
+        }
+
+        /// Turn the login on, with this token, the stored secret
+        /// [`LOGIN_SECRET`], the system's random source and the Tokio clock.
+        /// Without it the router has no login, as when the setting is off.
+        pub(super) fn login(mut self, token: &str) -> Self {
+            self.login = Some(LoginSetup {
+                token: token.to_string(),
+                secret: LOGIN_SECRET,
+                random: Arc::new(SystemRandomSource::new()),
+                clock: Arc::new(auth::TokioClock),
+                compare: None,
+            });
+            self
+        }
+
+        fn login_setup(&mut self) -> &mut LoginSetup {
+            self.login
+                .as_mut()
+                .expect("call login() before choosing how the login is built")
+        }
+
+        /// The stored session secret the login signs with.
+        pub(super) fn secret(mut self, secret: [u8; 32]) -> Self {
+            self.login_setup().secret = secret;
+            self
+        }
+
+        /// The random source the login uses, for example one that fails
+        /// ([`FailsAfter`]).
+        pub(super) fn random(mut self, random: Arc<dyn RandomSource>) -> Self {
+            self.login_setup().random = random;
+            self
+        }
+
+        /// The clock the guessing limit reads, to move it by hand.
+        pub(super) fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+            self.login_setup().clock = clock;
+            self
+        }
+
+        /// The comparison of a token with the right one, to count its calls
+        /// or slow it down.  Without it the real comparison is used.
+        pub(super) fn comparer(mut self, compare: Comparer) -> Self {
+            self.login_setup().compare = Some(compare);
+            self
         }
 
         /// A smaller record broadcast channel, to make a client fall behind.
@@ -977,6 +1152,12 @@ mod tests {
             } else {
                 Some(record_rx)
             };
+            let login = self.login.map(|l| {
+                Arc::new(
+                    Auth::with_parts(&l.token, &l.secret, l.random, l.clock, l.compare)
+                        .expect("the test's random source serves the login's setup"),
+                )
+            });
             let (router, state) = build_router(ApiContext {
                 broadcast_tx: broadcast_tx.clone(),
                 labels_tx: labels_tx.clone(),
@@ -986,6 +1167,7 @@ mod tests {
                 allowed_hosts: self.allowed_hosts,
                 writer_queue: record_tx.downgrade(),
                 write_failures: write_failures.clone(),
+                login: login.clone(),
             });
             Rig {
                 storage,
@@ -1000,6 +1182,7 @@ mod tests {
                 writer_cancel,
                 write_failures,
                 state,
+                auth: login,
                 router,
             }
         }
@@ -1022,10 +1205,19 @@ mod tests {
         pub(super) writer_cancel: CancellationToken,
         pub(super) write_failures: Arc<AtomicU64>,
         pub(super) state: AppState,
+        /// The login, when the test turned it on.
+        pub(super) auth: Option<Arc<Auth>>,
         router: Router,
     }
 
     impl Rig {
+        /// The `Cookie` header value of a session the login would accept.
+        pub(super) fn session_cookie(&self) -> String {
+            let auth = self.auth.as_ref().expect("the test turned the login on");
+            let session = auth.new_session(Utc::now()).unwrap();
+            format!("{SESSION_COOKIE}={session}")
+        }
+
         /// A handle to the router; clones share the same state.
         pub(super) fn app(&self) -> Router {
             self.router.clone()

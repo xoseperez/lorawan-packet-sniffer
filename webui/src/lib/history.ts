@@ -12,7 +12,8 @@
  *   (live records): `matchesFilter`, with the query string that asks the
  *   server for the same thing, `historyParams`;
  * - merging: `mergeRecords`, `mergeAfterLoad`, and the count arithmetic;
- * - the request state machine, `nextRequests`;
+ * - the request state machine, `nextRequests`, and `classifyFailedLoad`, which
+ *   says what the status of a load that did not return 200 means;
  * - the back-off series for retries and reconnects.
  */
 import type { MessageRecord, MType, Status } from '../types/messages';
@@ -581,6 +582,12 @@ export type HistoryEvent =
   | { kind: 'failed'; generation: number; transient: boolean; message?: string }
   /** A load got `503` with code "no_wal". */
   | { kind: 'noWal'; generation: number; message?: string }
+  /**
+   * A load got `401`: the session has ended. Not a failure of the load, so it
+   * shows no error and joins no retry series; the page goes back to the login,
+   * where the person starts again.
+   */
+  | { kind: 'unauthorized'; generation: number }
   | { kind: 'pause' }
   /** `overflowed`: the pause buffer passed `MAX_MESSAGES`. */
   | { kind: 'resume'; overflowed: boolean };
@@ -615,6 +622,27 @@ export type HistoryAction =
 export interface Step {
   state: RequestState;
   actions: HistoryAction[];
+}
+
+/**
+ * What a load that did not return 200 means. `unauthorized` (401) is the
+ * session ending: repeating the request cannot help and an error strip would
+ * only sit behind the login page. `noWal` and `busy` are the two answers the
+ * database gives on purpose (`503` with the code "no_wal" or "busy"); any
+ * other status is a plain `failed`.
+ */
+export type FailedLoad = 'unauthorized' | 'noWal' | 'busy' | 'failed';
+
+/**
+ * Classifies a failed load from its HTTP status and the machine-readable
+ * `code` of its JSON body (null when it had none). The status decides alone
+ * for a 401, whatever the body says.
+ */
+export function classifyFailedLoad(status: number, code: string | null): FailedLoad {
+  if (status === 401) return 'unauthorized';
+  if (status === 503 && code === 'no_wal') return 'noWal';
+  if (status === 503 && code === 'busy') return 'busy';
+  return 'failed';
 }
 
 /** The state for a page that has just mounted with `filter`. */
@@ -753,6 +781,8 @@ function fail(state: RequestState, cur: Load, transient: boolean, message: strin
  *   retried, ends it.
  * - An answer is routed by the pause state when it arrives: a user load
  *   replaces the rows even while paused, a catch-up load is held.
+ * - A 401 (`unauthorized`) ends the load and the retry series without an
+ *   error: the session is gone and the page is about to show the login.
  */
 export function nextRequests(state: RequestState, event: HistoryEvent, nowMs: number): Step {
   switch (event.kind) {
@@ -856,6 +886,15 @@ export function nextRequests(state: RequestState, event: HistoryEvent, nowMs: nu
         state: { ...state, inFlight: load, noWalInclude: true },
         actions: [{ kind: 'send', load, resend: true }],
       };
+    }
+
+    case 'unauthorized': {
+      const cur = state.inFlight;
+      if (cur === null || cur.generation !== event.generation) {
+        return { state, actions: [{ kind: 'ignore' }] };
+      }
+      // No error, and the retry series ends: a retry would be refused too.
+      return { state: { ...state, inFlight: null, retryStep: null, error: null }, actions: [] };
     }
 
     case 'pause':

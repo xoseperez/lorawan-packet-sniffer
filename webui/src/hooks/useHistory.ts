@@ -4,6 +4,7 @@ import type { FilterState } from '../components/FilterBar';
 import {
   LOAD_TIMEOUT_MS,
   MAX_MESSAGES,
+  classifyFailedLoad,
   compareTimestamps,
   countsAsMalformed,
   filterChangeEvent,
@@ -20,6 +21,7 @@ import {
   parseCountHeader,
   toHistoryFilter,
 } from '../lib/history';
+import { reportUnauthorized } from '../session';
 import type {
   HistoryAction,
   HistoryEvent,
@@ -505,11 +507,24 @@ class HistoryEngine {
         };
       } else {
         const { message, code } = await describeFailure(res);
-        if (res.status === 503 && code === 'no_wal') {
-          event = { kind: 'noWal', generation, message };
-        } else {
-          // A busy reader is worth another try; anything else would repeat.
-          event = { kind: 'failed', generation, transient: res.status === 503 && code === 'busy', message };
+        switch (classifyFailedLoad(res.status, code)) {
+          case 'unauthorized':
+            // The session ended. No error strip and no retry: the page goes
+            // back to the login, and this hook stops with it.
+            event = { kind: 'unauthorized', generation };
+            reportUnauthorized();
+            break;
+          case 'noWal':
+            event = { kind: 'noWal', generation, message };
+            break;
+          case 'busy':
+            // A busy reader is worth another try.
+            event = { kind: 'failed', generation, transient: true, message };
+            break;
+          case 'failed':
+            // Anything else would repeat.
+            event = { kind: 'failed', generation, transient: false, message };
+            break;
         }
       }
     } catch (e) {

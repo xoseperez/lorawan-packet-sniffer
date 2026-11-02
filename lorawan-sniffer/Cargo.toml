@@ -34,6 +34,8 @@
   http-body = { workspace = true }
   rust-embed = { workspace = true }
   mime_guess = { workspace = true }
+  mime = { workspace = true }
+  ring = { workspace = true }
   rumqttc = { workspace = true }
   rustls = { workspace = true }
   rustls-pki-types = { workspace = true }

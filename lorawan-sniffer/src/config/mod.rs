@@ -23,6 +23,12 @@ pub struct Configuration {
     /// logged once logging is set up.
     #[serde(skip)]
     pub load_warnings: Vec<String>,
+    /// The keys behind `load_warnings`: settings whose whole value still reads
+    /// `$NAME` because that variable is not set.  Kept so that [`validate`]
+    /// can turn the one that matters (the login token) into an error instead
+    /// of a warning.  Keys only, never values.
+    #[serde(skip)]
+    pub unexpanded_keys: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +68,14 @@ pub struct Api {
     /// off.  Checked by [`validate`].
     #[serde(deserialize_with = "host_list")]
     pub allowed_hosts: Vec<String>,
+    /// Ask for `token` before the WebUI and the API answer anything.  When
+    /// false, `token` is ignored.
+    pub login: bool,
+    /// The shared login token.  Checked by [`validate`] only when `login` is
+    /// on.  Never logged and never written by `configfile`: `Api` and
+    /// [`Configuration`] have no `Debug` on purpose, so a `{:?}` cannot print
+    /// it by accident, and no error message quotes it.
+    pub token: String,
 }
 
 impl Default for Api {
@@ -70,8 +84,44 @@ impl Default for Api {
             bind: "0.0.0.0:8888".to_string(),
             cors_origins: vec![],
             allowed_hosts: vec![],
+            login: false,
+            token: String::new(),
         }
     }
+}
+
+/// The login token must have at least this many hexadecimal characters
+/// (128 bits when it is random).
+pub const MIN_TOKEN_HEX_CHARS: usize = 32;
+
+/// The login token must use at least this many different characters, ignoring
+/// case.
+pub const MIN_TOKEN_DISTINCT_CHARS: usize = 8;
+
+/// Whether `token` has the shape of a generated login token: ASCII
+/// hexadecimal characters only, at least [`MIN_TOKEN_HEX_CHARS`] of them, and
+/// at least [`MIN_TOKEN_DISTINCT_CHARS`] different ones (`A` and `a` count as
+/// one).
+///
+/// This is a format check, not a proof of randomness: nothing can tell a
+/// random string from one a person made up to look random.  What it does is
+/// keep out the tokens that are plainly guessable, such as `000…0`, `abab…`
+/// or a short word, while accepting everything `openssl rand -hex 16` and
+/// `lorawan-sniffer configfile` produce.  A random 32-character hex string has
+/// about 14 different characters on average, so one with fewer than 8 is
+/// vanishingly rare and refusing it costs nothing.
+pub fn token_shape_ok(token: &str) -> bool {
+    if token.len() < MIN_TOKEN_HEX_CHARS {
+        return false;
+    }
+    let mut seen = 0u16;
+    for c in token.chars() {
+        match c.to_digit(16) {
+            Some(digit) => seen |= 1 << digit,
+            None => return false,
+        }
+    }
+    seen.count_ones() as usize >= MIN_TOKEN_DISTINCT_CHARS
 }
 
 /// Deserialize a list of host names from a TOML array of strings or from one
@@ -379,9 +429,11 @@ pub fn get(filenames: Vec<String>) -> Result<Configuration> {
     }
 
     let mut config: Configuration =
-        toml::from_str(&content).context("failed to parse configuration file")?;
-    config.load_warnings = unexpanded_references(&content)
-        .into_iter()
+        toml::from_str(&content).map_err(|e| parse_error(&content, &e))?;
+    config.unexpanded_keys = unexpanded_references(&content);
+    config.load_warnings = config
+        .unexpanded_keys
+        .iter()
         .map(|key| {
             format!(
                 "{key} refers to an environment variable that is not set, so its text \
@@ -391,6 +443,54 @@ pub fn get(filenames: Vec<String>) -> Result<Configuration> {
         })
         .collect();
     Ok(config)
+}
+
+/// A TOML error with its position and reason, but none of the file's text.
+///
+/// The parser's own message quotes the offending line.  When the mistake is
+/// in a value, such as an unquoted or unterminated login token or MQTT
+/// password, that line is the secret, and the message is printed at startup,
+/// where the service manager's journal keeps it.  Line and column are counted
+/// in the configuration as read, which is the files given with `-c` joined in
+/// order.
+fn parse_error(content: &str, error: &toml::de::Error) -> anyhow::Error {
+    let at = error
+        .span()
+        .map(|span| {
+            let before = content.get(..span.start).unwrap_or(content);
+            let line = before.matches('\n').count() + 1;
+            let column = before.chars().rev().take_while(|&c| c != '\n').count() + 1;
+            format!(" at line {line}, column {column}")
+        })
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "failed to parse configuration file{at}: {}",
+        without_value(error.message().trim_end())
+    )
+}
+
+/// A type error with the offending value left out.
+///
+/// A value of the wrong type is reported as "invalid type: integer `1234`,
+/// expected a string", and a token made only of digits, written without
+/// quotes, is such a value.  The kind of value and what was expected are
+/// enough to fix it.
+fn without_value(message: &str) -> String {
+    for prefix in ["invalid type: ", "invalid value: "] {
+        let Some(rest) = message.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some(expected) = rest.find(", expected ") else {
+            continue;
+        };
+        let kind = rest[..expected]
+            .split(['`', '"'])
+            .next()
+            .unwrap_or_default()
+            .trim();
+        return format!("{prefix}{kind}{}", &rest[expected..]);
+    }
+    message.to_string()
 }
 
 /// Keys whose whole value still reads `$NAME` after expansion.
@@ -513,13 +613,15 @@ pub(crate) fn push_toml_escaped(out: &mut String, value: &str) {
 /// fail late and quietly.  Run once after loading, before anything starts.
 ///
 /// The API's `allowed_hosts` is always checked: it guards the WebUI whether or
-/// not anything else is enabled.  The MQTT section is checked only when MQTT
-/// is enabled: a disabled section is never used, so a leftover typo in it must
-/// not stop the sniffer.
+/// not anything else is enabled.  Its login token is checked when login is on.
+/// The MQTT section is checked only when MQTT is enabled: a disabled section
+/// is never used, so a leftover typo in it must not stop the sniffer.
 pub fn validate(cfg: &Configuration) -> Result<()> {
-    // This has to stay ahead of the early return below, which skips every
+    // These have to stay ahead of the early return below, which skips every
     // check after it when MQTT is off.
     validate_allowed_hosts(&cfg.sniffer.api.allowed_hosts)?;
+    // The login guards the WebUI whether or not MQTT is on.
+    validate_login(&cfg.sniffer.api, &cfg.unexpanded_keys)?;
 
     let mqtt = &cfg.sniffer.mqtt;
     if !mqtt.enabled {
@@ -563,6 +665,40 @@ pub fn validate(cfg: &Configuration) -> Result<()> {
 /// suggests a name this validation accepts.
 pub(crate) fn is_host_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+}
+
+/// With login on, the token must be set and must have the shape of a
+/// generated one (see [`token_shape_ok`]).  With login off the token is not
+/// looked at at all: it is ignored, so a leftover one never stops the sniffer.
+///
+/// None of the messages quotes the token, even in part: an error ends up in
+/// the terminal, the journal and bug reports.
+fn validate_login(api: &Api, unexpanded: &[String]) -> Result<()> {
+    if !api.login {
+        return Ok(());
+    }
+
+    // A reference to a variable that is not set stays in the text as written.
+    // Without this check, "$SNIFFER_API_TOKEN" would be taken for the token
+    // itself, and the message below would be the less useful one.
+    if unexpanded.iter().any(|key| key == "sniffer.api.token") {
+        anyhow::bail!(
+            "[sniffer.api] token refers to an environment variable that is not set; \
+             define it (for the systemd service, in /etc/lorawan-sniffer/sniffer.env) \
+             or write the token itself; generate one with `lorawan-sniffer configfile` \
+             or `openssl rand -hex 16`"
+        );
+    }
+
+    if !token_shape_ok(&api.token) {
+        anyhow::bail!(
+            "[sniffer.api] login is on, but token must be a random token of at least \
+             {MIN_TOKEN_HEX_CHARS} hexadecimal characters; generate one with \
+             `lorawan-sniffer configfile` or `openssl rand -hex 16`"
+        );
+    }
+
+    Ok(())
 }
 
 /// Each entry of `allowed_hosts` must be a bare host name, or the list must be
@@ -1265,5 +1401,314 @@ mod tests {
         let cfg = parse(&expand_env(&text, lookup_in(&vars)));
 
         assert_eq!(cfg.sniffer.mqtt.password, r#"a"b\c$HOME"#);
+    }
+
+    // --- [sniffer.api] login and token ---
+
+    /// Load `text` the way `get` does, with `vars` standing in for the
+    /// process environment.
+    fn load_with(text: &str, vars: &[(&str, &str)]) -> Configuration {
+        let expanded = expand_env(text, lookup_in(vars));
+        let mut cfg = parse(&expanded);
+        cfg.unexpanded_keys = unexpanded_references(&expanded);
+        cfg
+    }
+
+    fn login_on(token: &str) -> Configuration {
+        let mut cfg = Configuration::default();
+        cfg.sniffer.api.login = true;
+        cfg.sniffer.api.token = token.to_string();
+        cfg
+    }
+
+    fn generated_token() -> String {
+        crate::core::random::generate_token(&crate::core::random::SystemRandomSource::new())
+            .unwrap()
+    }
+
+    /// The error `validate` gives for a configuration, which must come even
+    /// though MQTT is off (the default).
+    fn login_error(cfg: &Configuration) -> String {
+        assert!(!cfg.sniffer.mqtt.enabled);
+        format!("{:#}", validate(cfg).unwrap_err())
+    }
+
+    fn assert_asks_for_a_generated_token(err: &str) {
+        for phrase in [
+            "[sniffer.api]",
+            "login is on",
+            "at least 32 hexadecimal characters",
+            "`lorawan-sniffer configfile`",
+            "`openssl rand -hex 16`",
+        ] {
+            assert!(err.contains(phrase), "no '{phrase}' in: {err}");
+        }
+    }
+
+    #[test]
+    fn login_is_off_by_default() {
+        for cfg in [
+            Configuration::default(),
+            parse(""),
+            parse("[sniffer.api]\nbind = \"127.0.0.1:1\"\n"),
+        ] {
+            assert!(!cfg.sniffer.api.login);
+            assert!(cfg.sniffer.api.token.is_empty());
+            assert!(cfg.unexpanded_keys.is_empty());
+            validate(&cfg).unwrap();
+        }
+    }
+
+    #[test]
+    fn login_and_token_are_read_from_the_file() {
+        let token = generated_token();
+        let cfg = parse(&format!(
+            "[sniffer.api]\nlogin = true\ntoken = \"{token}\"\n"
+        ));
+        assert!(cfg.sniffer.api.login);
+        assert_eq!(cfg.sniffer.api.token, token);
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn login_off_ignores_any_token() {
+        for token in ["", "x", "not hex at all", "$SNIFFER_API_TOKEN", "0000"] {
+            let mut cfg = Configuration::default();
+            cfg.sniffer.api.token = token.to_string();
+            cfg.unexpanded_keys = vec!["sniffer.api.token".to_string()];
+            validate(&cfg).unwrap();
+        }
+
+        let cfg = load_with(
+            "[sniffer.api]\nlogin = false\ntoken = \"$SNIFFER_API_TOKEN\"\n",
+            &[],
+        );
+        assert_eq!(cfg.unexpanded_keys, ["sniffer.api.token"]);
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn login_refuses_a_token_of_the_wrong_shape() {
+        let hex31 = "0123456789abcdef0123456789abcde";
+        let hex32 = "0123456789abcdef0123456789abcdef";
+        assert_eq!(hex31.len(), 31);
+        assert_eq!(hex32.len(), 32);
+        let cases: [(&str, String); 11] = [
+            ("empty", String::new()),
+            ("31 hex characters", hex31.to_string()),
+            ("one non-hex character", format!("{}g", &hex32[..31])),
+            ("one distinct character", "0".repeat(32)),
+            ("two distinct characters", "ab".repeat(16)),
+            ("seven distinct characters", "0123456".repeat(5)),
+            ("a trailing space", format!("{hex32} ")),
+            ("a leading 0x", format!("0x{}", &hex32[..30])),
+            ("a short word", "correct horse battery staple".to_string()),
+            ("non-ASCII digits", "\u{0663}\u{0664}".repeat(16)),
+            (
+                "a reference-looking value",
+                "$SNIFFER_API_TOKEN".to_string(),
+            ),
+        ];
+
+        for (what, token) in cases {
+            assert!(!token_shape_ok(&token), "{what} passes token_shape_ok");
+            let err = login_error(&login_on(&token));
+            assert_asks_for_a_generated_token(&err);
+            if !token.is_empty() {
+                assert!(!err.contains(&token), "{what}: the token is in: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn login_accepts_tokens_of_the_right_shape() {
+        let mut accepted = vec![
+            "01234567".repeat(4),
+            "0123456789abcdef".repeat(2).to_uppercase(),
+            "0123456789ABCDEFabcdef0123456789".to_string(),
+            format!("{}{}", generated_token(), generated_token()),
+        ];
+        for _ in 0..20 {
+            let token = generated_token();
+            accepted.push(token.to_uppercase());
+            accepted.push(token);
+        }
+
+        for token in accepted {
+            assert!(token_shape_ok(&token), "{token} fails token_shape_ok");
+            validate(&login_on(&token)).unwrap();
+        }
+    }
+
+    #[test]
+    fn token_shape_boundaries() {
+        assert_eq!(MIN_TOKEN_HEX_CHARS, 32);
+        assert_eq!(MIN_TOKEN_DISTINCT_CHARS, 8);
+
+        // Length: 31 is out, 32 is in, with distinct characters to spare.
+        let long = "0123456789abcdef".repeat(4);
+        assert!(!token_shape_ok(&long[..31]));
+        assert!(token_shape_ok(&long[..32]));
+        assert!(token_shape_ok(&long));
+
+        // Distinct characters: 7 is out, 8 is in, and case does not add any.
+        assert!(!token_shape_ok(&"0123456".repeat(5)));
+        assert!(token_shape_ok(&"01234567".repeat(4)));
+        assert!(!token_shape_ok(&"aAbBcCdDeEfF0".repeat(3)));
+        assert!(token_shape_ok(&"aAbBcCdDeEfF01".repeat(3)));
+    }
+
+    #[test]
+    fn login_with_an_unset_variable_is_refused() {
+        let cfg = load_with(
+            "[sniffer.api]\nlogin = true\ntoken = \"$SNIFFER_API_TOKEN\"\n",
+            &[],
+        );
+        assert_eq!(cfg.sniffer.api.token, "$SNIFFER_API_TOKEN");
+        assert_eq!(cfg.unexpanded_keys, ["sniffer.api.token"]);
+
+        let err = login_error(&cfg);
+        assert!(
+            err.contains("[sniffer.api] token refers to an environment variable that is not set"),
+            "{err}"
+        );
+        assert!(err.contains("/etc/lorawan-sniffer/sniffer.env"), "{err}");
+        assert!(err.contains("openssl rand -hex 16"), "{err}");
+        assert!(!err.contains("SNIFFER_API_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn a_syntax_error_never_quotes_the_value() {
+        const HEX: &str = "0123456789abcdef0123456789abcdef";
+        const DIGITS: &str = "12345678901234567890123456789012";
+        let cases = [
+            (format!("token = {HEX}"), HEX),
+            (format!("token = \"{HEX}"), HEX),
+            (format!("token = \"{HEX}\" trailing"), HEX),
+            (format!("token = {DIGITS}"), DIGITS),
+            ("token = 98765".to_string(), "98765"),
+            ("token = 3.14159".to_string(), "3.14159"),
+        ];
+        for (line, value) in cases {
+            let file = TempFile::new("syntax-error.toml");
+            fs::write(&file.0, format!("[sniffer.api]\nlogin = true\n{line}\n")).unwrap();
+            let err = format!("{:#}", get(vec![file.path().to_string()]).err().unwrap());
+            assert!(!err.contains(value), "{line}: {err}");
+            assert!(err.contains("at line 3, column "), "{line}: {err}");
+        }
+
+        let file = TempFile::new("syntax-error-mqtt.toml");
+        fs::write(&file.0, "[sniffer.mqtt]\npassword = s3cr3t-pass\n").unwrap();
+        let err = format!("{:#}", get(vec![file.path().to_string()]).err().unwrap());
+        assert!(!err.contains("s3cr3t"), "{err}");
+    }
+
+    #[test]
+    fn a_type_error_keeps_the_kind_and_what_was_expected() {
+        assert_eq!(
+            without_value("invalid type: integer `1234` as i128, expected a string"),
+            "invalid type: integer, expected a string"
+        );
+        assert_eq!(
+            without_value("invalid type: string \"abc\", expected a boolean"),
+            "invalid type: string, expected a boolean"
+        );
+        assert_eq!(
+            without_value("invalid basic string, expected `\"`"),
+            "invalid basic string, expected `\"`"
+        );
+    }
+
+    #[test]
+    fn login_with_a_set_variable_expands() {
+        let token = generated_token();
+        let cfg = load_with(
+            "[sniffer.api]\nlogin = true\ntoken = \"$SNIFFER_API_TOKEN\"\n",
+            &[("SNIFFER_API_TOKEN", &token)],
+        );
+        assert_eq!(cfg.sniffer.api.token, token);
+        assert!(cfg.unexpanded_keys.is_empty());
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn login_flag_can_come_from_a_variable() {
+        let token = generated_token();
+        let text = "[sniffer.api]\nlogin = $SNIFFER_API_LOGIN\ntoken = \"$SNIFFER_API_TOKEN\"\n";
+        let cfg = load_with(
+            text,
+            &[("SNIFFER_API_LOGIN", "true"), ("SNIFFER_API_TOKEN", &token)],
+        );
+        assert!(cfg.sniffer.api.login);
+        validate(&cfg).unwrap();
+
+        // Login on with no token variable is the refusal, not a silent open API.
+        let cfg = load_with(text, &[("SNIFFER_API_LOGIN", "true")]);
+        assert!(login_error(&cfg).contains("refers to an environment variable that is not set"));
+    }
+
+    #[test]
+    fn a_bad_token_from_a_variable_is_not_quoted() {
+        let cfg = load_with(
+            "[sniffer.api]\nlogin = true\ntoken = \"$SNIFFER_API_TOKEN\"\n",
+            &[("SNIFFER_API_TOKEN", "canary-9d41-not-a-token")],
+        );
+        assert!(cfg.unexpanded_keys.is_empty());
+
+        let err = login_error(&cfg);
+        assert_asks_for_a_generated_token(&err);
+        assert!(!err.contains("canary-9d41"), "{err}");
+        assert!(!err.contains("SNIFFER_API_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn loading_records_an_unset_token_reference() {
+        let file = TempFile::new("unset-token.toml");
+        fs::write(
+            &file.0,
+            "[sniffer.api]\nlogin = true\ntoken = \"$LORAWAN_SNIFFER_TEST_NEVER_SET\"\n",
+        )
+        .unwrap();
+
+        let cfg = get(vec![file.path().to_string()]).unwrap();
+
+        assert_eq!(cfg.unexpanded_keys, ["sniffer.api.token"]);
+        assert_eq!(cfg.load_warnings.len(), 1);
+        let err = login_error(&cfg);
+        assert!(
+            err.contains("token refers to an environment variable"),
+            "{err}"
+        );
+        assert!(!err.contains("LORAWAN_SNIFFER_TEST_NEVER_SET"), "{err}");
+    }
+
+    #[test]
+    fn login_is_checked_even_when_mqtt_is_off_and_before_mqtt() {
+        // The MQTT section below is also wrong; the login error comes first
+        // because it is checked ahead of the early return and of MQTT.
+        let mut cfg = login_on("short");
+        cfg.sniffer.mqtt.enabled = true;
+        cfg.sniffer.mqtt.qos = 9;
+        let err = format!("{:#}", validate(&cfg).unwrap_err());
+        assert_asks_for_a_generated_token(&err);
+
+        // With a good token the MQTT error is the one reported.
+        cfg.sniffer.api.token = generated_token();
+        let err = format!("{:#}", validate(&cfg).unwrap_err());
+        assert!(err.contains("qos"), "{err}");
+    }
+
+    #[test]
+    fn login_errors_do_not_contain_the_token() {
+        for (token, unexpanded) in [
+            ("canary-1b7e-short", vec![]),
+            ("canary-1b7e-ref", vec!["sniffer.api.token".to_string()]),
+            ("", vec!["sniffer.api.token".to_string()]),
+        ] {
+            let mut cfg = login_on(token);
+            cfg.unexpanded_keys = unexpanded;
+            let err = login_error(&cfg);
+            assert!(!err.contains("canary"), "{err}");
+        }
     }
 }

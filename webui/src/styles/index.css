@@ -272,7 +272,7 @@ details summary:focus-visible {
 }
 
 /* ─────────────────────────────────────────────────────────
-   Column picker
+   Settings menu (columns, CSV export, log out)
 ───────────────────────────────────────────────────────── */
 .column-picker {
   position: relative;
@@ -284,7 +284,7 @@ details summary:focus-visible {
   display: flex;
   align-items: center;
   white-space: nowrap;
-  width: 60px;
+  width: 80px; /* "⚙ Settings"; the header has about 35 px left at 800 px */
 }
 .column-picker > summary::-webkit-details-marker { display: none; }
 
@@ -313,6 +313,38 @@ details summary:focus-visible {
 }
 .column-picker-list label:hover { background: var(--bg-hover); }
 .column-picker-list input[type="checkbox"] { cursor: pointer; margin: 0; }
+
+/* The actions close the menu, set apart from the columns: "Export CSV", and
+   "Log out" when the sniffer asks for a login. Each spans the whole width of
+   the two-column list, so it is as wide as the menu and a finger finds it
+   easily; each is the 36 px touchscreen target of docs/MOBILE.md. */
+.column-picker-sep {
+  column-span: all;
+  margin: 4px 0;
+  border-top: 1px solid var(--border);
+}
+
+.column-picker-action {
+  column-span: all;
+  display: block;
+  width: 100%;
+  height: 36px;
+  padding: 0 14px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  font-family: var(--font-ui);
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.column-picker-action:hover:not(:disabled) { background: var(--bg-hover); }
+.column-picker-action:disabled { opacity: 0.4; cursor: default; }
+.column-picker-action:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
 
 /* ─────────────────────────────────────────────────────────
    Message table
@@ -449,7 +481,7 @@ tr:hover td { background: var(--bg-hover) !important; }
 .signal-poor { color: var(--signal-poor); }
 
 /* ─── Column widths (fixed layout) ─── */
-.col-time   { width: 88px; }
+.col-time   { width: 140px; }  /* "MM-DD HH:MM:SS.ddd" in the mono font */
 .col-dir    { width: 28px; text-align: center; }
 .col-mtype  { width: 58px; }
 .col-device { width: 88px; }
@@ -461,7 +493,7 @@ tr:hover td { background: var(--bg-hover) !important; }
 .col-fport  { width: 28px; text-align: right; }
 .col-flags  { width: 58px; }
 .col-fopts  { width: 48px; text-align: right; }
-.col-freq   { width: 58px; text-align: right; }
+.col-freq   { width: 62px; text-align: right; }
 .col-dr     { width: 68px; }
 .col-rssi   { width: 44px; text-align: right; }
 .col-snr    { width: 44px; text-align: right; }
@@ -624,6 +656,100 @@ td.col-label { padding: 0; }
 }
 
 /* ─────────────────────────────────────────────────────────
+   Login page
+───────────────────────────────────────────────────────── */
+.login-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  height: 100%;
+  padding: 16px;
+  background: var(--header-bg);
+  /* The page scrolls instead of clipping when an on-screen keyboard leaves
+     less room than the card needs (html and body do not scroll). */
+  overflow-y: auto;
+}
+
+.login-card {
+  /* Auto margins above and below centre the card in the space the version
+     line leaves, and still let a short screen scroll to the top. */
+  margin: auto 0;
+  width: 100%;
+  max-width: 340px;
+  padding: 24px 20px 20px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--modal-shadow);
+}
+
+.login-title {
+  margin: 0 0 18px;
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  text-align: center;
+}
+
+/* 36 px tall, the touchscreen target of docs/MOBILE.md. */
+.login-input,
+.login-btn {
+  display: block;
+  width: 100%;
+  height: 36px;
+  border-radius: 4px;
+  font-size: 14px;
+  font-family: var(--font-ui);
+  touch-action: manipulation;
+}
+
+.login-input {
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+.login-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.login-input[aria-invalid="true"] { border-color: var(--signal-poor); }
+.login-input:read-only { opacity: 0.7; }
+
+.login-error {
+  margin: 8px 0 0;
+  color: var(--signal-poor);
+  font-size: 13px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.login-btn {
+  margin-top: 14px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+  cursor: pointer;
+}
+.login-btn:hover:not(:disabled) { filter: brightness(1.1); }
+.login-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.login-btn:disabled { opacity: 0.5; cursor: default; }
+
+.login-version {
+  flex-shrink: 0;
+  padding-top: 12px;
+  font-size: 11px;
+  color: var(--text-muted);
+  opacity: 0.6;
+  text-align: center;
+}
+
+/* ─────────────────────────────────────────────────────────
    History notice
 ───────────────────────────────────────────────────────── */
 
@@ -734,22 +860,3 @@ td.col-label { padding: 0; }
 .live-toggle.live .live-dot {
   animation: live-pulse 1.4s ease-in-out infinite;
 }
-
-/* ─────────────────────────────────────────────────────────
-   CSV export button
-───────────────────────────────────────────────────────── */
-.export-btn {
-  height: 26px;
-  padding: 0 9px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  background: var(--bg);
-  color: var(--text);
-  font-size: 12px;
-  font-family: var(--font-ui);
-  cursor: pointer;
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-.export-btn:hover:not(:disabled) { background: var(--bg-hover); }
-.export-btn:disabled { opacity: 0.4; cursor: default; }

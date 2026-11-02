@@ -5,6 +5,8 @@
   [sniffer.api]
     bind="$SNIFFER_API_BIND"
     allowed_hosts="$SNIFFER_API_ALLOWED_HOSTS"
+    login=$SNIFFER_API_LOGIN
+    token="$SNIFFER_API_TOKEN"
 
   [sniffer.database]
     path="$SNIFFER_DATABASE_PATH"

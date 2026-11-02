@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { MessageRecord, WsMessage, deviceId } from './types/messages';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useLabels } from './hooks/useLabels';
@@ -10,6 +10,9 @@ import { FilterBar, FilterState, DEFAULT_FILTERS } from './components/FilterBar'
 import { ColumnPicker, ColumnConfig, DEFAULT_COLUMNS } from './components/ColumnPicker';
 import { StatusBar } from './components/StatusBar';
 import { HistoryNotice } from './components/HistoryNotice';
+import { LoginPage } from './components/LoginPage';
+import { checkSession, logOut, onUnauthorized, reportUnauthorized } from './session';
+import type { SessionCheck } from './session';
 
 // How often the view re-checks which rows are still inside the time range, so
 // rows leave on their own when no record arrives.
@@ -57,10 +60,14 @@ function useLocalStorage<T>(key: string, initial: T): [T, (v: T) => void] {
 }
 
 // ---------------------------------------------------------------------------
-// App
+// The sniffer page
 // ---------------------------------------------------------------------------
 
-export function App() {
+/**
+ * The table and everything around it. `loginEnabled` is true when the sniffer
+ * asks for a login, which is when the "Log out" item belongs in the menu.
+ */
+function SnifferApp({ loginEnabled }: { loginEnabled: boolean }) {
   const [isLive, setIsLive] = useState(true);
 
   const [filters, setFilters] = useLocalStorage<FilterState>('sniffer-filters', DEFAULT_FILTERS);
@@ -142,6 +149,22 @@ export function App() {
     : null;
 
   // ------------------------------------------------------------------
+  // Log out
+  // ------------------------------------------------------------------
+  const handleLogout = useCallback(() => {
+    logOut().then(
+      // The session is gone: the gate shows the login, which closes this page's
+      // sockets with it.
+      reportUnauthorized,
+      // Claiming a logout that did not happen would leave the session valid
+      // on a screen that looks logged out, so say so and stay.
+      (e: unknown) => {
+        window.alert(`Could not log out: ${e instanceof Error ? e.message : 'unknown error'}.`);
+      },
+    );
+  }, []);
+
+  // ------------------------------------------------------------------
   // CSV export — serialises the current filtered view
   // ------------------------------------------------------------------
   const handleExportCsv = useCallback(() => {
@@ -208,15 +231,13 @@ export function App() {
           <span className="app-title-secondary"> Sniffer</span>
         </span>
         <FilterBar filters={filters} onChange={setFilters} gateways={history.knownGateways} />
-        <ColumnPicker columns={columns} onChange={setColumns} />
-        <button
-          className="export-btn"
-          onClick={handleExportCsv}
-          title={`Export ${filteredMessages.length} rows as CSV`}
-          disabled={filteredMessages.length === 0}
-        >
-          ↓ CSV
-        </button>
+        <ColumnPicker
+          columns={columns}
+          onChange={setColumns}
+          onExport={handleExportCsv}
+          exportCount={filteredMessages.length}
+          onLogout={loginEnabled ? handleLogout : undefined}
+        />
       </header>
 
       <main className="app-main" aria-busy={history.busy}>
@@ -269,4 +290,93 @@ export function App() {
       )}
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// The gate: which page the browser sees
+// ---------------------------------------------------------------------------
+
+type GateKind = 'checking' | SessionCheck['kind'];
+
+/** How long the page waits before asking again while the sniffer cannot be reached. */
+const RETRY_MS = 3_000;
+
+/** Status-bar text over an otherwise empty page, for the states that have nothing else to show. */
+function GateStatus({ tone, text }: { tone: 'connecting' | 'disconnected'; text: string }) {
+  return (
+    <div className="app">
+      <main className="app-main" />
+      <footer className="app-footer">
+        <div className="status-bar">
+          <span className={`ws-indicator ws-${tone}`}>
+            <span className="ws-dot" aria-hidden="true" />
+            {text}
+          </span>
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+/**
+ * Decides what the browser shows. It asks the sniffer for the session on
+ * load, then shows the login page, or the sniffer page (with a "Log out" item
+ * when login is on). Anything that sees a 401 reports it (`reportUnauthorized`)
+ * and the sniffer page goes away, closing its WebSockets, so nothing keeps
+ * reconnecting behind the login page.
+ *
+ * The state is also on `document.body.dataset.session`, for scripts that
+ * drive the page.
+ */
+export function App() {
+  // An object, not the bare kind: a retry that finds the sniffer still
+  // unreachable stores the same kind again, and the new object is what makes
+  // the effect below schedule the next retry.
+  const [gate, setGate] = useState<{ kind: GateKind }>({ kind: 'checking' });
+
+  // Only the latest check may change the page: a slow answer must not undo a
+  // newer one, or a 401 seen meanwhile.
+  const latest = useRef(0);
+
+  const recheck = useCallback(async (): Promise<SessionCheck> => {
+    const mine = ++latest.current;
+    const check = await checkSession();
+    if (mine === latest.current) setGate({ kind: check.kind });
+    return check;
+  }, []);
+
+  useEffect(() => {
+    void recheck();
+  }, [recheck]);
+
+  useEffect(
+    () =>
+      onUnauthorized(() => {
+        latest.current++;
+        setGate({ kind: 'login' });
+      }),
+    [],
+  );
+
+  useEffect(() => {
+    document.body.dataset.session = gate.kind;
+  }, [gate]);
+
+  useEffect(() => {
+    if (gate.kind !== 'unreachable') return;
+    const timer = setTimeout(() => void recheck(), RETRY_MS);
+    return () => clearTimeout(timer);
+  }, [gate, recheck]);
+
+  switch (gate.kind) {
+    case 'checking':
+      return <GateStatus tone="connecting" text="Connecting…" />;
+    case 'unreachable':
+      return <GateStatus tone="disconnected" text="Cannot reach the sniffer. Retrying…" />;
+    case 'login':
+      return <LoginPage onLoggedIn={recheck} />;
+    case 'open':
+    case 'logged-in':
+      return <SnifferApp loginEnabled={gate.kind === 'logged-in'} />;
+  }
 }

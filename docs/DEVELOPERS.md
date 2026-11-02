@@ -70,15 +70,17 @@ lorawan-packet-sniffer-v2/
 │       │   ├── history.rs      # What a history request asks for; label case folding
 │       │   ├── storage.rs      # SQLite persistence layer (writer + read-only connection)
 │       │   ├── writer.rs       # WriterItem: what the storage queue carries
+│       │   ├── random.rs       # Random bytes that can fail: RandomSource, generate_token
 │       │   └── toa.rs          # Time-on-Air calculator
 │       ├── config/
 │       │   └── mod.rs          # Configuration structs and TOML loader
 │       ├── cmd/
 │       │   ├── mod.rs          # Module re-exports
 │       │   ├── root.rs         # Main run loop: spawns all async tasks
-│       │   └── configfile.rs   # `configfile` subcommand (prints template)
+│       │   └── configfile.rs   # `configfile` subcommand (prints template, with a generated login token)
 │       ├── api/
-│       │   ├── mod.rs          # HTTP/WebSocket server (axum)
+│       │   ├── mod.rs          # HTTP/WebSocket server (axum), router and layer order
+│       │   ├── auth.rs         # Optional WebUI login: sessions, lockout, require_login, login/logout
 │       │   └── messages.rs     # GET /api/messages: message history
 │       └── proxy/
 │           ├── mod.rs          # Shared proxy utilities
@@ -91,7 +93,8 @@ lorawan-packet-sniffer-v2/
     ├── vite.config.ts
     └── src/
         ├── main.tsx            # React app entry point
-        ├── App.tsx             # Root component + WebSocket connection
+        ├── App.tsx             # The login gate, then the sniffer page (SnifferApp)
+        ├── session.ts          # Login's WebUI side: checkSession, logIn, logOut, reportUnauthorized
         ├── types/
         │   └── messages.ts     # TypeScript types mirroring MessageRecord
         ├── lib/
@@ -99,7 +102,8 @@ lorawan-packet-sniffer-v2/
         ├── components/
         │   ├── MessageTable.tsx # Packet table with virtual scrolling
         │   ├── FilterBar.tsx   # Time range / MType / status / gateway / device controls
-        │   ├── ColumnPicker.tsx # Show/hide column selector
+        │   ├── ColumnPicker.tsx # ⚙ Settings menu: columns, Export CSV, Log out
+        │   ├── LoginPage.tsx   # The token field and Log in button
         │   ├── HistoryNotice.tsx # The strip under the table: cap, errors, database behind
         │   └── StatusBar.tsx   # Connection and message count indicator
         ├── hooks/
@@ -618,6 +622,8 @@ Three partial indexes are created for the most common query patterns: by timesta
 
 **Blocking calls in async context:** All `Storage` methods (`insert`, `query_history`, etc.) are synchronous — they block the calling thread. The callers in `cmd/root.rs` wrap every call in `tokio::task::spawn_blocking` to avoid blocking the async event loop.
 
+**The session secret.** Migration 4 creates `session_secret`, a table with at most one row (`id` is `CHECK (id = 1)`, `secret` a 32-byte blob). `Storage::session_secret(fresh)` first reads the row with no transaction and no write, which is what every start after the first does and works on a read-only file. Only if there is no row does it `BEGIN IMMEDIATE`, read again (another process may have created it while this one waited for the lock), call `fresh` once and `INSERT`; a lock held past the busy timeout (5 s) is an error, never a secret of its own that the other process does not share. A row that is not 32 bytes is `SecretError::Damaged`, reported and never replaced, because replacing it would log every browser out. No `SecretError` value holds secret bytes. Older versions ignore the table, so their databases stay compatible, but they do not enforce the login.
+
 **`INSERT OR REPLACE`:** If a record with the same UUID is inserted twice (e.g., due to a retry), the second insert replaces the first without error. In practice UUIDs are unique, but the `OR REPLACE` makes the operation idempotent.
 
 ---
@@ -668,6 +674,8 @@ The configuration is hierarchical:
 
 **Serde defaults:** Every struct implements `Default` and is annotated `#[serde(default)]`. This means missing fields in the TOML file are filled in with default values. Operators can use a minimal config file.
 
+**The login settings.** `[sniffer.api] login` (default `false`) and `token` (default empty) are read like any other setting, `$VAR` expansion included. `validate` runs `validate_login` right after the `allowed_hosts` check and before the MQTT early return: with login off the token is not looked at; with login on an unexpanded `$VAR` reference (recorded in `Configuration.unexpanded_keys` when the file is loaded), an empty token or one that fails `token_shape_ok` (at least 32 hexadecimal characters, at least 8 distinct, `A` and `a` counting as one) stops startup with a message that names `[sniffer.api] token` and says how to generate one, and none of them quotes the value. The shape check is a format check: it cannot tell a random token from a typed one, and no text may describe it as proving randomness. `Api` and `Configuration` have no `Debug` on purpose.
+
 **`humantime_serde`:** The `retention` field is a `std::time::Duration` but is written in TOML as a human-readable string like `"30days"`. The `humantime_serde` crate handles the conversion automatically.
 
 **`pub fn get(filenames: Vec<String>) -> Result<Configuration>`:** Reads and concatenates multiple TOML files (allowing split configuration), expands `$ENV_VAR` references, and parses the result. Returns an `anyhow::Result` — the `anyhow` crate is used in the binary (application code) for ergonomic error handling with rich context messages.
@@ -692,6 +700,8 @@ Just re-exports the two submodules: `pub mod configfile` and `pub mod root`. No 
 Implements the `configfile` subcommand. It takes the current `Configuration` (which has all defaults populated) and renders a Handlebars template with those values.
 
 The result is a commented TOML template that an operator can use as a starting point. Running `lorawan-sniffer configfile > sniffer.toml` gives a complete, annotated configuration file.
+
+The template's `token` line is a fresh token: `run` reads 16 bytes from a `RandomSource`, writes them as 32 hex characters (`generate_token`), and renders the template with that as `generated_token`. The token loaded from a file or the environment has no placeholder and is removed from the values before rendering, so a mistaken placeholder fails the strict render and cannot print the loaded secret. The token is made before anything is printed, so a failing random source (`RandomError`) prints nothing and `main.rs` exits with "Cannot generate a login token: …".
 
 ---
 
@@ -779,9 +789,22 @@ The HTTP/WebSocket server, built on the `axum` web framework.
 | `GET /ws/labels` | `labels_ws_handler` | WebSocket feed of the device labels (see the README) |
 | `GET /api/messages` | `messages::messages_handler` | REST message history |
 | `GET /api/labels`, `PUT`/`DELETE /api/labels/{device}` | label handlers | Device labels (see the README) |
+| `GET /api/session` | `auth::session_open` / `auth::session_closed` | `{"login": true}` or `{"login": false}`; always registered |
+| `POST /api/login`, `POST /api/logout` | `auth::login`, `auth::logout` | Start and end a session; registered only when the login is on |
 | `GET /*` | `frontend_handler` | Serve the embedded React SPA |
 
-The Host check wraps all of them; the README's "Host check" section explains why.
+**Layer order.** `build_router` adds layers from the inside out, so the last one added is the first to see a request: the routes, then (only with `login = true`) `require_login`, then CORS (only with `cors_origins`), then the Host check. A foreign `Host` is refused before login is considered, a CORS preflight needs no credential, and the login's `401` and `429` come from outside every route. The README's "Host check" section explains why that check is outermost.
+
+**The login (`api/auth.rs`).** `ApiContext.login` is `Option<Arc<Auth>>`: `cmd/root.rs` builds it (`start_login`) only when `[sniffer.api] login` is true, and the router adds the login routes and the layer only when it is `Some`. With it `None` the router is the one that existed before the login, plus `/api/session`.
+
+- **`Auth`** holds the session key (`session_key(secret, token)` = `HMAC(secret, label ‖ 0x00 ‖ token)` used as an HMAC key), a `Comparer` for tokens, the `RandomSource`, two `RateLimitedLog`s (failed logins; a login whose `Origin` and `Host` differ) and the `Lockout`. It has no `Debug`. `Auth::new` draws a 32-byte per-process key from the random source and keeps the token only as its HMAC under that key; `hmac::verify` is the comparison, so it takes the same time wherever the inputs first differ. `Auth::with_parts` (tests only) swaps the clock and the comparison.
+- **A session** is `v1.<unix seconds>.<16 random bytes in hex>.<HMAC-SHA256 in hex>` and nothing is stored per session. `session_valid` parses the public shape first (a wrong shape reveals only that it is wrong), then `hmac::verify`. The cookie is `lorawan_sniffer_session; HttpOnly; SameSite=Strict; Path=/`, with no `Max-Age`, `Expires` or `Secure`; logout sends the same cookie with `Max-Age=0`.
+- **`Lockout::attempt(compare)`** is the only way a token is compared (`Auth::check_token` wraps it). One `std::sync::Mutex<Window { start, wrong, warned }>` is held across reading the clock, rolling the window over, checking `wrong >= LIMIT` (10), calling `compare`, and counting a wrong one. A single lock is the point: with check and count in separate steps, many requests that arrive together would all pass the check before any of them added to the count. The window is 60 s and fixed, so up to 20 wrong tokens can be compared across a boundary. `Locked(left)` is answered without comparing, a right token is never counted, a panicking `compare` leaves the count unchanged (the poisoned lock is recovered), and nothing in it `.await`s. The clock is `Clock`/`TokioClock`, so tests with a paused Tokio clock move the window.
+- **`credential(headers)`** returns `Bearer`, `Cookie` or `None`: a `Bearer` authorization header wins (and an unusable one, with no token, spaces in it or repeated, is `None` and does not fall back to a cookie); an `Authorization` of any other scheme is ignored, so a proxy's `Basic` does not hide the cookie; else the session cookie.
+- **`require_login`** lets `is_public(path)` paths through (anything outside `/ws`, `/ws/…`, `/api/…`, plus `/api/login` and `/api/logout`), refuses no credential and an invalid cookie with a plain `401` (the cookie failure is logged, not counted), and sends a Bearer token through `check_token`: `Right` passes, `Wrong` is `401`, `Locked` is `429` with `Retry-After`. The prefix test is on the path as the router sees it; odd spellings either match and are refused, or reach no data route.
+- **`same_host_json`** runs first in `login` and `logout`: exactly one `Content-Type` that `mime` parses as `application/json` with no `+suffix` and well-formed parameters (else `415`), then `origin_allowed(headers, uri, &[])`, an `Origin` with the request's host and port (else `403`; `cors_origins` are not consulted and `X-Forwarded-*` is never read). Values from the client reach the log only through `log_value` (64 characters, then `…`; unprintable bytes shown as `?`).
+- **Startup** (`start_login` in `cmd/root.rs`): `Storage::session_secret(|| random_bytes::<32>(..))` reads the stored secret with no write, or creates it in a `BEGIN IMMEDIATE` transaction; then `Auth::new`. Each failure (random source, database, damaged row) is an error that stops startup.
+- **Tests.** `api/auth_tests.rs` has the unit tests (sessions, the lockout with a manual clock and on real threads, `credential`, the parsing helpers) and `api/login_tests.rs` the router tests through the built router with `Setup::login(token)`. `crate::test_support` holds the capturing logger that the log test and the MQTT test share, because a process has one global logger.
 
 **`AppState`:** axum passes shared state to every handler via the `State` extractor. Besides the broadcast sender (to subscribe new WebSocket clients) and the `Storage` handle (to query history), it holds what history requests need: a weak sender for the storage queue (weak, so the API never keeps the queue open after the proxy has stopped), three `Semaphore`s, and the failure counter the writer increments.
 
@@ -1006,11 +1029,15 @@ Runs what `nextRequests` decides: timers, one `AbortController` per request, a 3
 
 ### `webui/src/hooks/useWebSocket.ts`
 
-A React hook that manages one WebSocket connection (connect, receive, reconnect after a drop). It hands each parsed frame to a callback and calls `onOpen` every time the socket opens, which is how `/ws` triggers a reload of the range. Reconnect waits grow from about 3 s to 60 s and are randomised; a connection that lasted a minute resets them.
+A React hook that manages one WebSocket connection (connect, receive, reconnect after a drop). It hands each parsed frame to a callback and calls `onOpen` every time the socket opens, which is how `/ws` triggers a reload of the range. Reconnect waits grow from about 3 s to 60 s and are randomised; a connection that lasted a minute resets them. A browser cannot read why a handshake was refused, so on every close the hook first calls `checkSession()`: `login` means it reports the end of the session and stops; anything else, `unreachable` included, reconnects as before (a close with code 1013 for falling behind is not a session end).
+
+### `webui/src/session.ts`
+
+The login's side in the browser, with no React: `checkSession()` asks `GET /api/session` and answers `open` (login off), `logged-in`, `login` (a 401) or `unreachable` (anything else, a network error included); `logIn(token)` and `logOut()` `POST` JSON with `Content-Type: application/json`, which the server insists on for both; and a small bus, `onUnauthorized(listener)` and `reportUnauthorized()`, that carries "the session is gone" from wherever a 401 is seen (a history load, a label save, a refused WebSocket) to the gate in `App.tsx`. Only relative URLs, and the cookie is never read or stored by script.
 
 ### `webui/src/App.tsx`
 
-The root component. Connects the hooks to the display components: `useHistory` for the rows, `useLabels` for the labels, `useWebSocket` for the live feed. It filters the held rows with `matchesFilter` at render time, on a 5 s tick so that rows leave the range without new traffic, and works out Matching, Shown and Blocked.
+The root component, in two layers. `App` is the gate: it asks `checkSession()` on load and shows "Connecting…", "Cannot reach the sniffer. Retrying…" (asking again every 3 s), `LoginPage`, or `SnifferApp`; a call to `reportUnauthorized()` sends it back to the login, which removes `SnifferApp` and its sockets. `SnifferApp` is the page itself. Connects the hooks to the display components: `useHistory` for the rows, `useLabels` for the labels, `useWebSocket` for the live feed. It filters the held rows with `matchesFilter` at render time, on a 5 s tick so that rows leave the range without new traffic, and works out Matching, Shown and Blocked.
 
 ### `webui/src/components/MessageTable.tsx`
 
@@ -1022,7 +1049,11 @@ Filter controls (time range, MType, status, gateway, device, and the "Show malfo
 
 ### `webui/src/components/ColumnPicker.tsx`
 
-A popover that lets the user show or hide individual columns.
+The **⚙ Settings** popover: it shows or hides individual columns, then, after a separator, holds the actions, which close it when chosen: **Export CSV** (the rows shown; `App` passes `onExport` and the row count) and, when the login is on, **Log out** (`onLogout`). The header has no room for buttons of their own at 800 px.
+
+### `webui/src/components/LoginPage.tsx`
+
+The login page: a password field, **Log in**, Enter submits. It does not send a blank field, trims the token, ignores a second submit while one is out (every wrong token counts against everyone's attempts), keeps the text after an error, and shows the server's message (wrong token, the lockout, a proxy that changed `Host`) or, when the sniffer accepted the token but a new check still finds no session, a line about allowing cookies.
 
 ### `webui/src/components/HistoryNotice.tsx`
 

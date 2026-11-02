@@ -31,7 +31,9 @@
 //! - version 1: gateway, join and frame-control columns on `messages`;
 //! - version 2: the `device_labels` table, one operator-chosen label per
 //!   device identifier;
-//! - version 3: the `malformed` and `classified` columns on `messages`.
+//! - version 3: the `malformed` and `classified` columns on `messages`;
+//! - version 4: the `session_secret` table, one random secret that signs the
+//!   WebUI login sessions.
 //!
 //! ## Malformed frames
 //!
@@ -54,6 +56,18 @@
 //! through that index and returns at once when there are none.  A pass that
 //! fails (a full disk, say) rolls back whole and is repeated at the next
 //! start; it never stops the sniffer from opening the database.
+//!
+//! ## Session secret
+//!
+//! With the WebUI login on, sessions are signed with a key made from the token
+//! and from a random secret kept in the `session_secret` table, so a session
+//! survives a restart, and a cookie cannot be forged from the token alone.
+//! [`Storage::session_secret`] reads the row without writing anything, which
+//! is what every start after the first does, so it works on a database the
+//! sniffer cannot write to.  Only when there is no row does it take SQLite's
+//! write lock, look again (another process may have made the row while this
+//! one waited), and insert.  A row that is not 32 bytes is reported, never
+//! replaced: replacing it would silently log every browser out.
 //!
 //! ## Device labels
 //!
@@ -116,7 +130,9 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use log::{warn, Level};
 use rusqlite::types::{Value, ValueRef};
-use rusqlite::{params, Connection, ErrorCode, OpenFlags, ToSql, TransactionBehavior};
+use rusqlite::{
+    params, Connection, ErrorCode, OpenFlags, OptionalExtension, ToSql, TransactionBehavior,
+};
 
 use crate::core::error::SnifferError;
 use crate::core::history::{
@@ -125,6 +141,7 @@ use crate::core::history::{
 use crate::core::metadata::{
     CrcStatus, Direction, MType, Malformed, MessageRecord, Protocol, Status,
 };
+use crate::core::random::RandomError;
 
 const SELECT_COLS: &str = "
     id, timestamp, direction, status, blocked_by, source_protocol,
@@ -231,6 +248,24 @@ const MIGRATIONS: &[&str] = &[
     // on `UNCLASSIFIED_INDEX_SQL`.
     "ALTER TABLE messages ADD COLUMN malformed  TEXT;
      ALTER TABLE messages ADD COLUMN classified INTEGER NOT NULL DEFAULT 0;",
+    // 3 -> 4: the secret that signs WebUI login sessions.
+    //
+    // Only DDL, so it is instant at any size, and it touches no other table.
+    // The table stays empty until the first start with the login on, so a
+    // sniffer with the login off never writes to it.  Older versions ignore
+    // it: their migration loop skips entries at or below the stored version
+    // and does not refuse a higher one, and they only create what is missing.
+    // A database that went back to such a version and comes forward again
+    // finds the secret where it was, so the sessions made before still work.
+    //
+    // Entries are only ever appended, never inserted before one that has
+    // shipped: a database already past that version would skip the inserted
+    // entry, and the entry after the gap would then run a second time.
+    "CREATE TABLE session_secret (
+         id         INTEGER PRIMARY KEY CHECK (id = 1),
+         secret     BLOB    NOT NULL CHECK (length(secret) = 32),
+         created_at TEXT    NOT NULL
+     );",
 ];
 
 const INSERT_SQL: &str = "
@@ -422,6 +457,31 @@ pub struct Pruned {
     pub messages: usize,
     /// Devices whose label was deleted, in no particular order.
     pub labels: Vec<String>,
+}
+
+/// Why [`Storage::session_secret`] could not return the session secret.
+///
+/// No variant holds secret bytes, so neither `Display` nor `Debug` can print
+/// them.
+#[derive(Debug, thiserror::Error)]
+pub enum SecretError {
+    /// There was no secret yet and the operating system's random source
+    /// failed.  Nothing was stored.
+    #[error(transparent)]
+    Random(#[from] RandomError),
+
+    /// SQLite refused to read or write: a read-only file or a full disk on
+    /// the first start, or another process holding the write lock past the
+    /// busy timeout.  Nothing was stored.
+    #[error(transparent)]
+    Storage(#[from] rusqlite::Error),
+
+    /// The `session_secret` row exists but does not hold exactly 32 bytes of
+    /// blob, which only editing the database by hand can cause.  It is left
+    /// as it is: replacing it would log every browser out without anyone
+    /// having asked for that.
+    #[error("the stored session secret is damaged")]
+    Damaged,
 }
 
 /// Thread-safe, cheaply-cloneable SQLite storage handle.
@@ -667,6 +727,31 @@ impl Storage {
         let conn = self.conn.lock().map_err(|_| SnifferError::LockPoisoned)?;
         let n = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
         Ok(n)
+    }
+
+    /// The secret that signs WebUI login sessions: the stored one, or a new
+    /// one if there is none yet.
+    ///
+    /// `fresh` supplies 32 random bytes and is called only when no secret is
+    /// stored, and at most once.  It runs inside the write transaction that
+    /// stores its result, so it should be quick.  A stored secret is read
+    /// without any write, so this works on a database that cannot be written.
+    ///
+    /// This runs on the writer connection, which waits up to its busy timeout
+    /// (five seconds) for another process that is creating the secret at the
+    /// same moment, and then fails with [`SecretError::Storage`].
+    pub fn session_secret(
+        &self,
+        fresh: impl FnOnce() -> Result<[u8; 32], RandomError>,
+    ) -> Result<[u8; 32], SecretError> {
+        // A holder that panicked rolled back its transaction while unwinding,
+        // so a poisoned connection is still consistent, and failing here
+        // would only make the sniffer unable to start.
+        let mut conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        read_or_create_session_secret(&mut conn, fresh)
     }
 
     /// Answer a history request: the records that match `q`, oldest first, and
@@ -957,6 +1042,65 @@ fn insert_record(conn: &Connection, rec: &MessageRecord) -> rusqlite::Result<usi
             rec.malformed.as_ref().map(malformed_str),
         ],
     )
+}
+
+// ---------------------------------------------------------------------------
+// Session secret
+// ---------------------------------------------------------------------------
+
+/// The stored secret: `None` when there is no row, `Some(None)` when the row
+/// is not a 32-byte blob.
+fn read_session_secret(conn: &Connection) -> rusqlite::Result<Option<Option<[u8; 32]>>> {
+    conn.query_row("SELECT secret FROM session_secret WHERE id = 1", [], |r| {
+        // The column accepts any type; a text value of the right length
+        // passes the length check, and is as damaged as a short blob.
+        Ok(match r.get_ref(0)? {
+            ValueRef::Blob(bytes) => <[u8; 32]>::try_from(bytes).ok(),
+            _ => None,
+        })
+    })
+    .optional()
+}
+
+/// Read the session secret, creating it if there is none.
+///
+/// The read comes first, in no transaction and with no write lock, so every
+/// start after the first neither waits for a writer nor needs the file to be
+/// writable.  Only when there is no row does this take SQLite's write lock
+/// with `BEGIN IMMEDIATE`.  If another process holds it, this waits up to the
+/// connection's busy timeout and then fails, and the caller stops rather than
+/// run with a secret of its own that the other process does not share.  The
+/// row is read again once the lock is held, because that other process may
+/// have created it meanwhile; two sniffers started together therefore end up
+/// with one secret.
+///
+/// `fresh` is called only when the second read still finds nothing, and its
+/// failure rolls back with nothing stored.
+fn read_or_create_session_secret(
+    conn: &mut Connection,
+    fresh: impl FnOnce() -> Result<[u8; 32], RandomError>,
+) -> Result<[u8; 32], SecretError> {
+    match read_session_secret(conn)? {
+        Some(Some(secret)) => return Ok(secret),
+        Some(None) => return Err(SecretError::Damaged),
+        None => {}
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    match read_session_secret(&tx)? {
+        Some(Some(secret)) => return Ok(secret),
+        Some(None) => return Err(SecretError::Damaged),
+        None => {}
+    }
+    let secret = fresh()?;
+    // A plain INSERT: should a row ever be there, this fails instead of
+    // replacing it.
+    tx.execute(
+        "INSERT INTO session_secret (id, secret, created_at) VALUES (1, ?1, ?2)",
+        params![&secret[..], Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(secret)
 }
 
 // ---------------------------------------------------------------------------
@@ -1710,6 +1854,8 @@ mod history_large_tests;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]
+mod secret_tests;
+#[cfg(test)]
 pub(crate) use tests::TempDb;
 
 #[cfg(test)]
@@ -1948,7 +2094,7 @@ mod tests {
     /// in the field.  It must never be edited to track later schemas: the
     /// whole point is that it stays the old schema while `INIT_SQL` and
     /// `MIGRATIONS` move on.
-    const SCHEMA_V2_0_0: &str = "
+    pub(super) const SCHEMA_V2_0_0: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous  = NORMAL;
     PRAGMA foreign_keys = ON;
@@ -2355,7 +2501,7 @@ mod tests {
 
     /// The frozen layout of a 2.1.0 database: the 2.0.0 schema plus the
     /// columns added by the first migration, marked as version 1.
-    const SCHEMA_V2_1_0_UPGRADE: &str = "
+    pub(super) const SCHEMA_V2_1_0_UPGRADE: &str = "
     ALTER TABLE messages ADD COLUMN gateway_eui TEXT;
     ALTER TABLE messages ADD COLUMN join_eui    TEXT;
     ALTER TABLE messages ADD COLUMN dev_nonce   INTEGER;
@@ -3043,7 +3189,7 @@ mod tests {
 
     /// The `device_labels` table as the previous version created it, which
     /// makes the database one at schema version 2.
-    const SCHEMA_2_LABELS: &str = "
+    pub(super) const SCHEMA_2_LABELS: &str = "
     CREATE TABLE device_labels (
         device     TEXT PRIMARY KEY,
         label      TEXT NOT NULL,
@@ -4102,20 +4248,23 @@ mod tests {
         assert_eq!(s.count().unwrap(), rows.len() as i64);
 
         // ---- A database that cannot grow ------------------------------------
-        // The state a failed pass leaves: migration 3 is in, every row reads
-        // unchecked, there is no index.  The limit comes after the migration
-        // because adding the columns rewrites the schema on the first page,
-        // and a migration that fails is fatal by design.
+        // The state a failed pass leaves: every migration is in, every row
+        // reads unchecked, there is no index.  The limit comes after the
+        // migrations because adding a column or a table rewrites the schema
+        // on the first page, and a migration that fails is fatal by design.
         let tmp = TempDb::new("retry-full");
         let path = tmp.path();
         schema_2_database(&path, &rows);
         let before = records_at_schema_2(&path);
         {
             let mut conn = Connection::open(&path).unwrap();
-            let tx = conn.transaction().unwrap();
-            tx.execute_batch(MIGRATIONS[2]).unwrap();
-            tx.pragma_update(None, "user_version", 3).unwrap();
-            tx.commit().unwrap();
+            for (i, migration) in MIGRATIONS.iter().enumerate().skip(2) {
+                let tx = conn.transaction().unwrap();
+                tx.execute_batch(migration).unwrap();
+                tx.pragma_update(None, "user_version", i as i64 + 1)
+                    .unwrap();
+                tx.commit().unwrap();
+            }
             // Packed pages and no free page: nothing is left to hand out.
             conn.execute_batch("VACUUM").unwrap();
             let free: i64 = conn

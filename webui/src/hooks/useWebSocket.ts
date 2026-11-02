@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { nextReconnect } from '../lib/history';
+import { checkSession, reportUnauthorized } from '../session';
 
 export type WsStatus = 'connecting' | 'connected' | 'disconnected';
 
@@ -18,6 +19,12 @@ export type WsStatus = 'connecting' | 'connected' | 'disconnected';
  * sniffer do not all come back at one instant. A link that keeps dropping, or a
  * server that closes a client for falling behind (close code 1013), therefore
  * costs one reconnect a minute at most, not one every 3 s.
+ *
+ * A browser cannot read why a handshake was refused; it only sees the socket
+ * close. So before each reconnect the hook asks `/api/session`: if the session
+ * has ended it reports that and stops, instead of retrying a login that no
+ * retry can pass. Any other answer, including "unreachable", reconnects as
+ * before; a close for falling behind (code 1013) is not a session end.
  */
 export function useWebSocket<T>(
   path: string,
@@ -73,9 +80,17 @@ export function useWebSocket<T>(
         setStatus('disconnected');
         const lastConnectionMs = openedAt === null ? 0 : Date.now() - openedAt;
         openedAt = null;
-        const next = nextReconnect(nominalMs, lastConnectionMs, Math.random());
-        nominalMs = next.nominalMs;
-        reconnectTimer = setTimeout(connect, next.delayMs);
+        void checkSession().then(check => {
+          // The page may have left while the check was out.
+          if (cancelled) return;
+          if (check.kind === 'login') {
+            reportUnauthorized();
+            return;
+          }
+          const next = nextReconnect(nominalMs, lastConnectionMs, Math.random());
+          nominalMs = next.nominalMs;
+          reconnectTimer = setTimeout(connect, next.delayMs);
+        });
       };
 
       ws.onerror = () => ws?.close();

@@ -8,7 +8,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
@@ -25,6 +25,7 @@ use super::*;
 use crate::core::decoder;
 use crate::core::metadata::{CrcStatus, Direction, MType, Malformed, Protocol, Status};
 use crate::proxy::{frame_fields, Outputs};
+use crate::test_support::capture_logger;
 
 /// Backoff short enough that tests reconnect in milliseconds.
 const FAST: Tuning = Tuning {
@@ -814,39 +815,6 @@ fn start_rejects_invalid_settings() {
 // ---------------------------------------------------------------------------
 // Secrets
 // ---------------------------------------------------------------------------
-
-/// Collects every log line, at every level, from the whole test process.
-struct CaptureLogger {
-    lines: Mutex<Vec<String>>,
-}
-
-impl log::Log for CaptureLogger {
-    fn enabled(&self, _: &log::Metadata) -> bool {
-        true
-    }
-
-    fn log(&self, record: &log::Record) {
-        self.lines.lock().unwrap().push(format!(
-            "{} {}: {}",
-            record.level(),
-            record.target(),
-            record.args()
-        ));
-    }
-
-    fn flush(&self) {}
-}
-
-fn capture_logger() -> &'static CaptureLogger {
-    static LOGGER: OnceLock<CaptureLogger> = OnceLock::new();
-    let logger = LOGGER.get_or_init(|| CaptureLogger {
-        lines: Mutex::new(Vec::new()),
-    });
-    // Ignore the error from a second test installing it again.
-    let _ = log::set_logger(logger);
-    log::set_max_level(log::LevelFilter::Trace);
-    logger
-}
 
 #[tokio::test]
 async fn logs_never_contain_the_password() {

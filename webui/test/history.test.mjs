@@ -640,6 +640,10 @@ class Hook {
     return this.dispatch({ kind: 'noWal', generation });
   }
 
+  unauthorized(generation) {
+    return this.dispatch({ kind: 'unauthorized', generation });
+  }
+
   // --- the table --------------------------------------------------------------
 
   currentFilter() {
@@ -1789,6 +1793,115 @@ test('nextRetryDelay: the same jitter bounds for every step', () => {
   });
   assert.equal(H.nextRetryDelay(1000, 0), 30000, 'any later step is the last one');
   assert.equal(H.nextRetryDelay(-3, 1), 5000);
+});
+
+// ===========================================================================
+// A 401: the session ended
+// ===========================================================================
+
+test('classifyFailedLoad: a 401 is unauthorized, not an error and not a retry', () => {
+  assert.equal(H.classifyFailedLoad(401, null), 'unauthorized');
+  // The status decides alone: no body code can turn a 401 into something retried.
+  assert.equal(H.classifyFailedLoad(401, 'busy'), 'unauthorized');
+  assert.equal(H.classifyFailedLoad(401, 'no_wal'), 'unauthorized');
+  assert.equal(H.classifyFailedLoad(401, 'anything'), 'unauthorized');
+});
+
+test('classifyFailedLoad: the other statuses keep their meaning', () => {
+  assert.equal(H.classifyFailedLoad(503, 'no_wal'), 'noWal');
+  assert.equal(H.classifyFailedLoad(503, 'busy'), 'busy');
+  assert.equal(H.classifyFailedLoad(503, null), 'failed');
+  assert.equal(H.classifyFailedLoad(503, 'other'), 'failed');
+  // The codes belong to a 503 only.
+  assert.equal(H.classifyFailedLoad(500, 'busy'), 'failed');
+  assert.equal(H.classifyFailedLoad(500, 'no_wal'), 'failed');
+  for (const status of [400, 403, 404, 429, 500, 502, 504]) {
+    assert.equal(H.classifyFailedLoad(status, null), 'failed', `status ${status}`);
+  }
+});
+
+test('unauthorized: a 401 ends the load without an error, a timer or another request', () => {
+  const h = new Hook();
+  h.dispatch({ kind: 'mount' });
+  h.fire('mount');
+  assert.notEqual(h.state.inFlight, null);
+  const sends = h.sends.length;
+
+  const actions = h.unauthorized(h.state.inFlight.generation);
+
+  assert.deepEqual(actions, []);
+  assert.equal(h.state.inFlight, null);
+  assert.equal(h.state.error, null, 'no error strip');
+  assert.equal(h.state.retryStep, null);
+  assert.equal(H.isBehind(h.state), false);
+  assert.equal(H.isBusy(h.state), false);
+  assert.equal(h.timers.size, 0, 'nothing is scheduled');
+  assert.equal(h.sends.length, sends, 'nothing is sent again');
+});
+
+test('unauthorized: the reload after a reconnect that gets a 401 is not retried either', () => {
+  const h = new Hook();
+  h.dispatch(open);
+  h.respond(1, { records: [rec('a', 1)] });
+  // The socket drops and comes back: a catch-up load, which a transient
+  // failure would put in the retry series.
+  h.dispatch(open);
+  const load = h.lastSend().load;
+  assert.equal(load.cause, 'catchUp');
+
+  const actions = h.unauthorized(load.generation);
+
+  assert.deepEqual(kinds(actions), []);
+  assert.equal(h.state.error, null);
+  assert.equal(h.state.retryStep, null);
+  assert.equal(h.state.retryTimer, false);
+  assert.equal(H.isBehind(h.state), false);
+  assert.equal(h.timers.size, 0);
+  assert.deepEqual(ids(h.rows), ['a'], 'the rows already held are left alone');
+});
+
+test('unauthorized: contrast, a transient failure of the same load does start the retry series and set an error', () => {
+  const h = new Hook();
+  h.dispatch(open);
+  h.respond(1, { records: [rec('a', 1)] });
+  h.dispatch(open);
+  const actions = h.fail(h.lastSend().load.generation, true, 'could not reach the sniffer');
+  assert.deepEqual(kinds(actions), ['startTimer:retry']);
+  assert.equal(h.state.error, 'could not reach the sniffer');
+  assert.equal(H.isBehind(h.state), true);
+});
+
+test('unauthorized: a 401 to a retry ends a running series', () => {
+  const h = new Hook();
+  h.dispatch(open);
+  h.respond(1, { settled: false });
+  assert.equal(H.isBehind(h.state), true);
+  h.fire('retry');
+  const retry = h.lastSend().load;
+  assert.equal(retry.retry, true);
+
+  h.unauthorized(retry.generation);
+
+  assert.equal(H.isBehind(h.state), false);
+  assert.equal(h.state.retryStep, null);
+  assert.equal(h.state.error, null);
+  assert.equal(h.timers.size, 0);
+});
+
+test('unauthorized: a 401 to a load that was overtaken changes nothing', () => {
+  const h = new Hook();
+  h.dispatch(open);
+  const first = h.lastSend().load;
+  h.dispatch({ kind: 'filter', filter: fstate({ gateway: 'G1' }) });
+  const second = h.lastSend().load;
+  assert.notEqual(first.generation, second.generation);
+
+  const before = h.state;
+  const actions = h.unauthorized(first.generation);
+
+  assert.deepEqual(kinds(actions), ['ignore']);
+  assert.equal(h.state, before);
+  assert.equal(h.state.inFlight.generation, second.generation, 'the newer load is still awaited');
 });
 
 // ===========================================================================

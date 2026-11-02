@@ -41,7 +41,7 @@ Data cells are 12px. On a tablet at arm's length, **13px for data and 11px for h
 
 ## Moderate — Sort Header Target
 
-The **Time column header** is the sort button — it's a `<th>` roughly 26px tall. On a 800px table that's a ~88px wide × 26px tall touch target at the top edge. Fine for mouse, hard to tap reliably. Recommend making it a clearly styled dedicated button within the header cell, or increasing `th` height to 32px.
+The **Time column header** is the sort button — it's a `<th>` roughly 26px tall. On a 800px table that's a ~140px wide × 26px tall touch target at the top edge. Fine for mouse, hard to tap reliably. Recommend making it a clearly styled dedicated button within the header cell, or increasing `th` height to 32px.
 
 ## Minor — Checkbox Tap Areas
 

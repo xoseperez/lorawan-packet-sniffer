@@ -18,6 +18,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Optional WebUI login.** `login = true` in `[sniffer.api]` (`SNIFFER_API_LOGIN`
+  in Docker) puts a login page in front of the WebUI and a `401` in front of
+  `/ws`, `/ws/labels` and everything under `/api/`. It is off by default, and
+  with it off nothing changes: no cookie, no login page, every existing route
+  answers as before. One shared token grants everything the WebUI can do; there are no
+  user names or roles.
+  - **The token** is `token` in `[sniffer.api]` (`SNIFFER_API_TOKEN` in Docker),
+    at least 32 hexadecimal characters with 8 different ones, which is what
+    `openssl rand -hex 16` and the new token line of `lorawan-sniffer configfile`
+    produce. With the login on, a missing or malformed token stops the sniffer at
+    startup. This is a format check that cannot tell a generated token from a
+    typed one, so always generate it.
+  - **A fresh `install.sh` install** writes a generated token into the new
+    `sniffer.toml` (login stays off), and an upgrade puts one in
+    `sniffer.toml.new`, leaving your `sniffer.toml` alone. The installer
+    stages the file readable by root only and cleans up after a failure or an
+    interrupt. The sniffer never writes its configuration.
+  - **The WebUI** shows a login page (one field, light and dark, sized for the
+    800 px touchscreen), keeps the session until the browser closes, has
+    **Log out** in the ⚙ Settings menu, and returns to the login page, without
+    retrying for ever, when the session ends.
+  - **Sessions** are signed cookies (`HttpOnly`, `SameSite=Strict`). The key
+    comes from the token and a random secret kept in the database (a new
+    `session_secret` table, schema version 4), so sessions survive a restart,
+    a new token or a new database logs every browser out, and a cookie cannot
+    be forged from the token alone.
+  - **Scripts** send `Authorization: Bearer <token>`. Origins listed in
+    `cors_origins` may send it too.
+  - **A lockout** accepts at most 10 wrong tokens per fixed one-minute window,
+    across all clients; after that every token, the right one included, gets
+    `429` with `Retry-After` until the window ends. Browsers already logged in
+    keep working.
+  - **Login and logout** accept only a JSON request addressed to the
+    sniffer's own host, so another web site cannot log a browser in or out. A
+    reverse proxy must pass the browser's `Host` header exactly, port included
+    (nginx: `proxy_set_header Host $http_host;`); the second nginx set-up in
+    the README, which sends an IP address as `Host`, does not work with the
+    login.
+  - Over plain HTTP the token and the cookie travel in clear; behind an HTTPS
+    proxy, bind the sniffer to `127.0.0.1`.
+  - **Rolling back** to a version without the login is a security downgrade:
+    it opens the same database but ignores the setting and serves everyone, so
+    restrict access to the port first.
+  - New endpoints `GET /api/session`, `POST /api/login` and `POST /api/logout`.
+    The README has a "WebUI login" section.
 - **Time-range history from the database.** The WebUI's time selector (5
   min, 15 min, 1 h, 24 h, all time) now loads the newest 5,000 records of the
   range from the database, instead of filtering the 500 records fetched when
@@ -105,8 +150,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     labelled too.
   - Labels follow identifiers, not devices: a device that rejoins gets a new
     DevAddr, and its DevEUI label and DevAddr label are separate. Labels are
-    not added to MQTT payloads, and there is no authentication on label
-    editing.
+    not added to MQTT payloads, and unless the WebUI login is on there is no
+    authentication on label editing.
 - **Label API and `/ws/labels`.** `GET /api/labels` returns every label,
   `PUT /api/labels/{device}` (JSON body `{"label": "..."}`) sets or replaces
   one and `DELETE /api/labels/{device}` removes it. The new WebSocket
@@ -154,6 +199,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The ⚙ Cols menu is now ⚙ Settings,** and holds the column choices, then
+  **Export CSV** and, when login is on, **Log out**. The separate ↓ CSV button
+  is gone from the header, which leaves room at 800 px.
+- **The time column shows the date too,** as `MM-DD HH:MM:SS.ddd` in the
+  browser's local time, so rows from different days can be told apart. The
+  column is wider; the default columns still fit at 800 px without scrolling
+  sideways. The CSV export keeps the full timestamp.
 - **The footer shows Matching and Shown instead of Total.** Matching is the
   rows shown plus the older matches the last load counted; Shown is the rows
   in the table. It can be high, never low. Blocked counts the blocked rows
@@ -244,6 +296,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A syntax error in the configuration no longer prints the line it is
+  on.** The error quoted the whole line, so a mistyped MQTT password or
+  login token (no quotes, or a missing closing quote) ended up in the
+  journal. It now gives the line, the column and the reason, and a value of
+  the wrong type is named by its kind only ("invalid type: integer, expected
+  a string").
 - **The time selector showed less history than it named.** "Last 24h" and
   "All time" only filtered the 500 records fetched when the page opened, so
   a database with 1,625 records showed 528, and the footer's Total read as if

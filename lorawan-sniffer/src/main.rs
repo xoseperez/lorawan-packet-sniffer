@@ -17,6 +17,8 @@ mod config;
 mod core;
 mod mqtt;
 mod proxy;
+#[cfg(test)]
+mod test_support;
 
 #[derive(Parser)]
 #[command(
@@ -49,7 +51,11 @@ async fn main() {
     });
 
     if let Some(Commands::Configfile {}) = &cli.command {
-        cmd::configfile::run(&config);
+        let random = crate::core::random::SystemRandomSource::new();
+        if let Err(e) = cmd::configfile::run(&config, &random) {
+            eprintln!("Cannot generate a login token: {e}");
+            process::exit(1);
+        }
         process::exit(0);
     }
 

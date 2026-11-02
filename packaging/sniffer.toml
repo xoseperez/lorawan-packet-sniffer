@@ -27,10 +27,12 @@
   log_to_syslog = false
 
   [sniffer.api]
-    # HTTP API / WebSocket bind address. The WebUI and the API have no
-    # authentication: anyone who can reach this port sees all captured
-    # traffic. On a machine reachable from untrusted networks, bind to
-    # "127.0.0.1:8888" and use an SSH tunnel or a reverse proxy.
+    # HTTP API / WebSocket bind address. Unless login is on (below), anyone
+    # who can reach this port sees all captured traffic and can edit device
+    # labels. On a machine reachable from untrusted networks, turn login on, or
+    # bind to "127.0.0.1:8888" and use an SSH tunnel or a reverse proxy. Over
+    # plain HTTP the token and the session cookie travel in clear; behind an
+    # HTTPS reverse proxy, bind to 127.0.0.1.
     bind = "0.0.0.0:8888"
 
     # Allowed CORS origins (optional).
@@ -44,6 +46,20 @@
     # name. Behind a reverse proxy that passes the Host header on, list the
     # public name. ["*"] turns the check off and is unsafe.
     # allowed_hosts = ["sniffer.example.com"]
+
+    # Ask for the token below before the WebUI and the API answer anything
+    # (the WebUI shows a login page; scripts send "Authorization: Bearer
+    # <token>"). When false, the token is ignored.
+    login = false
+
+    # The shared login token: a random token of at least 32 hexadecimal
+    # characters. The sniffer checks only its format, so always generate it,
+    # for example with `openssl rand -hex 16`. Changing it logs every browser
+    # out at the next restart. Every local user can read this file; to keep
+    # the token out of it, set SNIFFER_API_TOKEN in
+    # /etc/lorawan-sniffer/sniffer.env and write token = "$SNIFFER_API_TOKEN"
+    # here.
+    token = ""
 
   [sniffer.database]
     # Path to the SQLite database file. The service owns /var/lib/lorawan-sniffer.

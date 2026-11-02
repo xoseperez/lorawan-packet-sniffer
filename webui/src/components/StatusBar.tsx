@@ -23,6 +23,9 @@ interface Props {
   onToggleLive: () => void;
 }
 
+/** The version and the copyright line: at the right of the status bar, and under the login card. */
+export const VERSION_LINE = `v${__APP_VERSION__} | © Xose Pérez for RAKwireless 2026`;
+
 const WS_LABEL: Record<WsStatus, string> = {
   connecting:   'Connecting…',
   connected:    'Connected',
@@ -102,9 +105,7 @@ export function StatusBar({
         {WS_LABEL[wsStatus]}
       </span>
 
-      <span className="status-copyright">
-        v{__APP_VERSION__} | &copy; Xose Pérez for RAKwireless 2026
-      </span>
+      <span className="status-copyright">{VERSION_LINE}</span>
 
       <button
         className={`live-toggle ${isLive ? 'live' : 'paused'}`}

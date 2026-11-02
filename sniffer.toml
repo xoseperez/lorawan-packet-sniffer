@@ -13,7 +13,12 @@
 
   # HTTP API / WebSocket configuration.
   [sniffer.api]
-    # Bind address for the HTTP API and WebSocket feed.
+    # Bind address for the HTTP API and WebSocket feed. Unless login is on
+    # (below), anyone who can reach this port sees all captured traffic and can
+    # edit device labels. On a machine reachable from untrusted networks, turn
+    # login on, or bind to "127.0.0.1:8888" and use an SSH tunnel or a reverse
+    # proxy. Over plain HTTP the token and the session cookie travel in clear;
+    # behind an HTTPS reverse proxy, bind to 127.0.0.1.
     bind = "0.0.0.0:8888"
 
     # Allowed CORS origins.
@@ -29,6 +34,20 @@
     # public name. ["*"] turns the check off and is unsafe. In Docker, set
     # SNIFFER_API_ALLOWED_HOSTS to a comma-separated list.
     # allowed_hosts = ["sniffer.example.com"]
+
+    # Ask for the token below before the WebUI and the API answer anything
+    # (the WebUI shows a login page; scripts send "Authorization: Bearer
+    # <token>"). When false, the token is ignored. In Docker, set
+    # SNIFFER_API_LOGIN.
+    login = false
+
+    # The shared login token: a random token of at least 32 hexadecimal
+    # characters. The sniffer checks only its format, so always generate it,
+    # for example with `openssl rand -hex 16`. Changing it logs every browser
+    # out at the next restart. To keep the token out of this file, write
+    # token = "$SNIFFER_API_TOKEN" and set that variable in the environment (in
+    # Docker, set SNIFFER_API_TOKEN).
+    token = ""
 
   # SQLite database configuration.
   [sniffer.database]

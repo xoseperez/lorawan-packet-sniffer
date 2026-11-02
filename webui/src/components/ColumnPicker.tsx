@@ -1,3 +1,5 @@
+import { useRef } from 'react';
+
 export interface ColumnConfig {
   time: boolean;
   dir: boolean;
@@ -70,12 +72,34 @@ const LABELS: Record<keyof ColumnConfig, string> = {
 interface Props {
   columns: ColumnConfig;
   onChange: (c: ColumnConfig) => void;
+  /** Downloads the rows shown as CSV. */
+  onExport: () => void;
+  /** How many rows the export would hold; with none the item is disabled. */
+  exportCount: number;
+  /**
+   * Ends the session. Given only when login is on: the menu then closes with
+   * a "Log out" item.
+   */
+  onLogout?: () => void;
 }
 
-export function ColumnPicker({ columns, onChange }: Props) {
+/**
+ * The ⚙ Settings menu: which columns the table shows, then the actions, the
+ * CSV export and, when login is on, "Log out". The header has no width to
+ * spare at 800 px, so everything that is not a filter lives here.
+ */
+export function ColumnPicker({ columns, onChange, onExport, exportCount, onLogout }: Props) {
+  const menu = useRef<HTMLDetailsElement>(null);
+
+  // An action is done once chosen, so the menu gets out of the way.
+  const act = (action: () => void) => () => {
+    if (menu.current) menu.current.open = false;
+    action();
+  };
+
   return (
-    <details className="column-picker">
-      <summary>⚙ Cols</summary>
+    <details className="column-picker" ref={menu}>
+      <summary>⚙ Settings</summary>
       <div className="column-picker-list">
         {(Object.keys(columns) as Array<keyof ColumnConfig>).map(key => (
           <label key={key}>
@@ -87,6 +111,27 @@ export function ColumnPicker({ columns, onChange }: Props) {
             {LABELS[key]}
           </label>
         ))}
+        <div className="column-picker-sep" role="separator" />
+        <button
+          type="button"
+          className="column-picker-action"
+          data-action="export-csv"
+          onClick={act(onExport)}
+          disabled={exportCount === 0}
+          title={`Export ${exportCount} rows as CSV`}
+        >
+          Export CSV
+        </button>
+        {onLogout !== undefined && (
+          <button
+            type="button"
+            className="column-picker-action"
+            data-action="logout"
+            onClick={act(onLogout)}
+          >
+            Log out
+          </button>
+        )}
       </div>
     </details>
   );

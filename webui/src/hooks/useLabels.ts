@@ -1,6 +1,7 @@
 import { useCallback, useState } from 'react';
 import { LabelsFrame } from '../types/messages';
 import { useWebSocket } from './useWebSocket';
+import { reportUnauthorized } from '../session';
 
 // How long a save or delete may wait for the server before the dialog gives
 // up and shows an error. Without a limit, a connection that stalls would leave
@@ -67,6 +68,12 @@ async function sendLabelRequest(device: string, init: RequestInit): Promise<void
     clearTimeout(timer);
   }
 
+  if (res.status === 401) {
+    // The session ended while the dialog was open: the page goes back to the
+    // login, and the dialog says why it did not save.
+    reportUnauthorized();
+    throw new Error('Your session has ended. Log in again.');
+  }
   if (!res.ok) throw new Error(await describeFailure(res));
 }
 

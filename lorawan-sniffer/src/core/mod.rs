@@ -6,6 +6,7 @@ pub mod history;
 pub mod labels;
 pub mod linelog;
 pub mod metadata;
+pub mod random;
 pub mod ratelimit;
 pub mod seen;
 pub mod storage;

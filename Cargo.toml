@@ -43,6 +43,12 @@
   http-body = "1"
   rust-embed = "8"
   mime_guess = "2.0"
+  # Media-type parsing for the login endpoints' Content-Type check; already in
+  # the tree through axum.
+  mime = "0.3"
+  # HMAC and the system random source for the WebUI login; already compiled
+  # into every build through rustls, so it adds no crate.
+  ring = "0.17"
   # MQTT client without its default TLS provider: the default pulls in aws-lc-rs,
   # which needs CMake/NASM to cross-compile to musl. TLS uses rustls with ring instead.
   rumqttc = { version = "0.25", default-features = false, features = [

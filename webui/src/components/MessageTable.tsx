@@ -28,13 +28,16 @@ interface TableContext {
   onEditLabel: (device: string) => void;
 }
 
+/** Local date and time as `MM-DD HH:MM:SS.ddd`: the date shows which day a row belongs to once the range spans more than one. */
 function formatTime(ts: string): string {
   const d = new Date(ts);
+  const mo = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
   const ms = String(d.getMilliseconds()).padStart(3, '0');
-  return `${hh}:${mm}:${ss}.${ms}`;
+  return `${mo}-${dd} ${hh}:${mm}:${ss}.${ms}`;
 }
 
 const MTYPE_ABBREV: Record<MType, string> = {

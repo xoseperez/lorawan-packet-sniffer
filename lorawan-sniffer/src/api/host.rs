@@ -2,15 +2,21 @@
 //! address, by `localhost`, or by a name the operator listed in
 //! `[sniffer.api] allowed_hosts`.
 //!
-//! The API has no authentication, so the browser's same-origin rule is the
-//! only thing keeping other web sites away from the captured traffic.  DNS
-//! rebinding defeats that rule: a page on `evil.example` makes the name resolve
-//! to the sniffer's address, and from then on the browser treats the sniffer as
-//! the page's own origin, so `Origin` and `Host` agree and CORS never applies.
-//! What the attacker cannot change is the name: the request still says
+//! Unless the login is on (see [`super::auth`]), the API has no
+//! authentication, so the browser's same-origin rule is the only thing keeping
+//! other web sites away from the captured traffic.  DNS rebinding defeats that
+//! rule: a page on `evil.example` makes the name resolve to the sniffer's
+//! address, and from then on the browser treats the sniffer as the page's own
+//! origin, so `Origin` and `Host` agree and CORS never applies.  What the
+//! attacker cannot change is the name: the request still says
 //! `Host: evil.example`.  An address typed as an IP literal cannot be rebound
 //! (a page at `http://10.0.0.5:8888` really is that address), which is why IP
 //! addresses are always allowed and only names need listing.
+//!
+//! With the login on, a request that gets past this check still needs a
+//! session or the token, but the login does not replace the check: it stays
+//! the first thing every request meets, so a request for a foreign host is
+//! refused before login is considered.
 //!
 //! [`check_host`] is a middleware meant to wrap the whole router, so that the
 //! WebUI, the REST API and the WebSockets are all covered.
