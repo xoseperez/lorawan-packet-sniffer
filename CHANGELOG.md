@@ -7,491 +7,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-> **Upgrade note:** a WebUI or API reached by host name, rather than by IP
-> address or `localhost`, now needs that name in `allowed_hosts`. See
-> "Changed" below.
->
-> **Upgrade note:** the first start after the upgrade checks every stored row
-> for malformed frames before it starts forwarding. On a large database this
-> takes a while and needs free disk space for SQLite's write-ahead log; the
-> README gives the time and the space measured on 1,000,000 rows.
-
 ### Added
 
-- **Optional WebUI login.** `login = true` in `[sniffer.api]` (`SNIFFER_API_LOGIN`
-  in Docker) puts a login page in front of the WebUI and a `401` in front of
-  `/ws`, `/ws/labels` and everything under `/api/`. It is off by default, and
-  with it off nothing changes: no cookie, no login page, every existing route
-  answers as before. One shared token grants everything the WebUI can do; there are no
-  user names or roles.
-  - **The token** is `token` in `[sniffer.api]` (`SNIFFER_API_TOKEN` in Docker),
-    at least 32 hexadecimal characters with 8 different ones, which is what
-    `openssl rand -hex 16` and the new token line of `lorawan-sniffer configfile`
-    produce. With the login on, a missing or malformed token stops the sniffer at
-    startup. This is a format check that cannot tell a generated token from a
-    typed one, so always generate it.
-  - **A fresh `install.sh` install** writes a generated token into the new
-    `sniffer.toml` (login stays off), and an upgrade puts one in
-    `sniffer.toml.new`, leaving your `sniffer.toml` alone. The installer
-    stages the file readable by root only and cleans up after a failure or an
-    interrupt. The sniffer never writes its configuration.
-  - **The WebUI** shows a login page (one field, light and dark, sized for the
-    800 px touchscreen), keeps the session until the browser closes, has
-    **Log out** in the ⚙ Settings menu, and returns to the login page, without
-    retrying for ever, when the session ends.
-  - **Sessions** are signed cookies (`HttpOnly`, `SameSite=Strict`). The key
-    comes from the token and a random secret kept in the database (a new
-    `session_secret` table, schema version 4), so sessions survive a restart,
-    a new token or a new database logs every browser out, and a cookie cannot
-    be forged from the token alone.
-  - **Scripts** send `Authorization: Bearer <token>`. Origins listed in
-    `cors_origins` may send it too.
-  - **A lockout** accepts at most 10 wrong tokens per fixed one-minute window,
-    across all clients; after that every token, the right one included, gets
-    `429` with `Retry-After` until the window ends. Browsers already logged in
-    keep working.
-  - **Login and logout** accept only a JSON request addressed to the
-    sniffer's own host, so another web site cannot log a browser in or out. A
-    reverse proxy must pass the browser's `Host` header exactly, port included
-    (nginx: `proxy_set_header Host $http_host;`); the second nginx set-up in
-    the README, which sends an IP address as `Host`, does not work with the
-    login.
-  - Over plain HTTP the token and the cookie travel in clear; behind an HTTPS
-    proxy, bind the sniffer to `127.0.0.1`.
-  - **Rolling back** to a version without the login is a security downgrade:
-    it opens the same database but ignores the setting and serves everyone, so
-    restrict access to the port first.
-  - New endpoints `GET /api/session`, `POST /api/login` and `POST /api/logout`.
-    The README has a "WebUI login" section.
-- **Time-range history from the database.** The WebUI's time selector (5
-  min, 15 min, 1 h, 24 h, all time) now loads the newest 5,000 records of the
-  range from the database, instead of filtering the 500 records fetched when
-  the page opened. Live records are merged in without duplicates, and rows
-  leave the table as they age out of the range, even when nothing arrives.
-  - When more records match than were loaded, a strip under the table says
-    so: "Showing the newest 5,000 of 12,345 matching messages in the last
-    24 h". There is no "Load older"; a narrower range or a filter shows the
-    rest.
-  - The same strip says when a load failed (the rows are kept), how many
-    records the database could not store since the sniffer started, and when
-    the database is behind.
-- **Filters that search the database.** The device or label, type, status,
-  gateway and "Show malformed" filters are applied by the server, so a quiet
-  device is found even when its records lie beyond the newest 5,000 of the
-  range. The device filter matches labels with Unicode case folding (`ÑANDÚ`
-  finds `ñandú`). Typing loads after a pause of about 0.4 s, and a label
-  change reloads the table while the device box is not empty. The sniffer and
-  the browser apply the same rules, checked by one set of test vectors.
-- **`/api/messages` parameters and headers.** `from` (at or after a time),
-  `newest` (keep the newest `limit` records of the range), `count`, `settle`,
-  `device`, `mtype`, `status`, `gateway` and `malformed`. The answer can carry
-  `X-Total-Count`, `X-Malformed-Count`, `X-History-Settled` and
-  `X-Storage-Write-Failures`, and a `503` says why in a `code` (`no_wal`,
-  `busy`). `limit` and `since` return what they always did. The README
-  documents all of it, with curl examples.
-- **A full reload after every reconnect, with no hole.** Whenever `/ws`
-  opens, the WebUI loads the selected range again and merges the live
-  records it received since. The load waits up to 5 s (`settle=true`) until
-  the storage writer has processed everything queued before it, so a record
-  that was broadcast but not yet saved is not missed. This holds whatever the
-  timing: the sniffer queues a record for storage before it broadcasts it,
-  and a `/ws` client is subscribed before the handshake is answered. If the
-  writer is still behind after 5 s, the WebUI retries after about 5 s, 10,
-  20, 40 and every 60 s until an answer is complete. The README explains the
-  guarantee and its exceptions.
-- **WebUI tests.** `cd webui && npm test` runs the history logic (request
-  rules, merging, counts, back-off) with Node, and checks the filter vectors
-  that a Rust test also sends through the real API. `make test` and the
-  release workflow run it.
-
-- **Malformed-frame detection.** A frame that cannot be valid LoRaWAN 1.0 or
-  1.1 is marked with the first reason that applies, in this order: `crc` (the
-  gateway reported a failed CRC), `mhdr` (the RFU or Major bits of the first
-  byte are not zero) or `length` (a JoinRequest that is not 23 bytes, a
-  JoinAccept that is not 17 or 33, a RejoinRequest that is not 19 or 24, a
-  data frame shorter than 12 bytes plus its FOptsLen). Proprietary frames
-  have no length rule. It works in both gateway protocols and both directions;
-  a source that reports no CRC is not marked for it. Forwarding is unchanged.
-  - Every record has a new `malformed` field in the database, `/api/messages`,
-    `/ws` and MQTT: `null` for a valid frame, otherwise `"crc"`, `"mhdr"` or
-    `"length"`.
-  - The WebUI hides malformed rows by default. A **Show malformed** checkbox
-    at the end of the Type menu, remembered by the browser, shows them dimmed
-    and marked, with the reason in the Device cell ("malformed: CRC failed",
-    "malformed: bad header", "malformed: wrong length") and in full on hover.
-    The status bar counts the malformed rows hidden or shown.
-  - The CSV export has a `malformed` column before `label`.
-  - The README has a "Malformed frames" section, including the gateway
-    settings that make gateways forward CRC-failed packets
-    (`forward_crc_error` in the Semtech packet forwarder, `disable_crc_filter`
-    in Concentratord).
-- **`tools/gwsim.py --malformed-ratio R`:** that fraction of the PUSH_DATA
-  datagrams also carries one malformed frame, taken in turn from a list of ten
-  that covers every reason. The fake identifiers those frames would carry if
-  trusted are printed at start, and the summaries count the frames by reason.
-- **Device labels.** Give a device a name from the WebUI, such as "Qingping
-  T&H Havana" for `00E8A80B`. A label belongs to the identifier the Device
-  column shows: the DevAddr on data frames, the DevEUI on join requests.
-  - A **Label** column (hidden by default) shows it on every row with that
-    identifier, past and live. Clicking a cell opens a dialog to set, change
-    or remove the label (Enter saves, Escape cancels, an empty label removes).
-  - Changes appear at once in every open WebUI, without a reload.
-  - The device filter also matches labels.
-  - The CSV export has a `label` column, always quoted; a label starting with
-    `=`, `+`, `-` or `@` gets a leading apostrophe so a spreadsheet does not
-    read it as a formula.
-  - Labels are stored in the database (a new `device_labels` table, added to
-    existing databases in place), at most 64 characters each and 10,000 in
-    all. They live as long as their identifier has a stored record or was
-    seen live within the retention period, and nothing is removed during the
-    first retention period after a start, so a restart never removes a label.
-  - The sniffer keeps a best-effort, in-memory list of identifiers seen live
-    (at most 100,000), so rows that were never written to the database can be
-    labelled too.
-  - Labels follow identifiers, not devices: a device that rejoins gets a new
-    DevAddr, and its DevEUI label and DevAddr label are separate. Labels are
-    not added to MQTT payloads, and unless the WebUI login is on there is no
-    authentication on label editing.
-- **Label API and `/ws/labels`.** `GET /api/labels` returns every label,
-  `PUT /api/labels/{device}` (JSON body `{"label": "..."}`) sets or replaces
-  one and `DELETE /api/labels/{device}` removes it. The new WebSocket
-  `/ws/labels` sends the full set on connect, then one event per change in the
-  order the changes were saved, and a fresh full set to a client that falls
-  behind. `/api/messages` and `/ws` are unchanged. Writes follow the same
-  Origin rule as WebSocket handshakes, and origins listed in `cors_origins`
-  may now also use `PUT` and `DELETE`.
-- **`allowed_hosts`** in `[sniffer.api]` (`SNIFFER_API_ALLOWED_HOSTS` in
-  Docker): the host names the WebUI and API may be reached by. IP addresses and
-  `localhost` always work. `["*"]` turns the check off, and with it the
-  protection against DNS rebinding, so it is unsafe. The README describes both
-  ways to set this up behind a reverse proxy, with nginx examples.
-- **Release archives** for x86_64 and aarch64 Linux (`make dist`), with a
-  `SHA256SUMS` file. Each holds the static binary, a systemd service, an
-  install script and the configuration templates, and is reproducible.
-- **systemd service** for bare-metal installs (`packaging/`). The sniffer runs
-  as an unprivileged, sandboxed user and keeps its database in
-  `/var/lib/lorawan-sniffer`. Secrets such as the MQTT password go in a
-  root-only environment file and are referenced from the configuration as
-  `$NAME`. An override (`concentratord.conf`) enables Concentratord mode.
-- **`install.sh`** installs or upgrades the service without overwriting an
-  existing configuration, never restarts it on its own, and removes it with
-  `--uninstall` (keeping configuration and database).
-- **Configuration for running next to the LNS** on the same machine: the
-  sniffer takes UDP port 1702 and forwards to the LNS on `127.0.0.1:1700`.
-- **Release Docker image** (`docker/Dockerfile.release`, `make
-  docker-build-release`), built from the same binaries as the archives, so
-  the multi-arch image needs no emulation to build.
-- **Automated releases.** Pushing a `vX.Y.Z` tag on `master` builds the x86_64
-  and aarch64 Linux archives, publishes them with a `SHA256SUMS` file as a
-  GitHub Release (notes taken from this changelog), and pushes a multi-arch
-  (amd64 + arm64) image to `ghcr.io/xoseperez/lorawan-packet-sniffer`.
-  Versions with a suffix such as `-rc.1` are published as pre-releases and do
-  not move the `latest` image tag. The workflow can also be run by hand as a
-  dry run that publishes nothing.
-- **Warning for unset environment variables:** a configuration value that is
-  exactly `$NAME` with no such variable set is logged at startup by key (never
-  by value), instead of the text being used silently, for example as an MQTT
-  password.
-- **`tools/gwsim.py --joins N` and `--random-devaddr`:** simulated gateways
-  that also send JoinRequests (a fixed DevEUI per gateway, printed at start)
-  and data uplinks from a new random DevAddr each time. The fake LNS now
-  counts the frames it receives by message type.
+- WebUI login: optional shared token (`[sniffer.api] login`, `token`), login page, signed session cookies, Bearer tokens for scripts, lockout after 10 wrong tokens a minute.
+- Time-range history: the time selector loads the newest 5,000 matching records of the range from the database, with a notice when more match.
+- Server-side filters: device or label, type, status, gateway and malformed are applied by the database.
+- `/api/messages` parameters `from`, `newest`, `count`, `settle`, `device`, `mtype`, `status`, `gateway` and `malformed`, and headers `X-Total-Count`, `X-Malformed-Count`, `X-History-Settled` and `X-Storage-Write-Failures`.
+- Full reload of the WebUI after every WebSocket reconnect, with no missing records.
+- WebUI unit tests (`cd webui && npm test`).
+- Malformed-frame detection (`crc`, `mhdr`, `length`), with a `malformed` field on every record and a "Show malformed" option in the WebUI.
+- Device labels: Label column and dialog, label API (`/api/labels`) and live label feed (`/ws/labels`).
+- `allowed_hosts` setting against DNS rebinding.
+- Release archives for x86_64 and aarch64 Linux (`make dist`), with `SHA256SUMS`.
+- systemd service and `install.sh` (install, upgrade, `--uninstall`).
+- Release Docker image built from the release binaries.
+- Automated releases on `vX.Y.Z` tags: GitHub Release and multi-arch image on GHCR.
+- Startup warning for configuration values that reference an unset environment variable.
+- `tools/gwsim.py` options `--malformed-ratio`, `--joins` and `--random-devaddr`.
+- Configuration example for running next to the LNS on the same machine.
 
 ### Changed
 
-- **The ⚙ Cols menu is now ⚙ Settings,** and holds the column choices, then
-  **Export CSV** and, when login is on, **Log out**. The separate ↓ CSV button
-  is gone from the header, which leaves room at 800 px.
-- **The time column shows the date too,** as `MM-DD HH:MM:SS.ddd` in the
-  browser's local time, so rows from different days can be told apart. The
-  column is wider; the default columns still fit at 800 px without scrolling
-  sideways. The CSV export keeps the full timestamp.
-- **The footer shows Matching and Shown instead of Total.** Matching is the
-  rows shown plus the older matches the last load counted; Shown is the rows
-  in the table. It can be high, never low. Blocked counts the blocked rows
-  among those shown, and Malformed hidden / shown counts the malformed
-  records in the database that match the other filters, as of the last load.
-- **The gateway list keeps every gateway seen in the session,** in loads and
-  in live records, so a filter on a gateway does not empty it.
-- **History reads use a separate read-only database connection,** so a long
-  search never holds up the writer that saves records. This needs the
-  database in WAL mode, the default. Without it the sniffer warns at startup,
-  only the time range works, and the WebUI loads the range with malformed
-  records included and hides them itself, so it may show fewer than 5,000
-  rows.
-- **The write-ahead log file no longer keeps the largest size it reached:**
-  SQLite shortens it to 8 MiB when it restarts the log. After sustained
-  history queries the file could otherwise stay at hundreds of megabytes.
-- **A `/ws` client that falls behind, or stops reading for 10 s, is now
-  disconnected** (close code 1013, "try again later") instead of silently
-  missing records. The record frames are unchanged. A client that reconnects
-  should reload from `/api/messages` with `settle=true` and back off between
-  attempts.
-- **The WebUI reconnects with growing, randomised pauses,** from about 3 s up
-  to 60 s, instead of a fixed 3 s, and starts again at 3 s after a connection
-  that lasted a minute.
-- **Storage insert failures are logged and counted,** including inserts that
-  panicked and those at shutdown, which used to be discarded. Every
-  `/api/messages` response carries the count since the sniffer started, and
-  the WebUI shows it.
-
-- **A malformed record has `null` in the twelve fields decoded from the frame
-  body:** `dev_addr`, `dev_eui`, `join_eui`, `dev_nonce`, `fcnt`, `fport`,
-  `adr`, `adr_ack_req`, `ack`, `class_b`, `f_pending` and `f_opts_len`. They
-  used to hold values read from noise, such as made-up DevAddrs. The type, the
-  size, the radio data, the status and the gateway are kept. A malformed frame
-  therefore no longer produces a made-up identifier for the device filter, the
-  list of identifiers seen live, device labels or an MQTT topic.
-- **A blocking rule with an `mtype` list no longer matches a malformed
-  frame.** The type of such a frame is only its first byte read as a header,
-  so a rule blocking JoinRequests blocked about one noise frame in eight, and
-  in Semtech UDP held back the valid frames in the same PUSH_DATA. Rules with
-  no `mtype` list (direction and gateway only) still match malformed frames,
-  and the whole-datagram policy is unchanged.
-- **Database schema 3, and the stored rows are checked on the first start.**
-  The upgrade adds a `malformed` column and a per-row flag, and keeps every
-  row. Before forwarding starts, the sniffer marks the stored rows with a
-  failed CRC (`crc`) or a length that does not fit their type (`length`) and
-  clears their body-derived fields; `mhdr` cannot be applied, because the
-  first byte is not stored. It logs how many rows it will check first. If the
-  check fails, the sniffer starts anyway and tries again at the next start.
-  Rows an older version records after a rollback are checked at the next
-  start of this version. Older versions keep working on the upgraded
-  database.
-- **`tools/gwsim.py`:** the fake LNS counter of datagrams that are not
-  Semtech UDP packets is now called "invalid datagrams" (it was "malformed",
-  which now means a frame). The fake LNS counts malformed frames by reason,
-  leaves them out of its type and identifier tallies, and never sends a
-  downlink to their DevAddr.
-- **New home: `github.com/xoseperez/lorawan-packet-sniffer`.** The Rust
-  version now lives in the original project's repository, on `master`; the
-  original version 1 is on the `v1` branch, with its full history and tags.
-  The Docker image is `ghcr.io/xoseperez/lorawan-packet-sniffer`.
-- **Breaking: a WebUI or API reached by host name, rather than by IP address
-  or `localhost`, needs that name in `allowed_hosts`.** The sniffer now checks
-  the `Host` header of every request (WebUI, REST and both WebSockets) to stop
-  DNS rebinding, where a web page points its own domain name at the sniffer so
-  that its requests look same-origin. A request for any other host name gets
-  `403` with a plain-text message that names the setting. Access by IP address
-  or `localhost` is not affected. Add the name under `[sniffer.api]`, or set
-  `SNIFFER_API_ALLOWED_HOSTS` in Docker. Behind a reverse proxy, either pass
-  the original `Host` through and list the public name, or let the proxy send
-  an IP address as `Host` and list the public origin in `cors_origins`.
-- **Same-origin API by default.** With `cors_origins` empty the API sends no
-  CORS headers (it used to allow every origin), and the WebSocket feed refuses
-  handshakes from other sites. Before, any web page open in a browser that
-  could reach the sniffer could read the captured traffic. Origins listed in
-  `cors_origins` are allowed for both.
-- **One log line per packet only at DEBUG.** Captured messages and
-  Concentratord commands are no longer logged at INFO, which filled the
-  journal on busy servers; startup, gateway sessions and warnings still are.
-- Docker images are based on Alpine 3.23 (3.20 is no longer supported).
-- **WebUI filter bar without the direction filter**, so the filters fit an
-  800-pixel-wide screen. The Dir column still shows each message's direction.
-  A direction filter saved in the browser by an earlier version no longer
-  applies.
-- **The WebUI footer shows the version**, as
-  "v2.1.0 | © Xose Pérez for RAKwireless 2026". The version comes from
-  `webui/package.json`, and a test fails if it differs from the crate's.
+- **Breaking:** a WebUI or API reached by host name needs that name in `allowed_hosts`.
+- **Breaking:** the API is same-origin by default; other sites must be listed in `cors_origins`.
+- Database schema 4; the first start after upgrading checks every stored row for malformed frames before forwarding (time and disk space in the README).
+- ⚙ Settings menu replaces ⚙ Cols and holds the column choices, CSV export and Log out.
+- Time column shows the date (`MM-DD HH:MM:SS.ddd`).
+- Footer shows Matching, Shown, Blocked and Malformed instead of Total, and the version.
+- Malformed records carry no fields decoded from the frame body.
+- Blocking rules with an `mtype` list no longer match malformed frames.
+- History reads use a separate read-only database connection (WAL mode).
+- SQLite write-ahead log capped at 8 MiB.
+- WebSocket clients that fall behind are disconnected with code 1013.
+- WebUI reconnects with growing, randomised pauses (3–60 s).
+- Storage insert failures are logged and counted.
+- Per-packet log lines only at DEBUG.
+- Direction filter removed from the WebUI.
+- Gateway filter keeps every gateway seen in the session.
+- `tools/gwsim.py` "malformed" datagram counter renamed to "invalid datagrams".
+- Docker images based on Alpine 3.23.
+- Project moved to `github.com/xoseperez/lorawan-packet-sniffer`.
 
 ### Fixed
 
-- **A syntax error in the configuration no longer prints the line it is
-  on.** The error quoted the whole line, so a mistyped MQTT password or
-  login token (no quotes, or a missing closing quote) ended up in the
-  journal. It now gives the line, the column and the reason, and a value of
-  the wrong type is named by its kind only ("invalid type: integer, expected
-  a string").
-- **The time selector showed less history than it named.** "Last 24h" and
-  "All time" only filtered the 500 records fetched when the page opened, so
-  a database with 1,625 records showed 528, and the footer's Total read as if
-  it were nearly empty. They now load from the database. Records stored while
-  the live connection was down were also never fetched; the reload after a
-  reconnect fetches them.
-
-- **Noise got identifiers and header fields.** A JoinRequest was decoded
-  from 19 bytes up, although it is 23 bytes long, and a data frame from 8
-  bytes up, although the shortest is 12 bytes plus its FOptsLen, so short noise
-  got a DevEUI, JoinEUI or DevAddr. A JoinRequest is now decoded only at 23
-  bytes and a data frame only at 12 bytes plus FOptsLen; anything else is
-  marked malformed.
-- **The WebUI opened on its oldest rows.** With the table sorted newest
-  first (the default), loading the history scrolled it to the end, so the
-  page showed the oldest loaded messages until scrolled back up. It now opens
-  at the newest. Sorting oldest first also orders timestamps by time rather
-  than as text, which misplaced some of them.
-- An upstream given by name, such as `localhost`, could resolve to `::1`
-  first, and the sniffer forwarded there even when the LNS or multiplexer
-  only listened on IPv4, so nothing arrived. IPv4 addresses are now
-  preferred; IPv6 is used when the name has no IPv4 address.
-- SIGTERM, as sent by `systemctl stop` and `docker stop`, now stops the
-  sniffer cleanly like Ctrl-C. Before, it killed the process outright, and
-  under Docker, where the sniffer is PID 1, it was ignored until Docker's stop
-  timeout killed it.
-- Records still waiting to be written to the database are saved before the
-  sniffer exits; before, the last ones could be lost on shutdown.
-- `make docker-buildx` built its arm64 image around an x86_64 binary, so that
-  image could not run; it now uses the cross-compiled binaries.
+- Configuration syntax errors no longer print the offending line, which could hold a password or token.
+- Time ranges show the whole range, not a filter over the first 500 records.
+- Short noise frames no longer get identifiers.
+- WebUI opens at the newest rows.
+- Upstreams given by name prefer IPv4.
+- SIGTERM stops the sniffer cleanly.
+- Records waiting to be written are saved at shutdown.
+- `make docker-buildx` builds a working arm64 image.
 
 ## [2.1.0] - 2026-10-31
 
 ### Added
 
-- **Multiple gateways in the UDP proxy.** The sniffer keeps one session per
-  gateway EUI, each with its own upstream socket towards the LNS, so the LNS
-  sees every gateway as a separate peer. A session follows the gateway's EUI
-  when its address or port changes, is released after an idle timeout
-  (`session_timeout`, default `5m`) and is capped (`max_gateways`, default
-  `100`); packets from new gateways beyond the cap are dropped with a
-  rate-limited warning without affecting existing ones.
-- **UDP listen mode** (`[gateway.udp] mode = "listen"`) for running without an
-  LNS: any number of gateways are recorded and nothing is forwarded. Optional
-  PUSH_ACK / PULL_ACK replies (`listen_acks`, on by default); downlinks are
-  never sent. A warning is logged at startup if blocking rules are configured,
-  since they have no effect.
-- **Gateway EUI on every record**, in both UDP and Concentratord modes
-  (Concentratord's gateway ID is learned from its uplinks and from a
-  `GetGatewayId` reply).
-- **JoinEUI and DevNonce** on join requests, and the **FCtrl flags** (ADR,
-  ADRACKReq, ACK, ClassB on uplinks; ADR, ACK, FPending on downlinks) and
-  **FOptsLen** on data frames, in the database, REST API, WebSocket feed, CSV
-  export and MQTT. Flags that do not apply to a frame are `null`, not `false`.
-- **Gateway-specific blocking rules:** `[[filters]]` accept an optional
-  `gateways` list of EUIs (with or without colons, any case). An invalid EUI is
-  a startup error.
-- **MQTT publishing** (`[sniffer.mqtt]`, disabled by default) over TCP or TLS,
-  with a topic template (`{gateway_eui}`, `{direction}`, `{mtype}`, `{status}`,
-  `{dev_addr}`, `{dev_eui}`), QoS 0–2, optional credentials and a CA file for
-  private brokers (public CA roots are bundled in the binary); a client
-  certificate and key enable mutual TLS. Publishing is best effort and never
-  slows forwarding: when the broker is down or slow, messages are dropped and
-  counted instead of queued without limit, and the client reconnects by itself.
-  Credentials and keys are never logged.
-- **Self-forwarding guard.** In proxy mode the sniffer refuses to start if its
-  upstream is its own gateway-facing port, reached through any of the machine's
-  addresses, and drops looped packets at runtime (NAT, Docker port forwarding)
-  without recording or forwarding them again.
-- **Database schema migrations** through `PRAGMA user_version`. Databases
-  created by v2.0.0 are upgraded in place on startup and keep their rows, with
-  the new fields empty.
-- **`Captured` message status** for messages seen in listen mode, shown as a
-  neutral grey dot in the WebUI and available in the status filter.
-- **WebUI:** a gateway column (the last 8 hex digits of the EUI, full EUI in the
-  tooltip) and a gateway filter, optional JoinEUI, DevNonce, flags and FOptsLen
-  columns in the column picker, and the new fields in the CSV export.
-- **Simulator tools:** `tools/gwsim.py` (simulated gateways and a fake LNS for
-  functional and load testing) and `tools/procstat.sh` (peak memory and open
-  descriptors of a running process).
-- **`docs/MOBILE.md`** — touchscreen optimization report with recommendations
-  for the 800×600 tablet target device (tap target sizes, collapsible filter
-  row, `<details>` reliability, font sizing).
+- Multiple gateways in the UDP proxy (`session_timeout`, `max_gateways`).
+- UDP listen mode (`mode = "listen"`).
+- Gateway EUI on every record.
+- JoinEUI, DevNonce, FCtrl flags and FOptsLen fields.
+- Gateway-specific blocking rules (`gateways` in `[[filters]]`).
+- MQTT publishing (`[sniffer.mqtt]`), with TLS and mutual TLS.
+- Self-forwarding guard.
+- Database schema migrations (`PRAGMA user_version`).
+- `Captured` message status for listen mode.
+- WebUI gateway column and filter, and optional JoinEUI, DevNonce, flags and FOptsLen columns.
+- `tools/gwsim.py` and `tools/procstat.sh`.
+- `docs/MOBILE.md` touchscreen report.
 
 ### Changed
 
-- **The Docker image starts in listen mode when no upstream LNS is set**
-  (`GATEWAY_UDP_UPSTREAM_SERVER` unset or empty), and in proxy mode when it is.
-  New environment variables: `GATEWAY_UDP_MODE`, `GATEWAY_UDP_LISTEN_ACKS`,
-  `GATEWAY_UDP_SESSION_TIMEOUT`, `GATEWAY_UDP_MAX_GATEWAYS` and
-  `SNIFFER_MQTT_ENABLED`, `_SERVER`, `_PORT`, `_TLS`, `_CA_FILE`,
-  `_CLIENT_CERT_FILE`, `_CLIENT_KEY_FILE`, `_CLIENT_ID`, `_USERNAME`,
-  `_PASSWORD`, `_TOPIC`, `_QOS`.
-- **Environment values are inserted into the configuration literally.** A value
-  with quotes, backslashes or `$` (a password, for example) no longer breaks
-  parsing or gets expanded a second time, and a variable whose name is a prefix
-  of another no longer corrupts the longer one.
-- **ACKs are routed per gateway session** (PUSH_ACK to the source of the
-  gateway's last PUSH_DATA; PULL_ACK and PULL_RESP to the source of its last
-  PULL_DATA) instead of through a token map shared by all gateways. Packets are
-  still forwarded byte for byte.
-- Synthetic TX_ACKs for blocked downlinks carry the EUI of the gateway the
-  downlink was addressed to, instead of the last gateway seen.
-- **WebUI — visual design overhaul** (pure CSS, no new dependencies):
-  - Direction column color-coded: uplink ▲ blue, downlink ▼ amber.
-  - MType column renders a colored pill badge per category:
-    join/rejoin = purple, data-up = blue, data-down = amber, other = gray.
-  - Status column replaced "F"/"B" letters with an 8 px colored dot
-    (green = forwarded, red = blocked) with a `title` tooltip.
-  - Blocked rows use a stronger red tint and a 3 px inset left-border accent.
-  - Zebra striping on even rows for readability in dense data sets.
-  - Header title split into accent-blue "LoRaWAN" + muted "Sniffer" with a
-    vertical rule separating it from the filter controls.
-  - Table column headers styled as uppercase/spaced labels in muted color to
-    create a clear visual tier below the data.
-  - Live/Pause toggle shows a pulsing dot when the feed is live.
-  - WebSocket indicator replaced text icon with a colored dot + text label.
-  - Footer copyright notice "© RAKwireless 2026" added to the left of the
-    Live/Pause toggle.
-- **SNR signal-quality coloring is now spreading-factor-aware.** Color is
-  determined by the margin above the SF's minimum decodable SNR (SF7 = −7.5 dB
-  … SF12 = −20 dB): ≥ floor+10 dB → green, ≥ floor+3 dB → amber, below →
-  red. Falls back to SF7 floor if the datarate string cannot be parsed.
-- Merged `libsniffer` library crate into `lorawan-sniffer` as an internal
-  `core/` module (`src/core/{decoder,filter,metadata,storage,toa,error}.rs`).
-  The two-crate workspace added complexity without benefit for a single-binary
-  project with no external consumers; the `core/` module preserves the same
-  architectural boundary enforced by convention rather than by the compiler.
+- Docker image starts in listen mode when no upstream is set; new environment variables for the UDP and MQTT settings.
+- Environment values are inserted into the configuration literally.
+- ACKs are routed per gateway session.
+- Synthetic TX_ACKs carry the EUI of the downlink's gateway.
+- WebUI visual redesign: direction colours, type badges, status dots, zebra rows.
+- SNR colouring depends on the spreading factor.
+- `libsniffer` merged into `lorawan-sniffer` as `core/`.
 
 ### Fixed
 
-- The default configuration forwarded packets to the sniffer itself, turning a
-  single packet into tens of thousands of records. This is now refused at
-  startup and cut at runtime.
-- FPort was read from the MIC on data frames that have no FPort.
-- The ACK token map was never pruned and could grow to 65,536 entries; it is
-  gone, replaced by per-gateway session state that is released when idle.
-- A single error on the LNS-facing UDP socket (for example connection refused
-  while the LNS was down) stopped the whole proxy; errors are now logged with
-  rate limiting and the proxy keeps running.
+- Default configuration no longer forwards packets to the sniffer itself.
+- FPort no longer read from the MIC.
+- ACK token map no longer grows without bound.
+- One LNS socket error no longer stops the proxy.
 
 ## [2.0.0] - 2026-03-06
 
-Complete rewrite of the Python v1 sniffer in Rust. The sniffer is now a full
-MITM proxy supporting both directions (uplinks and downlinks) and both gateway
-protocols (Semtech UDP and ChirpStack Concentratord).
+Complete rewrite of the Python v1 sniffer in Rust, as a MITM proxy for both directions and both gateway protocols.
 
 ### Added
 
-- **UDP Packet Forwarder MITM proxy** — transparently proxies all six Semtech
-  protocol v2 message types: `PUSH_DATA`, `PUSH_ACK`, `PULL_DATA`, `PULL_ACK`,
-  `PULL_RESP`, `TX_ACK`.
-- **ChirpStack Concentratord proxy** — ZeroMQ IPC proxy (SUB→PUB for events,
-  REP→REQ for commands) with Protobuf decode/encode.
-- **LoRaWAN PHY decoder** — decodes MHDR (MType), DevAddr/FCnt/FPort for data
-  frames, and JoinEUI/DevEUI for Join Requests.
-- **Selective message blocking** — configurable filter rules matched by MType
-  and direction; first matching rule wins.
-- **Stealth mode** — optional ACK suppression for blocked messages so the
-  sender is unaware the message was received (`suppress_ack = true`).
-- **SQLite persistence** — every captured message is stored with full RF and
-  LoRaWAN metadata; WAL mode enabled for concurrent reads.
-- **Configurable data retention** — periodic deletion of rows older than a
-  humantime duration (e.g. `retention = "30days"`).
-- **Time-on-Air calculation** — estimated ToA in milliseconds for each frame.
-- **axum HTTP/WebSocket server** — serves the REST API and the real-time
-  WebSocket feed from the same binary.
-- **REST API** — `GET /api/messages` with `since` (ISO-8601) and `limit` query
-  parameters for historical queries.
-- **WebSocket feed** — real-time push of `MessageRecord` JSON envelopes to all
-  connected clients.
-- **React 19 WebUI** — single-page application embedded in the binary at
-  compile time via `rust-embed`; no separate web server needed.
-  - Virtual message table (`react-virtuoso`) with live auto-scroll and
-    pause/resume.
-  - Client-side filters: device (DevAddr/DevEUI), MType, direction, status,
-    time range.
-  - Column visibility toggle persisted to `localStorage`.
-  - Sortable by timestamp (ascending/descending).
-  - System dark/light theme via `prefers-color-scheme`.
-  - Touch-friendly layout usable on 800×600 screens.
-- **CORS support** — permissive by default; configurable `cors_origins` list.
-- **Syslog support** — `log_to_syslog = true` routes logs to the system
-  syslog daemon.
-- **`configfile` subcommand** — prints an annotated TOML template to stdout.
-- **Multi-arch release builds** — `x86_64-unknown-linux-musl` and
-  `aarch64-unknown-linux-musl` via `cross`; statically linked, no runtime
-  dependencies.
-- **Docker support** — single-stage `Dockerfile`; `make docker-buildx` pushes
-  a multi-arch image (amd64 + arm64).
+- Semtech UDP packet forwarder proxy.
+- ChirpStack Concentratord proxy (ZeroMQ).
+- LoRaWAN PHY decoder.
+- Message blocking rules.
+- Stealth mode (`suppress_ack`).
+- SQLite persistence with retention.
+- Time-on-air calculation.
+- REST API (`GET /api/messages`) and WebSocket feed.
+- React WebUI embedded in the binary.
+- CORS support (`cors_origins`).
+- Syslog support.
+- `configfile` subcommand.
+- Static musl builds for x86_64 and aarch64.
+- Docker support.
 
 [Unreleased]: https://github.com/xoseperez/lorawan-packet-sniffer/compare/v2.1.0...HEAD
 [2.1.0]: https://github.com/xoseperez/lorawan-packet-sniffer/compare/v2.0.0...v2.1.0
