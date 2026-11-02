@@ -75,6 +75,33 @@ pub enum CrcStatus {
     NoCrc,
 }
 
+/// Why a captured frame cannot be a valid LoRaWAN 1.0 / 1.1 frame.
+///
+/// When several reasons apply, the first in this order is the one recorded:
+/// `Crc`, then `Mhdr`, then `Length`.  The lowercase name is the text used in
+/// JSON and in the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Malformed {
+    /// The gateway reported that the CRC check of the radio frame failed.
+    Crc,
+    /// The MHDR's RFU bits or Major version are not zero.
+    Mhdr,
+    /// The length does not fit the frame type.
+    Length,
+}
+
+impl Malformed {
+    /// The reason as text: `"crc"`, `"mhdr"` or `"length"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Malformed::Crc => "crc",
+            Malformed::Mhdr => "mhdr",
+            Malformed::Length => "length",
+        }
+    }
+}
+
 /// Canonical representation of a captured LoRaWAN message.
 ///
 /// This struct is protocol-agnostic: fields are populated from whatever
@@ -136,12 +163,40 @@ pub struct MessageRecord {
     pub f_pending: Option<bool>,
     /// FCtrl FOptsLen: size of the FOpts field in bytes, present for data frames.
     pub f_opts_len: Option<u8>,
+    /// Why the frame cannot be a valid LoRaWAN frame, or `None` when it can.
+    ///
+    /// A malformed record keeps the type read from the first byte, the radio
+    /// data, the size, the airtime, the status and the gateway.  Everything
+    /// decoded from the frame body is `None`: `dev_addr`, `dev_eui`,
+    /// `join_eui`, `dev_nonce`, `fcnt`, `fport`, the FCtrl flags (`adr`,
+    /// `adr_ack_req`, `ack`, `class_b`, `f_pending`) and `f_opts_len`.  Bytes
+    /// that are not a LoRaWAN frame would otherwise produce identifiers that
+    /// belong to no device.
+    pub malformed: Option<Malformed>,
 }
 
 impl MessageRecord {
     pub fn new_id() -> String {
         Uuid::new_v4().to_string()
     }
+}
+
+/// Assert that every field decoded from the frame body is `None`, which is how
+/// a malformed record must look.
+#[cfg(test)]
+pub(crate) fn assert_body_cleared(rec: &MessageRecord) {
+    assert_eq!(rec.dev_addr, None, "dev_addr");
+    assert_eq!(rec.dev_eui, None, "dev_eui");
+    assert_eq!(rec.join_eui, None, "join_eui");
+    assert_eq!(rec.dev_nonce, None, "dev_nonce");
+    assert_eq!(rec.fcnt, None, "fcnt");
+    assert_eq!(rec.fport, None, "fport");
+    assert_eq!(rec.adr, None, "adr");
+    assert_eq!(rec.adr_ack_req, None, "adr_ack_req");
+    assert_eq!(rec.ack, None, "ack");
+    assert_eq!(rec.class_b, None, "class_b");
+    assert_eq!(rec.f_pending, None, "f_pending");
+    assert_eq!(rec.f_opts_len, None, "f_opts_len");
 }
 
 #[cfg(test)]
@@ -178,6 +233,7 @@ mod tests {
             class_b: None,
             f_pending: None,
             f_opts_len: None,
+            malformed: None,
         }
     }
 
@@ -203,7 +259,7 @@ mod tests {
         "toa_ms",
     ];
 
-    const NEW_KEYS: [&str; 9] = [
+    const NEW_KEYS: [&str; 10] = [
         "gateway_eui",
         "join_eui",
         "dev_nonce",
@@ -213,6 +269,7 @@ mod tests {
         "class_b",
         "f_pending",
         "f_opts_len",
+        "malformed",
     ];
 
     fn json_keys(value: &serde_json::Value) -> BTreeSet<String> {
@@ -226,7 +283,7 @@ mod tests {
             .chain(NEW_KEYS.iter())
             .map(|k| k.to_string())
             .collect();
-        assert_eq!(expected.len(), 27);
+        assert_eq!(expected.len(), 28);
 
         // Optional fields are serialized as null, never omitted, so clients
         // can rely on every key being present.
@@ -246,6 +303,7 @@ mod tests {
         full.class_b = Some(false);
         full.f_pending = Some(true);
         full.f_opts_len = Some(5);
+        full.malformed = Some(Malformed::Length);
         let full = serde_json::to_value(full).unwrap();
         assert_eq!(json_keys(&full), expected);
         assert_eq!(full["gateway_eui"], "AA:BB:CC:DD:00:11:22:33");
@@ -257,6 +315,64 @@ mod tests {
         assert_eq!(full["class_b"], false);
         assert_eq!(full["f_pending"], true);
         assert_eq!(full["f_opts_len"], 5);
+        assert_eq!(full["malformed"], "length");
+    }
+
+    #[test]
+    fn malformed_serializes_as_its_lowercase_name() {
+        let cases = [
+            (Malformed::Crc, "crc"),
+            (Malformed::Mhdr, "mhdr"),
+            (Malformed::Length, "length"),
+        ];
+        for (reason, text) in cases {
+            assert_eq!(reason.as_str(), text);
+
+            let mut rec = record();
+            rec.malformed = Some(reason);
+            let json = serde_json::to_value(&rec).unwrap();
+            assert_eq!(json["malformed"], text);
+
+            // The text round-trips, so a stored or received record keeps its reason.
+            let back: MessageRecord = serde_json::from_value(json).unwrap();
+            assert_eq!(back.malformed, Some(reason));
+        }
+
+        let json = serde_json::to_value(record()).unwrap();
+        assert!(json["malformed"].is_null());
+    }
+
+    #[test]
+    fn assert_body_cleared_checks_every_body_field() {
+        // The helper must fail for each of the twelve fields on its own, or a
+        // test using it would silently let one of them through.
+        assert_body_cleared(&record());
+
+        type Setter = fn(&mut MessageRecord);
+        let setters: [(&str, Setter); 12] = [
+            ("dev_addr", |r| r.dev_addr = Some("01020304".to_string())),
+            ("dev_eui", |r| {
+                r.dev_eui = Some("01:02:03:04:05:06:07:08".to_string())
+            }),
+            ("join_eui", |r| {
+                r.join_eui = Some("01:02:03:04:05:06:07:08".to_string())
+            }),
+            ("dev_nonce", |r| r.dev_nonce = Some(1)),
+            ("fcnt", |r| r.fcnt = Some(1)),
+            ("fport", |r| r.fport = Some(1)),
+            ("adr", |r| r.adr = Some(false)),
+            ("adr_ack_req", |r| r.adr_ack_req = Some(false)),
+            ("ack", |r| r.ack = Some(false)),
+            ("class_b", |r| r.class_b = Some(false)),
+            ("f_pending", |r| r.f_pending = Some(false)),
+            ("f_opts_len", |r| r.f_opts_len = Some(0)),
+        ];
+        for (name, set) in setters {
+            let mut rec = record();
+            set(&mut rec);
+            let result = std::panic::catch_unwind(|| assert_body_cleared(&rec));
+            assert!(result.is_err(), "{name} was not checked");
+        }
     }
 
     #[test]
@@ -278,5 +394,6 @@ mod tests {
         let rec: MessageRecord = serde_json::from_value(json).unwrap();
         assert_eq!(rec.gateway_eui, None);
         assert_eq!(rec.f_opts_len, None);
+        assert_eq!(rec.malformed, None);
     }
 }

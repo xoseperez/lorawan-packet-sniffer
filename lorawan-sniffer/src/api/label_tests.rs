@@ -16,11 +16,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use super::tests::{record_with_new_fields, send, Reply, Rig, Setup};
+use super::tests::{
+    frame_of_noise_dev_addr, record_from_frame, record_with_new_fields, send, Reply, Rig, Setup,
+    NOISE_DEV_ADDR,
+};
 use super::*;
 use crate::cmd::root::run_seen_listener;
 use crate::core::labels::{LabelError, MAX_LABELS};
-use crate::core::metadata::MType;
+use crate::core::metadata::{CrcStatus, MType};
 
 const ADDR: &str = "00E8A80B";
 const EUI: &str = "36:31:39:54:36:5D:05:39";
@@ -1156,6 +1159,91 @@ async fn a_device_seen_only_on_the_record_broadcast_can_be_labelled() {
     assert_eq!(put(&app, ADDR, "heard live").await.status, StatusCode::OK);
     assert_eq!(put(&app, EUI, "joined live").await.status, StatusCode::OK);
     assert_eq!(rig.storage.count().unwrap(), 0, "nothing was stored");
+    rig.cancel.cancel();
+    timeout(GUARD, listener).await.unwrap().unwrap();
+}
+
+/// A valid 23-byte JoinRequest.
+fn join_request_frame() -> Vec<u8> {
+    let mut frame = vec![0x00];
+    frame.extend_from_slice(&[0x01, 0, 0, 0, 0, 0, 0, 0]); // JoinEUI
+    frame.extend_from_slice(&[0x08, 7, 6, 5, 4, 3, 2, 1]); // DevEUI
+    frame.extend_from_slice(&[0x34, 0x12]); // DevNonce
+    frame.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // MIC
+    frame
+}
+
+#[tokio::test]
+async fn a_device_seen_only_in_malformed_frames_cannot_be_labelled() {
+    let rig = Setup::new().build();
+    let app = rig.app();
+    let listener = tokio::spawn(run_seen_listener(
+        rig.broadcast_tx.subscribe(),
+        rig.seen.clone(),
+        rig.cancel.clone(),
+    ));
+
+    // Frames that read as a data frame from DevAddr 6874FA22 and as a join
+    // request from a DevEUI, but cannot be LoRaWAN frames: the first failed
+    // its CRC, the second is a join request three bytes short.
+    let data = frame_of_noise_dev_addr();
+    let join = join_request_frame();
+    // The DevEUI the same bytes carry when they are a valid join request.
+    let dev_eui = record_from_frame(&join, CrcStatus::Ok)
+        .dev_eui
+        .expect("a valid join request carries a DevEUI");
+    let malformed = [
+        record_from_frame(&data, CrcStatus::Fail),
+        record_from_frame(&join[..20], CrcStatus::Ok),
+    ];
+    for record in &malformed {
+        assert!(record.malformed.is_some(), "{record:?}");
+        assert_eq!((&record.dev_addr, &record.dev_eui), (&None, &None));
+    }
+
+    // Each is stored and sent on the record broadcast, as the proxy does. A
+    // valid record follows them: the listener handles the broadcast in order,
+    // so once it has noted that one it has dealt with the malformed ones too.
+    for record in &malformed {
+        rig.storage.insert(record).unwrap();
+        rig.broadcast_tx
+            .send(make_ws_json(record).unwrap())
+            .unwrap();
+    }
+    rig.broadcast_tx
+        .send(make_ws_json(&data_record(ADDR)).unwrap())
+        .unwrap();
+    eventually("the listener to note the valid record", || {
+        rig.seen.len() == 1
+    })
+    .await;
+
+    for device in [NOISE_DEV_ADDR, dev_eui.as_str()] {
+        let reply = put(&app, device, "never seen").await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{device}");
+    }
+    assert_eq!(rig.seen.len(), 1, "only the valid record was noted");
+    assert!(rig.storage.labels().unwrap().is_empty());
+
+    // Control: the same bytes received with a passed CRC, and the join request
+    // at its full length, are devices that can be labelled.
+    let valid = [
+        record_from_frame(&data, CrcStatus::Ok),
+        record_from_frame(&join, CrcStatus::Ok),
+    ];
+    for record in &valid {
+        assert_eq!(record.malformed, None, "{record:?}");
+        rig.storage.insert(record).unwrap();
+        rig.broadcast_tx
+            .send(make_ws_json(record).unwrap())
+            .unwrap();
+    }
+    eventually("the listener to note both devices", || rig.seen.len() == 3).await;
+    for device in [NOISE_DEV_ADDR, dev_eui.as_str()] {
+        let reply = put(&app, device, "seen now").await;
+        assert_eq!(reply.status, StatusCode::OK, "{device}");
+    }
+
     rig.cancel.cancel();
     timeout(GUARD, listener).await.unwrap().unwrap();
 }

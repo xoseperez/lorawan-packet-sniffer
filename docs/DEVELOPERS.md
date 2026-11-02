@@ -172,15 +172,20 @@ Here is the journey of a single uplink packet from gateway to database:
 4.  The JSON body is deserialized into PushDataPayload { rxpk: Vec<RxPk>, ... }.
 
 5.  For each RxPk (one RF packet):
-      a. decoder::decode_phy() base64-decodes the PHY payload and parses the
-         LoRaWAN header to extract MType, DevAddr, FCnt, FPort.
+      a. decoder::decode_phy(payload, crc) base64-decodes the PHY payload and
+         applies the malformed-frame rules (CRC failed, bad MHDR, wrong
+         length). A frame that passes has its LoRaWAN header parsed to
+         extract MType, DevAddr, FCnt, FPort; a malformed one keeps only its
+         MType, size and reason.
       b. filter::evaluate() checks all configured rules in order.
-         First match wins. If no rule matches → Forwarded.
+         First match wins. If no rule matches → Forwarded. A malformed frame
+         has no type for the rules, so rules listing MTypes skip it.
       c. A MessageRecord is assembled from all available fields.
-      d. The record is logged at INFO level (log_message).
+      d. The record is logged at DEBUG level (log_message).
       e. The record is serialized to JSON and sent on the broadcast channel
-         (broadcast_record) → API server → all WebSocket clients.
-      f. The record is sent on the mpsc channel (send_record) → storage writer.
+         (Outputs::emit, which also queues it for storage and MQTT)
+         → API server → all WebSocket clients.
+      f. The same call sends it on the mpsc channel → storage writer.
 
 6.  If any rxpk was blocked, the PUSH_DATA is NOT forwarded to the LNS.
     Instead, a synthetic PUSH_ACK is sent back to the gateway so it
@@ -405,6 +410,8 @@ pub enum MType {
 
 **`Direction`** — whether the packet travels from gateway to LNS (`Up`) or from LNS to gateway (`Down`).
 
+**`Malformed`** — why a frame cannot be a valid LoRaWAN 1.0 / 1.1 frame: `Crc`, `Mhdr` or `Length`. It serialises as `"crc"`, `"mhdr"` or `"length"`, the same text the `malformed` column of SQLite holds. `MessageRecord.malformed` is `None` for a valid frame; on a malformed one, `dev_addr`, `dev_eui`, `join_eui`, `dev_nonce`, `fcnt`, `fport`, the five FCtrl flags and `f_opts_len` are all `None`.
+
 **`Status`** — whether the packet was forwarded (`Forwarded`) or dropped by a filter rule (`Blocked`).
 
 **`MessageRecord`** — the canonical, protocol-agnostic struct that represents one captured packet. It is:
@@ -418,23 +425,48 @@ Every field has a comment explaining its semantics. `Option<T>` fields are absen
 
 ### `core/decoder.rs`
 
-Decodes a LoRaWAN PHY (physical layer) payload into a `DecodedFrame`.
+Decodes a LoRaWAN PHY (physical layer) payload into a `DecodedFrame`, and decides whether the frame can be a valid LoRaWAN frame at all.
 
 **Important constraint:** LoRaWAN payloads are encrypted with session keys. The sniffer does not have those keys, so it can only read the unencrypted header. Fields like `FRMPayload` (the actual application data) remain opaque.
 
-The function `decode_phy(data_b64: &str) -> Option<DecodedFrame>` accepts a Base64-encoded string (as it arrives in the UDP JSON) and returns `None` only if the Base64 is invalid or the payload is empty. An unrecognised MType or truncated frame still returns a `DecodedFrame` with whatever fields could be read.
+```rust
+pub fn decode_phy(data_b64: &str, crc: Option<&CrcStatus>) -> Option<DecodedFrame>
+pub fn decode_phy_bytes(bytes: &[u8], crc: Option<&CrcStatus>) -> Option<DecodedFrame>
+```
 
-The companion `decode_phy_bytes(bytes: &[u8])` accepts raw bytes (as they arrive from Concentratord Protobuf).
+`decode_phy` accepts a Base64-encoded string (as it arrives in the UDP JSON) and returns `None` only if the Base64 is invalid or the payload is empty. `decode_phy_bytes` accepts raw bytes (as they arrive from Concentratord Protobuf). `crc` is the gateway's CRC status, already mapped to `CrcStatus` by the backend, so `core/` never sees `stat = -1` or `BAD_CRC`. It is `None` for a downlink and when the status is unknown. The parameter is explicit so that the compiler points at every call site when the signature changes.
+
+**Classification.** Before parsing anything, the decoder applies three rules in order and records the first that holds as `DecodedFrame.malformed`:
+
+| Reason | Rule |
+|---|---|
+| `Crc` | `crc` is `Some(CrcStatus::Fail)`. `NoCrc`, an unknown status and `None` are not failures, so a source that reports no CRC is not marked |
+| `Mhdr` | `bytes[0] & 0x1F != 0`: the RFU bits (4:2) or the Major version (1:0) are not zero |
+| `Length` | `length_fits()` says no: JoinRequest 23 bytes; JoinAccept 17 or 33; RejoinRequest 19 or 24; data frames at least 12 + FOptsLen. Proprietary and Unknown have no length rule |
+
+Classification reads only the MHDR and, for a data frame of 6 bytes or more, the FOptsLen bits of FCtrl (byte 5). A shorter data frame has no FCtrl, but it is under the 12-byte minimum whatever FOptsLen would have been.
+
+A malformed frame is returned with only `mtype`, `payload_size` and `malformed`; nothing is parsed from its body. This is deliberate: a fake DevAddr is never produced, rather than produced and cleared later, so storage, WebSocket, REST, MQTT and the live-identifier list are protected with no code of their own, and the record builders keep copying fields. A payload that cannot be decoded at all has no first byte; `proxy::frame_fields` marks it `Crc` if the CRC failed and leaves it unmarked otherwise.
+
+`storage.rs` applies the same length rule in SQL (`CLASSIFY_MALFORMED_SQL`) to rows stored before the classification existed. A test compares it with `length_fits` for every stored combination of type, size, FOptsLen and CRC status, so change both or neither.
 
 **LoRaWAN frame format:**
 
 ```
-JoinRequest (19 bytes):
+JoinRequest (23 bytes):
   MHDR(1) + JoinEUI(8,LE) + DevEUI(8,LE) + DevNonce(2,LE) + MIC(4)
 
-Data frame:
+JoinAccept (17 bytes, or 33 with a CFList):
+  MHDR(1) + encrypted body + MIC(4)
+
+RejoinRequest (19 or 24 bytes, depending on the RejoinType; the RJType byte is not checked):
+  MHDR(1) + RJType(1) + ... + MIC(4)
+
+Data frame (at least 12 + FOptsLen bytes):
   MHDR(1) + DevAddr(4,LE) + FCtrl(1) + FCnt(2,LE) + FOpts(0-15) + [FPort(1)] + FRMPayload + MIC(4)
 ```
+
+`decode_join_request` and `decode_data_frame` are safe on a slice of any length: one too short for its type yields no fields.
 
 **Rust note on `..Default::default()`:**
 
@@ -468,7 +500,7 @@ The filter engine. Deliberately simple: a linear scan through rules, first match
 - `blocked_by: Option<String>` — `None` means forwarded; `Some(name)` means blocked by the named rule
 - `suppress_ack: bool` — whether to suppress the protocol-level acknowledgement
 
-**`evaluate(rules, direction, mtype) -> FilterDecision`** — iterates the rules slice. The order in the config file is the order they are evaluated.
+**`evaluate(rules, direction, mtype, gateway) -> FilterDecision`** — iterates the rules slice. The order in the config file is the order they are evaluated. `mtype` is an `Option<&MType>`: `None` for a malformed frame, whose type is only its first byte read as an MHDR. A rule with a non-empty `mtypes` list never matches `None`; a rule with no list still does. Any change to rule evaluation must keep that.
 
 **Why is this in `core/` and not directly in `proxy/`?** The filter logic is protocol-agnostic. Both the UDP proxy and the Concentratord proxy call the same `filter::evaluate()`. Keeping it in a separate module avoids duplication and makes it independently testable.
 
@@ -719,7 +751,7 @@ The `frontend_handler` implements SPA routing: if the requested path is not foun
 
 Shared utilities used by both proxy backends. These are declared `pub(super)` — visible to sibling modules (`udp.rs`, `concentratord.rs`) but not outside the `proxy` module.
 
-**`unpack_frame`:** Converts an `Option<DecodedFrame>` into a flat tuple, filling fields with `None` / `MType::Unknown` if decoding failed.
+**`frame_fields`:** Converts an `Option<DecodedFrame>` and the CRC status into a flat `FrameFields`, filling fields with `None` / `MType::Unknown` if decoding failed. `FrameFields::rule_mtype()` is the type the filter sees: `None` for a malformed frame.
 
 **`decision_to_status`:** Converts a `FilterDecision` into `(Status, Option<String>)` for storing in `MessageRecord`.
 
@@ -1003,8 +1035,8 @@ Without WAL (Write-Ahead Logging), SQLite uses a global write lock that blocks a
 ### Adding support for a new gateway protocol
 
 1. Create `lorawan-sniffer/src/proxy/newprotocol.rs`.
-2. Implement a `pub async fn run(config, filters, record_tx, broadcast_tx, cancel) -> Result<()>`.
-3. Use `super::{send_record, broadcast_record, log_message, unpack_frame, decision_to_status}`.
+2. Implement a `pub async fn run(config, filters, outputs, cancel) -> Result<()>`.
+3. Use `super::{frame_fields, classify, log_message, Outputs}`: `frame_fields` decodes a frame (pass the CRC status for an uplink, `None` for a downlink), `classify` applies the rules to `FrameFields::rule_mtype()`, and `Outputs::emit` sends the record to storage, `/ws` and MQTT.
 4. Add `Protocol::NewProtocol` to `config/mod.rs`.
 5. Add a match arm in `cmd/root.rs`.
 6. Declare the module in `proxy/mod.rs`.

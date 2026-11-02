@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::core::decoder::{self, FCtrl};
 use crate::core::eui::Eui64;
 use crate::core::filter::{self, FilterRule};
-use crate::core::metadata::{Direction, MType, MessageRecord, Status};
+use crate::core::metadata::{CrcStatus, Direction, MType, Malformed, MessageRecord, Status};
 use crate::core::ratelimit::RateLimitedLog;
 use crate::mqtt::MqttStats;
 
@@ -33,16 +33,29 @@ pub(super) struct FrameFields {
     pub fport: Option<u8>,
     pub fctrl: Option<FCtrl>,
     pub payload_size: u16,
+    pub malformed: Option<Malformed>,
+}
+
+impl FrameFields {
+    /// The type blocking rules see: `None` for a malformed frame, whose type is
+    /// only its first byte read as an MHDR and means nothing for noise.
+    pub fn rule_mtype(&self) -> Option<&MType> {
+        self.malformed.is_none().then_some(&self.mtype)
+    }
 }
 
 /// Flatten a `DecodedFrame` into the fields a record needs.
 ///
 /// A payload that could not be decoded at all (`None`) becomes
 /// [`MType::Unknown`] with no header fields, and `fallback_size` as its size,
-/// taken from the transport's own length field.
+/// taken from the transport's own length field.  It has no first byte, so the
+/// MHDR and length rules cannot apply to it; it is marked [`Malformed::Crc`]
+/// when `crc` says the gateway reported a failed CRC, and not marked
+/// otherwise.
 pub(super) fn frame_fields(
     frame: Option<decoder::DecodedFrame>,
     fallback_size: u16,
+    crc: Option<&CrcStatus>,
 ) -> FrameFields {
     match frame {
         Some(f) => FrameFields {
@@ -55,6 +68,7 @@ pub(super) fn frame_fields(
             fport: f.fport,
             fctrl: f.fctrl,
             payload_size: f.payload_size,
+            malformed: f.malformed,
         },
         None => FrameFields {
             mtype: MType::Unknown,
@@ -66,6 +80,7 @@ pub(super) fn frame_fields(
             fport: None,
             fctrl: None,
             payload_size: fallback_size,
+            malformed: decoder::crc_failed(crc).then_some(Malformed::Crc),
         },
     }
 }
@@ -112,12 +127,13 @@ impl Verdict {
 /// proxy never forwards, so a rule could neither block anything nor be honored
 /// in any meaningful way, and the message is simply captured.  Otherwise the
 /// first enabled rule matching `direction`, `mtype` and `gateway` blocks it,
-/// and no match means forward.  `gateway` is `None` when it is not known.
+/// and no match means forward.  `mtype` is `None` for a malformed frame, which
+/// no rule listing types matches.  `gateway` is `None` when it is not known.
 pub(super) fn classify(
     listen: bool,
     filters: &[FilterRule],
     direction: &Direction,
-    mtype: &MType,
+    mtype: Option<&MType>,
     gateway: Option<&Eui64>,
 ) -> Verdict {
     if listen {
@@ -251,7 +267,7 @@ pub(super) fn log_message(rec: &MessageRecord) {
     }
 }
 
-/// The INFO line for a record.
+/// The DEBUG line for a record.
 fn log_line(rec: &MessageRecord) -> String {
     let status_tag = match rec.status {
         Status::Forwarded => "FORWARDED",
@@ -295,8 +311,13 @@ fn log_line(rec: &MessageRecord) -> String {
         Direction::Down => String::new(),
     };
 
+    let malformed_str = rec
+        .malformed
+        .map(|m| format!(" malformed={}", m.as_str()))
+        .unwrap_or_default();
+
     format!(
-        "[{}] {} {} {} gw={}{}{}  {:.3}MHz {} size={}{}{}",
+        "[{}] {} {} {} gw={}{}{}  {:.3}MHz {} size={}{}{}{}",
         status_tag,
         dir_tag,
         rec.mtype,
@@ -309,6 +330,7 @@ fn log_line(rec: &MessageRecord) -> String {
         rec.payload_size,
         toa_str,
         rf_str,
+        malformed_str,
     )
 }
 
@@ -329,8 +351,8 @@ mod tests {
 
     #[test]
     fn frame_fields_carry_join_fields() {
-        let frame = decoder::decode_phy_bytes(&join_request());
-        let fields = frame_fields(frame, 0);
+        let frame = decoder::decode_phy_bytes(&join_request(), None);
+        let fields = frame_fields(frame, 0, None);
 
         assert_eq!(fields.mtype, MType::JoinRequest);
         assert_eq!(fields.join_eui.as_deref(), Some("00:00:00:00:00:00:00:01"));
@@ -351,7 +373,7 @@ mod tests {
         pkt.extend_from_slice(&[0x02, 0x01]); // FOpts
         pkt.push(0x09); // FPort
         pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // MIC
-        let fields = frame_fields(decoder::decode_phy_bytes(&pkt), 0);
+        let fields = frame_fields(decoder::decode_phy_bytes(&pkt, None), 0, None);
 
         assert_eq!(fields.mtype, MType::UnconfirmedDataUp);
         assert_eq!(fields.dev_addr.as_deref(), Some("01ABCDEF"));
@@ -370,7 +392,7 @@ mod tests {
 
     #[test]
     fn undecodable_payload_uses_the_transport_size() {
-        let fields = frame_fields(None, 42);
+        let fields = frame_fields(None, 42, None);
         assert_eq!(fields.mtype, MType::Unknown);
         assert_eq!(fields.payload_size, 42);
         assert_eq!(fields.dev_addr, None);
@@ -378,6 +400,65 @@ mod tests {
         assert_eq!(fields.join_eui, None);
         assert_eq!(fields.dev_nonce, None);
         assert_eq!(fields.fctrl, None);
+        assert_eq!(fields.malformed, None);
+    }
+
+    #[test]
+    fn undecodable_payload_with_a_failed_crc_is_malformed() {
+        // There is no first byte to check, so only the CRC can mark it.
+        let fields = frame_fields(None, 42, Some(&CrcStatus::Fail));
+        assert_eq!(fields.malformed, Some(Malformed::Crc));
+        assert_eq!(fields.mtype, MType::Unknown);
+        assert_eq!(fields.payload_size, 42);
+        assert_eq!(fields.dev_addr, None);
+        assert_eq!(fields.fctrl, None);
+
+        // Any other status leaves it unmarked.
+        for crc in [CrcStatus::Ok, CrcStatus::NoCrc] {
+            let fields = frame_fields(None, 42, Some(&crc));
+            assert_eq!(fields.malformed, None, "{crc:?}");
+        }
+    }
+
+    #[test]
+    fn decoded_frames_carry_their_reason_through() {
+        // The reason comes from the decoder and is passed on as it is; the
+        // CRC given here only matters for a payload that did not decode.
+        let pkt = join_request();
+        for (crc, expected) in [
+            (Some(CrcStatus::Fail), Some(Malformed::Crc)),
+            (Some(CrcStatus::Ok), None),
+            (Some(CrcStatus::NoCrc), None),
+            (None, None),
+        ] {
+            let frame = decoder::decode_phy_bytes(&pkt, crc.as_ref());
+            let fields = frame_fields(frame, 0, crc.as_ref());
+            assert_eq!(fields.malformed, expected, "{crc:?}");
+            if expected.is_some() {
+                // Nothing read from the body, but the type and size stay.
+                assert_eq!(fields.mtype, MType::JoinRequest);
+                assert_eq!(fields.payload_size, 23);
+                assert_eq!(fields.dev_eui, None);
+                assert_eq!(fields.join_eui, None);
+                assert_eq!(fields.dev_nonce, None);
+            } else {
+                assert_eq!(fields.dev_nonce, Some(0x1234));
+            }
+        }
+
+        // Wrong length with a good CRC.
+        let frame = decoder::decode_phy_bytes(&pkt[..20], Some(&CrcStatus::Ok));
+        let fields = frame_fields(frame, 0, Some(&CrcStatus::Ok));
+        assert_eq!(fields.malformed, Some(Malformed::Length));
+        assert_eq!(fields.mtype, MType::JoinRequest);
+        assert_eq!(fields.payload_size, 20);
+        assert_eq!(fields.dev_eui, None);
+
+        // A reserved MHDR bit.
+        let mut bad = pkt.clone();
+        bad[0] |= 0x04;
+        let fields = frame_fields(decoder::decode_phy_bytes(&bad, None), 0, None);
+        assert_eq!(fields.malformed, Some(Malformed::Mhdr));
     }
 
     // --- classify / Verdict ---
@@ -399,7 +480,13 @@ mod tests {
     #[test]
     fn matching_rule_blocks_with_its_name_and_stealth_flag() {
         let rules = [rule("quiet", true, vec![]), rule("loud", false, vec![])];
-        let verdict = classify(false, &rules, &Direction::Up, &MType::JoinRequest, None);
+        let verdict = classify(
+            false,
+            &rules,
+            &Direction::Up,
+            Some(&MType::JoinRequest),
+            None,
+        );
         assert_eq!(
             verdict,
             Verdict::Block {
@@ -413,7 +500,7 @@ mod tests {
 
     #[test]
     fn no_matching_rule_forwards() {
-        let verdict = classify(false, &[], &Direction::Up, &MType::JoinRequest, None);
+        let verdict = classify(false, &[], &Direction::Up, Some(&MType::JoinRequest), None);
         assert_eq!(verdict, Verdict::Forward);
         assert_eq!(verdict.status(), Status::Forwarded);
         assert_eq!(verdict.blocked_by(), None);
@@ -424,7 +511,7 @@ mod tests {
         // A rule that would block everything must not matter when listening.
         let rules = [rule("block-all", false, vec![])];
         let (dir, mtype) = (Direction::Up, MType::JoinRequest);
-        let verdict = classify(true, &rules, &dir, &mtype, Some(&GW_A));
+        let verdict = classify(true, &rules, &dir, Some(&mtype), Some(&GW_A));
         assert_eq!(verdict, Verdict::Capture);
         assert_eq!(verdict.status(), Status::Captured);
         assert_eq!(verdict.blocked_by(), None);
@@ -435,13 +522,93 @@ mod tests {
         let rules = [rule("only-a", false, vec![GW_A])];
         let blocks = |gw: Option<&Eui64>| {
             matches!(
-                classify(false, &rules, &Direction::Down, &MType::JoinAccept, gw),
+                classify(
+                    false,
+                    &rules,
+                    &Direction::Down,
+                    Some(&MType::JoinAccept),
+                    gw
+                ),
                 Verdict::Block { .. }
             )
         };
         assert!(blocks(Some(&GW_A)));
         assert!(!blocks(Some(&GW_B)));
         assert!(!blocks(None));
+    }
+
+    #[test]
+    fn a_malformed_frame_has_no_type_for_the_rules() {
+        let fields = frame_fields(
+            decoder::decode_phy_bytes(&join_request(), Some(&CrcStatus::Fail)),
+            0,
+            Some(&CrcStatus::Fail),
+        );
+        assert_eq!(fields.malformed, Some(Malformed::Crc));
+        // The record keeps the type; only the rules do not see it.
+        assert_eq!(fields.mtype, MType::JoinRequest);
+        assert_eq!(fields.rule_mtype(), None);
+
+        // Nor does a payload that did not decode at all.
+        assert_eq!(
+            frame_fields(None, 42, Some(&CrcStatus::Fail)).rule_mtype(),
+            None
+        );
+
+        let fields = frame_fields(
+            decoder::decode_phy_bytes(&join_request(), Some(&CrcStatus::Ok)),
+            0,
+            Some(&CrcStatus::Ok),
+        );
+        assert_eq!(fields.malformed, None);
+        assert_eq!(fields.rule_mtype(), Some(&MType::JoinRequest));
+    }
+
+    #[test]
+    fn rules_listing_types_do_not_block_a_frame_without_a_type() {
+        let by_type = FilterRule {
+            mtypes: vec![MType::JoinRequest, MType::UnconfirmedDataUp],
+            ..rule("by-type", false, vec![])
+        };
+        let by_direction = FilterRule {
+            direction: Some(Direction::Up),
+            ..rule("by-direction", false, vec![])
+        };
+        let by_gateway = rule("by-gateway", false, vec![GW_A]);
+
+        assert_eq!(
+            classify(
+                false,
+                std::slice::from_ref(&by_type),
+                &Direction::Up,
+                None,
+                Some(&GW_A)
+            ),
+            Verdict::Forward
+        );
+        for blocker in [&by_direction, &by_gateway] {
+            let verdict = classify(
+                false,
+                std::slice::from_ref(blocker),
+                &Direction::Up,
+                None,
+                Some(&GW_A),
+            );
+            assert_eq!(verdict.blocked_by(), Some(blocker.name.as_str()));
+        }
+
+        // A type rule listed first does not shadow the one that matches.
+        let rules = [by_type, by_direction];
+        let verdict = classify(false, &rules, &Direction::Up, None, Some(&GW_A));
+        assert_eq!(verdict.blocked_by(), Some("by-direction"));
+        let verdict = classify(
+            false,
+            &rules,
+            &Direction::Up,
+            Some(&MType::JoinRequest),
+            Some(&GW_A),
+        );
+        assert_eq!(verdict.blocked_by(), Some("by-type"));
     }
 
     // --- log line ---
@@ -456,6 +623,21 @@ mod tests {
 
         rec.gateway_eui = None;
         assert!(log_line(&rec).contains("gw=n/a"));
+    }
+
+    #[test]
+    fn log_line_shows_the_malformed_reason() {
+        let mut rec = test_record();
+        assert!(!log_line(&rec).contains("malformed"), "{}", log_line(&rec));
+
+        for reason in [Malformed::Crc, Malformed::Mhdr, Malformed::Length] {
+            rec.malformed = Some(reason);
+            let line = log_line(&rec);
+            assert!(
+                line.ends_with(&format!(" malformed={}", reason.as_str())),
+                "{line}"
+            );
+        }
     }
 
     // --- Outputs ---
@@ -489,6 +671,7 @@ mod tests {
             class_b: None,
             f_pending: None,
             f_opts_len: None,
+            malformed: None,
         }
     }
 

@@ -6,6 +6,10 @@ export interface FilterState {
   status: 'all' | Status;
   gateway: string; // gateway EUI, '' = all gateways
   timePreset: '5m' | '15m' | '1h' | '24h' | 'all';
+  // Malformed frames are noise most of the time, so they stay hidden until
+  // asked for. The box is in the Type list because the header has no room
+  // left for another control at 800 px.
+  showMalformed: boolean;
 }
 
 export const DEFAULT_FILTERS: FilterState = {
@@ -14,6 +18,7 @@ export const DEFAULT_FILTERS: FilterState = {
   status: 'all',
   gateway: '',
   timePreset: '5m',
+  showMalformed: false,
 };
 
 const ALL_MTYPES: { value: MType; label: string }[] = [
@@ -95,6 +100,14 @@ export function FilterBar({ filters, onChange, gateways }: Props) {
               {label}
             </label>
           ))}
+          <label className="filter-malformed">
+            <input
+              type="checkbox"
+              checked={filters.showMalformed}
+              onChange={e => update({ showMalformed: e.target.checked })}
+            />
+            Show malformed
+          </label>
         </div>
       </details>
 

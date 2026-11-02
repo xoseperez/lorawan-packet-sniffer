@@ -477,6 +477,7 @@ mod tests {
             class_b: None,
             f_pending: None,
             f_opts_len: None,
+            malformed: None,
         }
     }
 

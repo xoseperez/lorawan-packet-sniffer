@@ -14,6 +14,10 @@ export type Direction = 'up' | 'down';
 export type Status = 'Forwarded' | 'Blocked' | 'Captured';
 export type Protocol = 'udp' | 'concentratord';
 export type CrcStatus = 'Ok' | 'Fail' | 'NoCrc';
+// Why a frame cannot be a valid LoRaWAN 1.0/1.1 frame: the gateway reported a
+// failed CRC, the MHDR has non-zero reserved or major-version bits, or the
+// length does not fit the frame's type.
+export type Malformed = 'crc' | 'mhdr' | 'length';
 
 export interface MessageRecord {
   id: string;
@@ -48,6 +52,11 @@ export interface MessageRecord {
   class_b: boolean | null;
   f_pending: boolean | null;
   f_opts_len: number | null; // 0-15
+  // Set when the frame cannot be valid LoRaWAN. The type and the radio data
+  // are kept, but everything decoded from the frame body (identifiers, FCnt,
+  // FPort, the FCtrl flags, FOptsLen) is null, because for such a frame it
+  // would be noise.
+  malformed: Malformed | null;
 }
 
 /**
@@ -66,11 +75,53 @@ export interface WsMessage {
 /**
  * The identifier a row can be labelled by: the DevAddr of a data frame, or the
  * DevEUI of a join request. A record never carries both. Join accepts, rejoin
- * requests, proprietary frames and truncated frames carry neither, so they
- * have no identifier and cannot be labelled.
+ * requests, proprietary frames, truncated frames and malformed frames carry
+ * neither, so they have no identifier and cannot be labelled.
  */
 export function deviceId(m: Pick<MessageRecord, 'dev_addr' | 'dev_eui'>): string | null {
   return m.dev_addr ?? m.dev_eui ?? null;
+}
+
+// What a frame was expected to be, for the "wrong length" reason. A frame that
+// is not malformed never needs it; Proprietary and Unknown have no length
+// rule, so "frame" is only a fallback.
+const TYPE_WORDS: Record<MType, string> = {
+  JoinRequest:         'join request',
+  JoinAccept:          'join accept',
+  RejoinRequest:       'rejoin request',
+  UnconfirmedDataUp:   'data uplink',
+  ConfirmedDataUp:     'data uplink',
+  UnconfirmedDataDown: 'data downlink',
+  ConfirmedDataDown:   'data downlink',
+  Proprietary:         'frame',
+  Unknown:             'frame',
+};
+
+/**
+ * The full reason a frame is malformed, in plain words, or null when it is not.
+ * For the hover text of a row.
+ */
+export function malformedReason(m: Pick<MessageRecord, 'malformed' | 'mtype'>): string | null {
+  switch (m.malformed) {
+    case 'crc':    return 'CRC check failed';
+    case 'mhdr':   return 'not a LoRaWAN 1.0/1.1 header';
+    case 'length': return `wrong length for a ${TYPE_WORDS[m.mtype] ?? 'frame'}`;
+    default:       return null;
+  }
+}
+
+/**
+ * The reason in two or three words, short enough to sit in a table cell and
+ * be read without hovering (a touch screen has no hover), or null when the
+ * frame is not malformed.
+ */
+export function malformedShort(m: Pick<MessageRecord, 'malformed'>): string | null {
+  switch (m.malformed) {
+    case 'crc':    return 'CRC failed';
+    case 'mhdr':   return 'bad header';
+    case 'length': return 'wrong length';
+    default:       return null;
+  }
 }
 
 /**

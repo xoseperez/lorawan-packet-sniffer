@@ -611,7 +611,9 @@ fn build_uplink_record(
     let (rssi, snr, crc) = extract_rx_info(frame);
     let raw_size = frame.phy_payload.len() as u16;
 
-    let decoded = decoder::decode_phy_bytes(&frame.phy_payload);
+    let decoded = decoder::decode_phy_bytes(&frame.phy_payload, crc.as_ref());
+    let fields = frame_fields(decoded, raw_size, crc.as_ref());
+    let verdict = classify(false, filters, &Direction::Up, fields.rule_mtype(), gateway);
     let FrameFields {
         mtype,
         dev_addr,
@@ -622,9 +624,9 @@ fn build_uplink_record(
         fport,
         fctrl,
         payload_size,
-    } = frame_fields(decoded, raw_size);
+        malformed,
+    } = fields;
 
-    let verdict = classify(false, filters, &Direction::Up, &mtype, gateway);
     let toa = toa::compute_lora_toa(payload_size, &datarate, &codr);
 
     let record = MessageRecord {
@@ -655,6 +657,7 @@ fn build_uplink_record(
         class_b: fctrl.and_then(|c| c.class_b),
         f_pending: fctrl.and_then(|c| c.f_pending),
         f_opts_len: fctrl.map(|c| c.f_opts_len),
+        malformed,
     };
     (record, verdict)
 }
@@ -671,7 +674,16 @@ fn build_downlink_record(
     let raw_size = phy.len() as u16;
 
     let (freq_mhz, datarate, codr) = extract_downlink_rf(frame);
-    let decoded = decoder::decode_phy_bytes(phy);
+    // A downlink has no CRC to report.
+    let decoded = decoder::decode_phy_bytes(phy, None);
+    let fields = frame_fields(decoded, raw_size, None);
+    let verdict = classify(
+        false,
+        filters,
+        &Direction::Down,
+        fields.rule_mtype(),
+        gateway,
+    );
     let FrameFields {
         mtype,
         dev_addr,
@@ -682,9 +694,9 @@ fn build_downlink_record(
         fport,
         fctrl,
         payload_size,
-    } = frame_fields(decoded, raw_size);
+        malformed,
+    } = fields;
 
-    let verdict = classify(false, filters, &Direction::Down, &mtype, gateway);
     let toa = toa::compute_lora_toa(payload_size, &datarate, &codr);
 
     let record = MessageRecord {
@@ -715,6 +727,7 @@ fn build_downlink_record(
         class_b: fctrl.and_then(|c| c.class_b),
         f_pending: fctrl.and_then(|c| c.f_pending),
         f_opts_len: fctrl.map(|c| c.f_opts_len),
+        malformed,
     };
     (record, verdict)
 }
@@ -826,7 +839,7 @@ mod tests {
 
     use tokio::sync::{broadcast, mpsc};
 
-    use crate::core::metadata::Status;
+    use crate::core::metadata::{assert_body_cleared, MType, Malformed, Status};
 
     /// Gateway IDs as Concentratord writes them: 16 lowercase hex digits.
     const GW_ID: &str = "0016c001ff10d3f6";
@@ -910,6 +923,40 @@ mod tests {
             })),
         }
         .encode_to_vec()
+    }
+
+    /// An UnconfirmedDataUp PHY payload from `dev_addr`: 15 bytes with an
+    /// FPort and two bytes of payload.
+    fn data_up_phy(dev_addr: u32) -> Vec<u8> {
+        let mut pkt = vec![0x40u8];
+        pkt.extend_from_slice(&dev_addr.to_le_bytes());
+        pkt.push(0x00); // FCtrl
+        pkt.extend_from_slice(&[0x05, 0x00]); // FCnt
+        pkt.push(0x01); // FPort
+        pkt.extend_from_slice(&[0x11, 0x22]); // FRMPayload
+        pkt.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // MIC
+        pkt
+    }
+
+    /// An uplink event carrying `phy_payload` with the given CRC status.
+    fn uplink_event_of(phy_payload: Vec<u8>, crc: gw::CrcStatus) -> Vec<u8> {
+        let mut frame = uplink_frame(GW_ID);
+        frame.phy_payload = phy_payload;
+        frame.rx_info.as_mut().unwrap().crc_status = crc as i32;
+        gw::Event {
+            event: Some(gw::event::Event::UplinkFrame(frame)),
+        }
+        .encode_to_vec()
+    }
+
+    /// A downlink command for `GW_ID` carrying `phy_payload`.
+    fn downlink_command_of(phy_payload: Vec<u8>) -> Vec<u8> {
+        let mut command = gw::Command::decode(downlink_command(GW_ID).as_slice()).unwrap();
+        let Some(gw::command::Command::SendDownlinkFrame(frame)) = command.command.as_mut() else {
+            unreachable!("downlink_command builds a downlink");
+        };
+        frame.items[0].phy_payload = phy_payload;
+        command.encode_to_vec()
     }
 
     /// Run encoded downlink-command bytes through the same decode step the
@@ -1117,5 +1164,146 @@ mod tests {
         let action = send_downlink(&downlink_command(""), &rules, &learned, &out);
         assert!(matches!(action, DownlinkAction::Relay));
         assert_eq!(records.try_recv().unwrap().status, Status::Forwarded);
+    }
+
+    #[test]
+    fn a_bad_crc_uplink_is_recorded_as_malformed_and_still_forwarded() {
+        let (out, mut records) = outputs();
+        let learned = LearnedGateway::default();
+
+        // The bytes read as a data frame from DevAddr 6874FA22, which is what
+        // a failed CRC would otherwise have put in the table.
+        let event = uplink_event_of(data_up_phy(0x6874FA22), gw::CrcStatus::BadCrc);
+        assert!(handle_event(&event, &[], &learned, &out));
+
+        let rec = records.try_recv().unwrap();
+        assert_eq!(rec.malformed, Some(Malformed::Crc));
+        assert_body_cleared(&rec);
+        // What was measured about the reception stays.
+        assert_eq!(rec.status, Status::Forwarded);
+        assert_eq!(rec.direction, Direction::Up);
+        assert_eq!(rec.mtype, MType::UnconfirmedDataUp);
+        assert_eq!(rec.freq_mhz, 868.1);
+        assert_eq!(rec.datarate, "SF7BW125");
+        assert_eq!(rec.rssi, Some(-60));
+        assert_eq!(rec.snr, Some(7.5));
+        assert_eq!(rec.crc_status, Some(CrcStatus::Fail));
+        assert_eq!(rec.payload_size, 15);
+        assert!(rec.toa_ms.is_some_and(|t| t > 0.0), "{:?}", rec.toa_ms);
+        assert_eq!(rec.gateway_eui.as_deref(), Some(GW_DISPLAY));
+        assert!(records.try_recv().is_err());
+
+        // The same bytes with a passed or absent check keep their fields.
+        for crc in [gw::CrcStatus::CrcOk, gw::CrcStatus::NoCrc] {
+            let event = uplink_event_of(data_up_phy(0x6874FA22), crc);
+            assert!(handle_event(&event, &[], &learned, &out));
+            let rec = records.try_recv().unwrap();
+            assert_eq!(rec.malformed, None, "{crc:?}");
+            assert_eq!(rec.dev_addr.as_deref(), Some("6874FA22"), "{crc:?}");
+            assert_eq!(rec.fcnt, Some(5), "{crc:?}");
+        }
+    }
+
+    #[test]
+    fn a_reserved_mhdr_bit_makes_an_uplink_malformed() {
+        let (out, mut records) = outputs();
+        let learned = LearnedGateway::default();
+
+        let mut phy = data_up_phy(0x6874FA22);
+        phy[0] = 0x44;
+        let event = uplink_event_of(phy, gw::CrcStatus::CrcOk);
+        assert!(handle_event(&event, &[], &learned, &out));
+
+        let rec = records.try_recv().unwrap();
+        assert_eq!(rec.malformed, Some(Malformed::Mhdr));
+        assert_body_cleared(&rec);
+        assert_eq!(rec.mtype, MType::UnconfirmedDataUp);
+        assert_eq!(rec.crc_status, Some(CrcStatus::Ok));
+        assert_eq!(rec.payload_size, 15);
+        assert_eq!(rec.status, Status::Forwarded);
+    }
+
+    #[test]
+    fn a_downlink_of_the_wrong_length_is_malformed_and_relayed() {
+        let (out, mut records) = outputs();
+        let learned = LearnedGateway::default();
+
+        // A data frame needs at least 12 bytes.
+        let mut phy = data_up_phy(0x6874FA22);
+        phy[0] = 0x60;
+        phy.truncate(9);
+        let command = downlink_command_of(phy);
+        let action = send_downlink(&command, &[], &learned, &out);
+        assert!(matches!(action, DownlinkAction::Relay));
+
+        let rec = records.try_recv().unwrap();
+        assert_eq!(rec.malformed, Some(Malformed::Length));
+        assert_body_cleared(&rec);
+        assert_eq!(rec.direction, Direction::Down);
+        assert_eq!(rec.mtype, MType::UnconfirmedDataDown);
+        // A downlink has no CRC to report.
+        assert_eq!(rec.crc_status, None);
+        assert_eq!(rec.payload_size, 9);
+        assert_eq!(rec.status, Status::Forwarded);
+    }
+
+    #[test]
+    fn type_rules_do_not_match_malformed_uplinks_or_downlinks() {
+        let (out, mut records) = outputs();
+        let learned = LearnedGateway::default();
+        let type_rule = |name: &str, direction: Direction, mtype: MType| FilterRule {
+            direction: Some(direction),
+            mtypes: vec![mtype],
+            ..rule(name, vec![])
+        };
+
+        // A BAD_CRC frame whose first byte reads as a JoinRequest passes a
+        // rule on JoinRequests...
+        let noise = uplink_event_of(vec![0x00; 20], gw::CrcStatus::BadCrc);
+        let join_rule = [type_rule("no-joins", Direction::Up, MType::JoinRequest)];
+        assert!(handle_event(&noise, &join_rule, &learned, &out));
+        let rec = records.try_recv().unwrap();
+        assert_eq!(rec.status, Status::Forwarded);
+        assert_eq!(rec.blocked_by, None);
+        assert_eq!(rec.mtype, MType::JoinRequest);
+        assert_eq!(rec.malformed, Some(Malformed::Crc));
+
+        // ...which does block a valid JoinRequest.
+        assert!(!handle_event(
+            &uplink_event(GW_ID),
+            &join_rule,
+            &learned,
+            &out
+        ));
+        assert_eq!(records.try_recv().unwrap().status, Status::Blocked);
+
+        // A rule that lists no type still blocks the noise.
+        let direction_rule = [FilterRule {
+            direction: Some(Direction::Up),
+            ..rule("all-up", vec![])
+        }];
+        assert!(!handle_event(&noise, &direction_rule, &learned, &out));
+        let rec = records.try_recv().unwrap();
+        assert_eq!(rec.status, Status::Blocked);
+        assert_eq!(rec.blocked_by.as_deref(), Some("all-up"));
+        assert_eq!(rec.malformed, Some(Malformed::Crc));
+
+        // The same holds for a downlink of the wrong length: a rule on its
+        // type does not stop it, a rule on the direction does.
+        let short = downlink_command_of(join_accept_phy()[..10].to_vec());
+        let accept_rule = [type_rule("no-accepts", Direction::Down, MType::JoinAccept)];
+        let action = send_downlink(&short, &accept_rule, &learned, &out);
+        assert!(matches!(action, DownlinkAction::Relay));
+        let rec = records.try_recv().unwrap();
+        assert_eq!(rec.status, Status::Forwarded);
+        assert_eq!(rec.malformed, Some(Malformed::Length));
+
+        let down_rule = [FilterRule {
+            direction: Some(Direction::Down),
+            ..rule("all-down", vec![])
+        }];
+        let action = send_downlink(&short, &down_rule, &learned, &out);
+        assert!(matches!(action, DownlinkAction::Reply(_)));
+        assert_eq!(records.try_recv().unwrap().status, Status::Blocked);
     }
 }

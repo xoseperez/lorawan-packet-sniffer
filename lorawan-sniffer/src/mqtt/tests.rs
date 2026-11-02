@@ -22,8 +22,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::core::metadata::{Direction, MType, Protocol, Status};
-use crate::proxy::Outputs;
+use crate::core::decoder;
+use crate::core::metadata::{CrcStatus, Direction, MType, Malformed, Protocol, Status};
+use crate::proxy::{frame_fields, Outputs};
 
 /// Backoff short enough that tests reconnect in milliseconds.
 const FAST: Tuning = Tuning {
@@ -299,11 +300,70 @@ fn test_record() -> MessageRecord {
         class_b: None,
         f_pending: None,
         f_opts_len: None,
+        malformed: None,
     }
 }
 
+/// The record a proxy builds for `frame` received with CRC status `crc`: the
+/// fields come from the decoder, as they do in the backends.
+fn record_from_frame(frame: &[u8], crc: CrcStatus) -> MessageRecord {
+    let crc = Some(crc);
+    let fields = frame_fields(
+        decoder::decode_phy_bytes(frame, crc.as_ref()),
+        frame.len() as u16,
+        crc.as_ref(),
+    );
+    MessageRecord {
+        crc_status: crc,
+        mtype: fields.mtype,
+        dev_addr: fields.dev_addr,
+        dev_eui: fields.dev_eui,
+        join_eui: fields.join_eui,
+        dev_nonce: fields.dev_nonce,
+        fcnt: fields.fcnt,
+        fport: fields.fport,
+        payload_size: fields.payload_size,
+        adr: fields.fctrl.map(|c| c.adr),
+        adr_ack_req: fields.fctrl.and_then(|c| c.adr_ack_req),
+        ack: fields.fctrl.map(|c| c.ack),
+        class_b: fields.fctrl.and_then(|c| c.class_b),
+        f_pending: fields.fctrl.and_then(|c| c.f_pending),
+        f_opts_len: fields.fctrl.map(|c| c.f_opts_len),
+        malformed: fields.malformed,
+        ..test_record()
+    }
+}
+
+/// One record for each reason, built from frames whose bytes read as DevAddr
+/// `6874FA22` and that the decoder rejects: a failed CRC, a reserved MHDR bit
+/// and a frame too short for its type.
+fn malformed_records() -> Vec<MessageRecord> {
+    // MHDR, DevAddr, FCtrl, FCnt, FPort, FRMPayload, MIC.
+    let mut frame = vec![0x40, 0x22, 0xFA, 0x74, 0x68, 0x00, 0x05, 0x00, 0x01];
+    frame.extend_from_slice(&[0x11, 0x22, 0xDE, 0xAD, 0xBE, 0xEF]);
+    let mut bad_mhdr = frame.clone();
+    bad_mhdr[0] |= 0x04;
+
+    let records = vec![
+        record_from_frame(&frame, CrcStatus::Fail),
+        record_from_frame(&bad_mhdr, CrcStatus::Ok),
+        record_from_frame(&frame[..9], CrcStatus::Ok),
+    ];
+    let reasons: Vec<_> = records.iter().map(|r| r.malformed).collect();
+    assert_eq!(
+        reasons,
+        [
+            Some(Malformed::Crc),
+            Some(Malformed::Mhdr),
+            Some(Malformed::Length)
+        ]
+    );
+    records
+}
+
 /// One record for every direction, status and protocol, with the optional
-/// fields present on some and absent on others.
+/// fields present on some and absent on others, and one for each reason a
+/// frame can be malformed.
 fn records_of_every_kind() -> Vec<MessageRecord> {
     let mut records = Vec::new();
     for direction in [Direction::Up, Direction::Down] {
@@ -330,6 +390,7 @@ fn records_of_every_kind() -> Vec<MessageRecord> {
             }
         }
     }
+    records.extend(malformed_records());
     records
 }
 
@@ -391,12 +452,24 @@ async fn every_record_arrives_exactly_once(qos: u8, expected_qos: QoS) {
         assert_eq!(publish.topic, expected_topic(record));
         assert_eq!(publish.qos, expected_qos);
         assert!(!publish.retain, "records must not be retained");
+        let payload: serde_json::Value = serde_json::from_slice(&publish.payload).unwrap();
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&publish.payload).unwrap(),
+            payload,
             serde_json::to_value(record).unwrap(),
             "payload of {}",
             record.id
         );
+        // The reason is the text of the record's own, and a malformed
+        // record carries no identifier.
+        match record.malformed {
+            Some(reason) => {
+                assert_eq!(payload["malformed"], reason.as_str(), "{}", record.id);
+                for key in ["dev_addr", "dev_eui", "join_eui", "fcnt", "fport"] {
+                    assert!(payload[key].is_null(), "{key} of {}", record.id);
+                }
+            }
+            None => assert!(payload["malformed"].is_null(), "{}", record.id),
+        }
     }
 
     assert_eq!(harness.published(), records.len() as u64);
@@ -434,6 +507,31 @@ async fn topic_template_from_the_configuration_is_used() {
     wait_until("two publishes", || broker.publish_count() >= 2).await;
     let topics: Vec<String> = broker.publishes().into_iter().map(|p| p.topic).collect();
     assert_eq!(topics, ["lora/Blocked/01ABCDEF", "lora/Forwarded/unknown"]);
+}
+
+#[tokio::test]
+async fn a_dev_addr_topic_renders_unknown_for_malformed_records() {
+    let broker = FakeBroker::start(Behaviour::HEALTHY).await;
+    let cfg = MqttConfig {
+        topic: "lora/{status}/{dev_addr}/{dev_eui}".to_string(),
+        ..broker.config(0)
+    };
+    let mut harness = Harness::start(&cfg);
+    harness.wait_connected().await;
+
+    // The bytes of the first read as DevAddr 6874FA22; that must not reach
+    // the topic.
+    let records = malformed_records();
+    for record in &records {
+        harness.emit(record.clone());
+    }
+
+    wait_until("three publishes", || {
+        broker.publish_count() >= records.len()
+    })
+    .await;
+    let topics: Vec<String> = broker.publishes().into_iter().map(|p| p.topic).collect();
+    assert_eq!(topics, ["lora/Forwarded/unknown/unknown"; 3]);
 }
 
 #[tokio::test]

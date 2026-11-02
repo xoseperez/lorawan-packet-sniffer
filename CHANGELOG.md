@@ -10,9 +10,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > **Upgrade note:** a WebUI or API reached by host name, rather than by IP
 > address or `localhost`, now needs that name in `allowed_hosts`. See
 > "Changed" below.
+>
+> **Upgrade note:** the first start after the upgrade checks every stored row
+> for malformed frames before it starts forwarding. On a large database this
+> takes a while and needs free disk space for SQLite's write-ahead log; the
+> README gives the time and the space measured on 1,000,000 rows.
 
 ### Added
 
+- **Malformed-frame detection.** A frame that cannot be valid LoRaWAN 1.0 or
+  1.1 is marked with the first reason that applies, in this order: `crc` (the
+  gateway reported a failed CRC), `mhdr` (the RFU or Major bits of the first
+  byte are not zero) or `length` (a JoinRequest that is not 23 bytes, a
+  JoinAccept that is not 17 or 33, a RejoinRequest that is not 19 or 24, a
+  data frame shorter than 12 bytes plus its FOptsLen). Proprietary frames
+  have no length rule. It works in both gateway protocols and both directions;
+  a source that reports no CRC is not marked for it. Forwarding is unchanged.
+  - Every record has a new `malformed` field in the database, `/api/messages`,
+    `/ws` and MQTT: `null` for a valid frame, otherwise `"crc"`, `"mhdr"` or
+    `"length"`.
+  - The WebUI hides malformed rows by default. A **Show malformed** checkbox
+    at the end of the Type menu, remembered by the browser, shows them dimmed
+    and marked, with the reason in the Device cell ("malformed: CRC failed",
+    "malformed: bad header", "malformed: wrong length") and in full on hover.
+    The status bar counts the malformed rows hidden or shown.
+  - The CSV export has a `malformed` column before `label`.
+  - The README has a "Malformed frames" section, including the gateway
+    settings that make gateways forward CRC-failed packets
+    (`forward_crc_error` in the Semtech packet forwarder, `disable_crc_filter`
+    in Concentratord).
+- **`tools/gwsim.py --malformed-ratio R`:** that fraction of the PUSH_DATA
+  datagrams also carries one malformed frame, taken in turn from a list of ten
+  that covers every reason. The fake identifiers those frames would carry if
+  trusted are printed at start, and the summaries count the frames by reason.
 - **Device labels.** Give a device a name from the WebUI, such as "Qingping
   T&H Havana" for `00E8A80B`. A label belongs to the identifier the Device
   column shows: the DevAddr on data frames, the DevEUI on join requests.
@@ -83,6 +113,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A malformed record has `null` in the twelve fields decoded from the frame
+  body:** `dev_addr`, `dev_eui`, `join_eui`, `dev_nonce`, `fcnt`, `fport`,
+  `adr`, `adr_ack_req`, `ack`, `class_b`, `f_pending` and `f_opts_len`. They
+  used to hold values read from noise, such as made-up DevAddrs. The type, the
+  size, the radio data, the status and the gateway are kept. A malformed frame
+  therefore no longer produces a made-up identifier for the device filter, the
+  list of identifiers seen live, device labels or an MQTT topic.
+- **A blocking rule with an `mtype` list no longer matches a malformed
+  frame.** The type of such a frame is only its first byte read as a header,
+  so a rule blocking JoinRequests blocked about one noise frame in eight, and
+  in Semtech UDP held back the valid frames in the same PUSH_DATA. Rules with
+  no `mtype` list (direction and gateway only) still match malformed frames,
+  and the whole-datagram policy is unchanged.
+- **Database schema 3, and the stored rows are checked on the first start.**
+  The upgrade adds a `malformed` column and a per-row flag, and keeps every
+  row. Before forwarding starts, the sniffer marks the stored rows with a
+  failed CRC (`crc`) or a length that does not fit their type (`length`) and
+  clears their body-derived fields; `mhdr` cannot be applied, because the
+  first byte is not stored. It logs how many rows it will check first. If the
+  check fails, the sniffer starts anyway and tries again at the next start.
+  Rows an older version records after a rollback are checked at the next
+  start of this version. Older versions keep working on the upgraded
+  database.
+- **`tools/gwsim.py`:** the fake LNS counter of datagrams that are not
+  Semtech UDP packets is now called "invalid datagrams" (it was "malformed",
+  which now means a frame). The fake LNS counts malformed frames by reason,
+  leaves them out of its type and identifier tallies, and never sends a
+  downlink to their DevAddr.
 - **New home: `github.com/xoseperez/lorawan-packet-sniffer`.** The Rust
   version now lives in the original project's repository, on `master`; the
   original version 1 is on the `v1` branch, with its full history and tags.
@@ -116,6 +174,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Noise got identifiers and header fields.** A JoinRequest was decoded
+  from 19 bytes up, although it is 23 bytes long, and a data frame from 8
+  bytes up, although the shortest is 12 bytes plus its FOptsLen, so short noise
+  got a DevEUI, JoinEUI or DevAddr. A JoinRequest is now decoded only at 23
+  bytes and a data frame only at 12 bytes plus FOptsLen; anything else is
+  marked malformed.
 - **The WebUI opened on its oldest rows.** With the table sorted newest
   first (the default), loading the history scrolled it to the end, so the
   page showed the oldest loaded messages until scrolled back up. It now opens

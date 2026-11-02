@@ -16,6 +16,7 @@ Version 2 is a rewrite in Rust. The original version 1 (v0.x releases) lives on 
 - **Listen mode** — no LNS needed: the sniffer records what any number of gateways send (optionally acknowledging them) and forwards nothing
 - **Rich message metadata** — every record carries the gateway EUI, plus JoinEUI and DevNonce on join requests and the FCtrl flags (ADR, ADRACKReq, ACK, ClassB / FPending) and FOptsLen on data frames
 - **Selective blocking** — block messages by MType, direction and, optionally, gateway; optional stealth mode (suppresses ACKs)
+- **Malformed-frame detection** — frames that cannot be valid LoRaWAN (CRC failed, bad header, wrong length) are marked with the reason, carry no made-up DevAddr or DevEUI, and are hidden in the WebUI until you ask for them; forwarding is never affected
 - **MQTT publishing** — optionally publish every captured message as JSON to an MQTT broker over TCP or TLS (including mutual TLS), with a configurable topic template
 - **Self-forwarding protection** — refuses to start with an upstream that is its own port, and cuts any packet loop that still happens at runtime
 - **Persistent storage** — SQLite database with configurable retention; databases from earlier versions are upgraded in place
@@ -362,13 +363,15 @@ Filter rules are evaluated in order; the first matching enabled rule wins. A pac
 | `name` | string | Human-readable label shown in logs and the WebUI |
 | `enabled` | bool | Toggle without removing the rule |
 | `direction` | `"up"` \| `"down"` \| `"both"` | Which direction to match |
-| `mtype` | string[] | LoRaWAN MTypes to match (empty = match all) |
+| `mtype` | string[] | LoRaWAN MTypes to match (empty = match all). A rule with a list never matches a [malformed frame](#malformed-frames) |
 | `suppress_ack` | bool | Also suppress protocol-level ACKs (stealth mode) |
 | `gateways` | string[] | Optional. Gateway EUIs the rule is limited to (empty or omitted = all gateways) |
 
 Valid MType values: `JoinRequest`, `JoinAccept`, `UnconfirmedDataUp`, `UnconfirmedDataDown`, `ConfirmedDataUp`, `ConfirmedDataDown`, `RejoinRequest`, `Proprietary`.
 
 A rule with a `gateways` list only matches messages received from, or addressed to, one of those gateways, so you can block traffic through one gateway and leave the others alone. EUIs are accepted with or without colons or dashes, in any case (`AA:BB:CC:DD:00:11:22:33`, `aabbccdd00112233`); an invalid EUI stops the sniffer at startup, naming the rule. A message whose gateway is unknown never matches a rule that lists gateways. Rules have no effect in UDP listen mode.
+
+A rule that lists `mtype` values never matches a [malformed frame](#malformed-frames), because the type of such a frame is only its first byte read as a header, which means nothing for noise. Rules without an `mtype` list (direction and gateway only) still match malformed frames.
 
 ## MQTT publishing
 
@@ -439,6 +442,92 @@ Concentratord runs on the gateway itself, so this mode always handles one gatewa
 
 When running in Docker, the sniffer container must share the host IPC namespace or a tmpfs volume with concentratord so the ZMQ IPC sockets are accessible. See the comments in `docker-compose.yml`.
 
+## Malformed frames
+
+Some gateways forward radio packets that are not LoRaWAN frames at all: noise the radio picked up, or packets whose CRC check failed. Decoded as if they were real, they appeared as every message type, with made-up DevAddrs, FCnts and DevEUIs, and cluttered the table and the device filter. The sniffer now recognises the frames that cannot be valid LoRaWAN 1.0 or 1.1, marks each one as **malformed** with the reason, and decodes nothing else from it. Forwarding does not change: every frame still reaches its destination byte for byte.
+
+### What counts as malformed
+
+A frame is malformed when any of these rules holds. The reason recorded is the first that applies, in this order:
+
+| Reason | Rule |
+|---|---|
+| `crc` | The gateway reported a failed CRC (`stat = -1` in Semtech UDP, `BAD_CRC` in Concentratord) |
+| `mhdr` | The MHDR (first byte) has non-zero RFU bits (4:2) or Major version bits (1:0). LoRaWAN 1.0 and 1.1 frames always have both at 0 |
+| `length` | The length does not fit the type: a JoinRequest is not 23 bytes, a JoinAccept is not 17 or 33, a RejoinRequest is not 19 or 24, or a data frame (confirmed or unconfirmed, up or down) is shorter than 12 bytes plus its FOptsLen |
+
+- **Proprietary frames** are exempt from the length rule only. A vendor frame whose first byte has non-zero RFU or Major bits is marked `mhdr` and hidden by default.
+- The rules apply in both directions. A malformed downlink from the LNS is marked too, although CRC only applies to what a gateway receives.
+- To classify a frame the sniffer reads the first byte and, for data frames of 6 bytes or more, the FOptsLen bits of FCtrl. Nothing else is decoded from a malformed frame.
+
+What is **not** malformed:
+
+- A frame whose CRC status is "no CRC". A source that does not report CRC must not have all its traffic hidden.
+- A frame with FOpts and FPort 0. It breaks the protocol, but real devices send it.
+- A valid frame received with a downlink type. The sniffer does not check the type against the direction.
+- A payload that cannot be read at all (empty, or invalid base64 in Semtech UDP). It has no first byte, so the `mhdr` and `length` rules cannot apply. It is recorded as type `Unknown`, marked `crc` if the gateway reported a failed CRC and left unmarked otherwise, and has no identifier either way.
+
+### What a malformed record holds
+
+Every record has a `malformed` field: `null` for a valid frame, otherwise `"crc"`, `"mhdr"` or `"length"`. A malformed record keeps the type (the first byte read as an MHDR, so for noise it means nothing), the size, the airtime, the status, the gateway and the radio data (frequency, data rate, RSSI, SNR, CRC status). The twelve fields decoded from the frame body are `null`:
+
+`dev_addr`, `dev_eui`, `join_eui`, `dev_nonce`, `fcnt`, `fport`, `adr`, `adr_ack_req`, `ack`, `class_b`, `f_pending` and `f_opts_len`.
+
+Malformed records are stored, sent on `/ws`, returned by `/api/messages` and published to MQTT like any other record. The CSV export has a `malformed` column (`crc`, `mhdr`, `length` or empty) before the `label` column. At DEBUG level, the log line of a malformed frame ends with `malformed=<reason>`.
+
+Because the identifiers are never produced, a malformed frame cannot put a made-up DevAddr or DevEUI in the device filter, in the list of identifiers seen live, in [device labels](#what-can-be-labelled) or in an MQTT topic.
+
+### Forwarding and blocking rules
+
+Forwarding and ACKs behave exactly as before for malformed frames, in both gateway protocols.
+
+The one change to [blocking rules](#blocking-rules): a rule with an `mtype` list never matches a malformed frame. Without this, a rule blocking JoinRequests would block about one noise frame in eight. Rules with no `mtype` list (direction and gateway only) still match malformed frames. In Semtech UDP, when a rule blocks one frame of a PUSH_DATA the whole datagram is held back; that is unchanged, but noise can no longer cause a type rule to hold back the valid frames that share its datagram.
+
+### In the WebUI
+
+- Malformed rows are **hidden by default**. A **Show malformed** checkbox at the end of the Type menu shows them. It is off by default and the browser remembers it, like the other filters.
+- Shown malformed rows are dimmed, and their type badge is dashed and struck through, with the hover text `Malformed: <reason>`. The Device cell, empty on these rows, says why in short words, so it can be read on a touch screen: `malformed: CRC failed`, `malformed: bad header` or `malformed: wrong length`. Hovering gives the full reason: "CRC check failed", "not a LoRaWAN 1.0/1.1 header" or "wrong length for a join request / join accept / rejoin request / data uplink / data downlink / frame".
+- The status bar shows **Malformed hidden: N** while the box is off and **Malformed shown: N** while it is on: how many malformed rows there are among the loaded rows that pass the other filters. Total and Blocked count every loaded row, malformed ones included.
+- The other filters (device, gateway, type, status, time) apply to malformed rows as well when they are shown, and the CSV export covers the rows shown.
+- Filtering is done in the browser, which loads the newest 500 records and keeps at most 10,000. Hidden malformed rows still take their place in those limits, so on a noisy gateway fewer useful rows are loaded than the numbers suggest.
+
+### MQTT consumers
+
+Malformed records are published like any other. A consumer that does not want noise should skip the messages whose payload has a non-null `malformed`. The `{dev_addr}` and `{dev_eui}` topic placeholders render `unknown`, as for any missing value. An `{mtype}` topic still carries the first-byte type of noise, so a subscriber to one type's topic can receive malformed frames of that type; check `malformed` in the payload.
+
+### Gateway settings that forward CRC-failed packets
+
+A gateway passes on packets that failed their CRC check only when it is set to. Whether to turn that off is up to you; the sniffer only marks them.
+
+- **Semtech packet forwarder:** in `gateway_conf` of `global_conf.json`, `forward_crc_error` makes the forwarder pass on packets with a bad CRC and `forward_crc_disabled` passes on packets sent without a CRC. Set them to `false` to stop forwarding them.
+- **ChirpStack Concentratord:** `disable_crc_filter` in the `[concentratord]` section of its configuration. The default `false` drops frames whose CRC failed. `true` lets them through, together with frames that have no CRC.
+
+### Existing databases: the first start after the upgrade
+
+The database goes to schema version 3 on the first start. The upgrade runs in place and keeps every row; it adds the `malformed` column and an internal flag that says whether a row has been checked.
+
+The sniffer then checks the rows already stored, **before it starts forwarding**, and marks those that are malformed:
+
+- It can apply two rules to stored rows: `crc`, from the stored CRC status, and `length`, from the stored type, size and FOptsLen. It clears the body-derived fields of the rows it marks. The `mhdr` rule cannot be applied, because the first byte is not stored. Rows written by 2.0.0 have no FOptsLen, so only the 12-byte minimum applies to their data frames.
+- **Time.** Every stored row is rewritten once, so the time grows with the database. For 1,000,000 rows (a 344 MB database) it took about 4 s on a development machine with NVMe storage. Slower storage, such as an SD card or eMMC, takes longer. Forwarding starts when the check is done.
+- **Free disk space.** SQLite's write-ahead log grows while the check runs. Keep at least as much free space as the database file takes (1.0× its size) on the disk that holds it. This figure comes from the peak log size measured on 1,000,000 rows (0.64× the database), plus 50 % headroom.
+- **Log.** Before the check starts the sniffer says how much it will do, so a long first start is not mistaken for a hang:
+
+  ```
+  Database schema upgraded from version 2 to 3
+  Checking every stored row for malformed frames (about N rows); forwarding starts when this is done
+  Checked N stored rows, M malformed, in T ms
+  ```
+
+  A new database logs "Database created at schema version 3" instead of the first line.
+- **If the check fails** (a full disk, for example), the sniffer logs `Could not check stored rows for malformed frames: <error>; will retry at the next start`, starts and forwards anyway, and tries again on the next start. Until one succeeds, old rows keep their made-up identifiers in the WebUI, the API and the label checks.
+- **If only the clean-up fails.** The check grows the write-ahead log and shrinks it again once it is saved. If the shrinking fails, the check stays done and is not repeated. The sniffer logs the warning `Checked the stored rows, but could not shrink the write-ahead log: <error>; it is removed when the sniffer next stops cleanly`, and the `-wal` file next to the database keeps its space until the sniffer next stops cleanly.
+- Rows this version stores are checked as they are recorded, so every later start, including one after a crash or a power cut, has nothing to check and adds no measurable delay.
+
+An identifier that appeared only in malformed rows has no stored record after the check. A label on it follows the normal [lifetime rule](#how-long-a-label-lives).
+
+**After a rollback.** An older version can run on an upgraded database; it ignores the new columns. The rows it records meanwhile are not marked as checked, so they keep their made-up identifiers and have no `malformed` value. The next start of this version finds exactly those rows, however the table changed in between (rows deleted, `VACUUM`, several rollbacks), checks them the same way and logs `Checking N stored rows recorded by an older version for malformed frames`. Rolling back is therefore a matter of reinstalling the previous binary.
+
 ## Device labels
 
 The WebUI shows a device only by its DevAddr (`00E8A80B`), or by its DevEUI on join requests. A label is a short name you attach to that identifier, such as "Qingping T&H Havana", so you do not have to remember which hex address belongs to which device. Labels are set from the WebUI and stored in the sniffer's database, so they survive restarts. They are not part of the captured records: `/api/messages`, the `/ws` feed and the MQTT payloads are unchanged, and nothing about labels touches forwarding.
@@ -450,7 +539,9 @@ A label belongs to the identifier the Device column shows:
 - the **DevAddr** on data frames, uplinks and downlinks alike (`00E8A80B`);
 - the **DevEUI** on join requests (`36:31:39:54:36:5D:05:39`).
 
-A record never has both. Rows with no identifier have an empty Label cell that cannot be edited: join accepts, rejoin requests, proprietary frames, and join or data frames too short to decode. A join accept is encrypted, so the sniffer cannot tell which DevEUI got which DevAddr, and it does not decode the DevEUI of rejoin requests.
+A record never has both. Rows with no identifier have an empty Label cell that cannot be edited: join accepts, rejoin requests, proprietary frames and [malformed frames](#malformed-frames), which include join and data frames too short to be valid. A join accept is encrypted, so the sniffer cannot tell which DevEUI got which DevAddr, and it does not decode the DevEUI of rejoin requests.
+
+A malformed frame has no identifier, so it never enters the list of identifiers seen live and never makes an identifier labellable: a `PUT` for the made-up DevAddr of a noise frame gets `404`.
 
 ### Editing a label
 
@@ -572,10 +663,11 @@ Every record returned by `/api/messages` and pushed on `/ws` carries these field
 | `class_b` | Uplink data frames | Boolean |
 | `f_pending` | Downlink data frames | Boolean |
 | `f_opts_len` | Data frames, both directions | Integer (0–15) |
+| `malformed` | All records | `null` for a valid frame, otherwise `"crc"`, `"mhdr"` or `"length"` (see [Malformed frames](#malformed-frames)) |
 
-FCtrl bit 4 is `class_b` on uplinks and `f_pending` on downlinks; flags that do not apply to a frame's direction or type are `null`, not `false`. The `status` field can now also be `Captured` (UDP listen mode, in addition to `Forwarded` and `Blocked`).
+FCtrl bit 4 is `class_b` on uplinks and `f_pending` on downlinks; flags that do not apply to a frame's direction or type are `null`, not `false`. On a malformed record, all twelve fields decoded from the frame body (`dev_addr`, `dev_eui`, `join_eui`, `dev_nonce`, `fcnt`, `fport`, the five flags and `f_opts_len`) are `null`. The `status` field can now also be `Captured` (UDP listen mode, in addition to `Forwarded` and `Blocked`).
 
-The WebUI has matching Gateway (last 8 hex digits, full EUI in the tooltip), JoinEUI, DevNonce, flags and FOptsLen columns in the column picker, a gateway filter, and the new fields in the CSV export.
+The WebUI has matching Gateway (last 8 hex digits, full EUI in the tooltip), JoinEUI, DevNonce, flags and FOptsLen columns in the column picker, a gateway filter, and the new fields in the CSV export (`malformed` is the column before `label`).
 
 ### Cross-origin access
 
@@ -676,6 +768,8 @@ These two `location` blocks replace the ones in set-up A's `server` block. Witho
 - In proxy mode all gateways are forwarded to the one configured LNS.
 - Listen mode never sends downlinks and cannot block anything.
 - FOpts MAC commands are not decoded; only their length is exported.
+- **Some noise stays visible.** The checks only catch frames that cannot be valid LoRaWAN. Non-LoRaWAN LoRa traffic with a good CRC, a first byte that reads as a valid header and a length that happens to fit looks like real traffic. The sniffer cannot check the MIC, which needs the session keys.
+- **Old rows have no `mhdr` reason.** The first byte is not stored, so when the stored rows are checked after the upgrade only `crc` and `length` can be applied.
 - **Label editing has no authentication.** Anyone who can open the WebUI can add, change and remove [device labels](#device-labels). The Host and Origin checks keep other web sites out, not other people. Restrict who can reach the port (bind to `127.0.0.1`, a firewall, a VPN, or a reverse proxy that asks for a login).
 
 ## Testing
@@ -688,7 +782,7 @@ The tests include loopback tests for multi-gateway routing, listen mode and the 
 
 Two helper scripts live in `tools/`:
 
-- `tools/gwsim.py` — a Semtech UDP simulator (Python 3, standard library only): N simulated gateways, each with separate push and pull sockets like a real packet forwarder, plus a fake LNS that sends ACKs and downlinks. Use it to try the sniffer without hardware or to run a 100-gateway load test; the usage examples are at the top of the file. `--joins N` makes each gateway also send a JoinRequest every N uplinks, from a fixed DevEUI per gateway that is printed at start, so there are DevEUI rows to label. `--random-devaddr` gives every data uplink a new random DevAddr, which fills the sniffer's list of identifiers seen live. The fake LNS counts the frames it receives by message type, so a run can show that the JoinRequests arrived.
+- `tools/gwsim.py` — a Semtech UDP simulator (Python 3, standard library only): N simulated gateways, each with separate push and pull sockets like a real packet forwarder, plus a fake LNS that sends ACKs and downlinks. Use it to try the sniffer without hardware or to run a 100-gateway load test; the usage examples are at the top of the file. `--joins N` makes each gateway also send a JoinRequest every N uplinks, from a fixed DevEUI per gateway that is printed at start, so there are DevEUI rows to label. `--random-devaddr` gives every data uplink a new random DevAddr, which fills the sniffer's list of identifiers seen live. The fake LNS counts the frames it receives by message type, so a run can show that the JoinRequests arrived. `--malformed-ratio R` (0 to 1, default 0) makes that fraction of the PUSH_DATA datagrams carry one more frame that breaks a LoRaWAN rule, taken in turn from a fixed list of ten that covers every reason, including one frame that breaks all three rules (counted as `crc`). The fake DevAddrs and DevEUI such frames would carry if they were trusted (`6874FA22`, `D47263A5`, `16D03003`, `16D03004`, `0BADADD0`, `16D03005` and `DE:AD:00:00:00:00:00:20`) are printed at start, so you can check that none of them shows up in a record or the device filter. The summaries count the frames by reason (`malformed crc / mhdr / length a / b / c`); the fake LNS keeps them out of its type and identifier tallies, never sends a downlink to their DevAddr, and reports the datagrams that are not Semtech UDP packets as `invalid datagrams` (it called them `malformed` before).
 - `tools/procstat.sh` — prints the peak and current memory (`VmHWM`, `VmRSS`) and the open file descriptors of a running process, for example `tools/procstat.sh "$(pidof lorawan-sniffer)" 10`.
 
 ## License

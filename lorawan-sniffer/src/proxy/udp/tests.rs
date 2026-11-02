@@ -26,16 +26,18 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use super::packet::{
-    build_tx_ack, gateway_eui, PROTOCOL_VERSION, PULL_ACK, PULL_DATA, PULL_RESP, PUSH_ACK,
-    PUSH_DATA, TX_ACK,
+    build_tx_ack, gateway_eui, RxPk, TxPk, PROTOCOL_VERSION, PULL_ACK, PULL_DATA, PULL_RESP,
+    PUSH_ACK, PUSH_DATA, TX_ACK,
 };
-use super::{run_with_socket, UdpProxy};
+use super::{build_downlink_record, build_uplink_record, run_with_socket, UdpProxy};
 use crate::config::{Configuration, MqttConfig, UdpConfig, UdpMode};
 use crate::core::eui::Eui64;
 use crate::core::filter::FilterRule;
-use crate::core::metadata::{Direction, MType, MessageRecord, Protocol, Status};
+use crate::core::metadata::{
+    assert_body_cleared, CrcStatus, Direction, MType, Malformed, MessageRecord, Protocol, Status,
+};
 use crate::core::ratelimit::DEFAULT_INTERVAL;
-use crate::proxy::Outputs;
+use crate::proxy::{Outputs, Verdict};
 
 /// Upper bound for anything that is supposed to happen.
 const WAIT: Duration = Duration::from_secs(5);
@@ -87,13 +89,22 @@ fn join_accept() -> Vec<u8> {
     frame
 }
 
-/// A PUSH_DATA datagram from `eui` carrying one `rxpk` per frame.
+/// A PUSH_DATA datagram from `eui` carrying one `rxpk` per frame, each with a
+/// passed CRC check.
 fn push_data(token: [u8; 2], eui: &Eui64, frames: &[Vec<u8>]) -> Vec<u8> {
+    let frames: Vec<(Vec<u8>, i8)> = frames.iter().map(|f| (f.clone(), 1)).collect();
+    push_data_with(token, eui, &frames)
+}
+
+/// Like [`push_data`], with the CRC status `stat` of each frame: 1 for a passed
+/// check, -1 for a failed one and 0 for none.
+fn push_data_with(token: [u8; 2], eui: &Eui64, frames: &[(Vec<u8>, i8)]) -> Vec<u8> {
     let rxpk: Vec<String> = frames
         .iter()
-        .map(|f| {
+        .map(|(f, stat)| {
             format!(
-                r#"{{"freq":868.1,"datr":"SF7BW125","codr":"4/5","rssi":-50,"lsnr":7.5,"stat":1,"size":{},"data":"{}"}}"#,
+                r#"{{"freq":868.1,"datr":"SF7BW125","codr":"4/5","rssi":-50,"lsnr":7.5,"stat":{},"size":{},"data":"{}"}}"#,
+                stat,
                 f.len(),
                 BASE64_STANDARD.encode(f)
             )
@@ -103,6 +114,47 @@ fn push_data(token: [u8; 2], eui: &Eui64, frames: &[Vec<u8>]) -> Vec<u8> {
     pkt.extend_from_slice(&eui.0);
     pkt.extend_from_slice(format!(r#"{{"rxpk":[{}]}}"#, rxpk.join(",")).as_bytes());
     pkt
+}
+
+/// Three frames as a gateway that forwards frames with a failed CRC delivers
+/// them: a one-byte "ConfirmedDataDown", a 22-byte "Proprietary" and a 238-byte
+/// "UnconfirmedDataUp" whose bytes read as DevAddr `6874FA22` and FPort 127.
+fn lns01_noise() -> Vec<Vec<u8>> {
+    let one_byte = vec![0xA0];
+
+    let mut proprietary = vec![0xE0];
+    proprietary.extend((1..22).map(|i| (i * 7) as u8));
+
+    let mut uplink = vec![0x40, 0x22, 0xFA, 0x74, 0x68, 0x00, 0x05, 0x00, 127];
+    uplink.resize(238, 0x5A);
+
+    vec![one_byte, proprietary, uplink]
+}
+
+/// One of every kind of uplink a noisy gateway delivers in a single PUSH_DATA,
+/// with the reason each one is expected to be recorded under: the noise (CRC
+/// failed), a valid frame with a reserved MHDR bit, a nine-byte data frame and
+/// a valid frame.
+fn mixed_uplinks() -> Vec<(Vec<u8>, i8, Option<Malformed>)> {
+    let mut frames: Vec<_> = lns01_noise()
+        .into_iter()
+        .map(|f| (f, -1, Some(Malformed::Crc)))
+        .collect();
+    let mut bad_mhdr = data_up(0x1001, 2);
+    bad_mhdr[0] |= 0x04;
+    frames.push((bad_mhdr, 1, Some(Malformed::Mhdr)));
+    frames.push((data_up(0x1001, 3)[..9].to_vec(), 1, Some(Malformed::Length)));
+    frames.push((data_up(0x1001, 4), 1, None));
+    frames
+}
+
+/// The PUSH_DATA datagram of [`mixed_uplinks`].
+fn mixed_push_data(token: [u8; 2], eui: &Eui64) -> Vec<u8> {
+    let frames: Vec<(Vec<u8>, i8)> = mixed_uplinks()
+        .into_iter()
+        .map(|(f, stat, _)| (f, stat))
+        .collect();
+    push_data_with(token, eui, &frames)
 }
 
 fn pull_data(token: [u8; 2], eui: &Eui64) -> Vec<u8> {
@@ -1105,6 +1157,381 @@ async fn listen_acks_on_and_off() {
     })
     .await
     .expect_err("a gateway got an answer although listen_acks is off");
+    sniffer.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Malformed frames
+// ---------------------------------------------------------------------------
+
+/// The EUI of the gateway `FakeGateway::new(1, ..)` plays.
+const GATEWAY_1: Eui64 = Eui64([0xAA, 0xBB, 0xCC, 0xDD, 0x00, 0x00, 0x00, 1]);
+
+/// A JoinAccept of 10 bytes; a real one has 17 or 33.
+fn short_join_accept() -> Vec<u8> {
+    let mut frame = vec![0x20];
+    frame.extend_from_slice(&[0x55; 9]);
+    frame
+}
+
+/// Noise that reads as a JoinRequest: a CRC-failed 20-byte frame starting with
+/// the JoinRequest MHDR.
+fn noise_reading_as_a_join_request() -> Vec<u8> {
+    let mut frame = vec![0x00];
+    frame.extend((1..20).map(|i| (i * 13) as u8));
+    frame
+}
+
+fn rxpk_of(frame: &[u8], stat: i8) -> RxPk {
+    RxPk {
+        freq: 868.1,
+        datr: "SF7BW125".to_string(),
+        codr: "4/5".to_string(),
+        rssi: Some(-50),
+        lsnr: Some(7.5),
+        stat,
+        size: frame.len() as u16,
+        data: BASE64_STANDARD.encode(frame),
+    }
+}
+
+fn txpk_of(frame: &[u8]) -> TxPk {
+    TxPk {
+        freq: 869.525,
+        datr: "SF9BW125".to_string(),
+        codr: "4/5".to_string(),
+        size: frame.len() as u16,
+        data: BASE64_STANDARD.encode(frame),
+    }
+}
+
+#[test]
+fn a_failed_crc_makes_the_uplink_record_malformed_and_clears_its_fields() {
+    // The bytes read as a data frame from DevAddr 6874FA22, which is what a
+    // failed CRC would otherwise have put in the table.
+    let frame = data_up(0x6874FA22, 5);
+    let (rec, verdict) = build_uplink_record(&rxpk_of(&frame, -1), GATEWAY_1, false, &[]);
+
+    assert_eq!(rec.malformed, Some(Malformed::Crc));
+    assert_body_cleared(&rec);
+
+    // What was measured about the reception stays.
+    assert_eq!(rec.direction, Direction::Up);
+    assert_eq!(rec.mtype, MType::UnconfirmedDataUp);
+    assert_eq!(rec.freq_mhz, 868.1);
+    assert_eq!(rec.datarate, "SF7BW125");
+    assert_eq!(rec.rssi, Some(-50));
+    assert_eq!(rec.snr, Some(7.5));
+    assert_eq!(rec.crc_status, Some(CrcStatus::Fail));
+    assert_eq!(rec.payload_size, 15);
+    assert!(rec.toa_ms.is_some_and(|t| t > 0.0), "{:?}", rec.toa_ms);
+    assert_eq!(rec.gateway_eui.as_deref(), Some("AA:BB:CC:DD:00:00:00:01"));
+    assert_eq!(rec.status, Status::Forwarded);
+    assert_eq!(verdict, Verdict::Forward);
+}
+
+#[test]
+fn an_uplink_without_a_failed_crc_keeps_its_fields() {
+    // The same bytes, with every other status a gateway can report.
+    let frame = data_up(0x6874FA22, 5);
+    for (stat, crc) in [
+        (1, Some(CrcStatus::Ok)),
+        (0, Some(CrcStatus::NoCrc)),
+        (7, None),
+    ] {
+        let (rec, verdict) = build_uplink_record(&rxpk_of(&frame, stat), GATEWAY_1, false, &[]);
+
+        assert_eq!(rec.malformed, None, "stat {stat}");
+        assert_eq!(rec.crc_status, crc, "stat {stat}");
+        assert_eq!(rec.dev_addr.as_deref(), Some("6874FA22"), "stat {stat}");
+        assert_eq!(rec.fcnt, Some(5), "stat {stat}");
+        assert_eq!(rec.fport, Some(1), "stat {stat}");
+        assert_eq!(rec.f_opts_len, Some(0), "stat {stat}");
+        assert_eq!(verdict, Verdict::Forward, "stat {stat}");
+    }
+}
+
+#[test]
+fn a_downlink_of_the_wrong_length_is_a_malformed_record() {
+    let frame = short_join_accept();
+    let (rec, verdict) = build_downlink_record(&txpk_of(&frame), GATEWAY_1, &[]);
+
+    assert_eq!(rec.malformed, Some(Malformed::Length));
+    assert_body_cleared(&rec);
+    assert_eq!(rec.direction, Direction::Down);
+    assert_eq!(rec.mtype, MType::JoinAccept);
+    // A downlink has no CRC to report.
+    assert_eq!(rec.crc_status, None);
+    assert_eq!(rec.payload_size, 10);
+    assert_eq!(rec.freq_mhz, 869.525);
+    assert_eq!(rec.datarate, "SF9BW125");
+    assert_eq!(rec.gateway_eui.as_deref(), Some("AA:BB:CC:DD:00:00:00:01"));
+    assert_eq!(rec.status, Status::Forwarded);
+    assert_eq!(verdict, Verdict::Forward);
+}
+
+#[tokio::test]
+async fn malformed_frames_are_forwarded_byte_for_byte() {
+    let mut lns = FakeLns::new().await;
+    let mut sniffer = Sniffer::proxy(&lns).await;
+    let gw = sniffer.gateway(1).await;
+    assert_eq!(gw.eui, GATEWAY_1);
+
+    // Noise, a bad header, a short frame and a valid frame in one PUSH_DATA
+    // reach the LNS as they were sent, and its answer reaches the gateway.
+    let uplink = mixed_push_data([1, 1], &gw.eui);
+    gw.send_push(&uplink).await;
+    assert_eq!(lns.recv().await.datagram, uplink);
+    lns.reply(&gw.eui, &push_ack([1, 1])).await;
+    assert_eq!(gw.recv_push().await, push_ack([1, 1]));
+
+    // A malformed downlink reaches the gateway as it was sent, and the
+    // gateway's TX_ACK reaches the LNS.
+    gw.send_pull(&pull_data([2, 2], &gw.eui)).await;
+    assert_eq!(lns.recv().await.kind(), PULL_DATA);
+    let downlink = pull_resp([3, 3], &short_join_accept());
+    lns.reply(&gw.eui, &downlink).await;
+    assert_eq!(gw.recv_pull().await, downlink);
+    let confirmation = tx_ack([3, 3], &gw.eui);
+    gw.send_pull(&confirmation).await;
+    assert_eq!(lns.recv().await.datagram, confirmation);
+
+    let expected = mixed_uplinks();
+    let records = sniffer.records(expected.len() + 1).await;
+    for (record, (_, _, reason)) in records.iter().zip(&expected) {
+        assert_eq!(record.direction, Direction::Up);
+        assert_eq!(record.status, Status::Forwarded);
+        assert_eq!(record.blocked_by, None);
+        assert_eq!(record.malformed, *reason);
+        match reason {
+            Some(_) => assert_body_cleared(record),
+            None => assert_eq!(record.dev_addr.as_deref(), Some("00001001")),
+        }
+        // The noise's fake DevAddr is in no record.
+        assert_ne!(record.dev_addr.as_deref(), Some("6874FA22"));
+    }
+    let record = records.last().unwrap();
+    assert_eq!(record.direction, Direction::Down);
+    assert_eq!(record.status, Status::Forwarded);
+    assert_eq!(record.malformed, Some(Malformed::Length));
+    assert_body_cleared(record);
+
+    gw.assert_quiet().await;
+    lns.assert_quiet().await;
+    sniffer.stop().await;
+}
+
+/// A rule listing no types that blocks everything coming from gateway 1.
+fn block_gateway_1() -> FilterRule {
+    rule("only-g1", None, vec![], false, vec![GATEWAY_1])
+}
+
+/// A rule listing no types that blocks every uplink.
+fn block_uplinks() -> FilterRule {
+    rule("all-up", Some(Direction::Up), vec![], false, vec![])
+}
+
+#[tokio::test]
+async fn type_rules_do_not_match_malformed_frames() {
+    // CRC-failed noise whose first byte reads as an UnconfirmedDataUp.
+    let noise = lns01_noise().pop().unwrap();
+    assert_eq!(noise[0], 0x40);
+    let no_unconfirmed = rule(
+        "no-unconfirmed",
+        Some(Direction::Up),
+        vec![MType::UnconfirmedDataUp],
+        false,
+        vec![],
+    );
+
+    // A rule on the type it reads as lets the noise through untouched, and
+    // the LNS's own PUSH_ACK reaches the gateway.
+    let mut lns = FakeLns::new().await;
+    let mut sniffer = Sniffer::start(
+        UdpConfig::default(),
+        Upstream::Lns(lns.addr()),
+        vec![no_unconfirmed],
+    )
+    .await;
+    let gw = sniffer.gateway(1).await;
+    let datagram = push_data_with([1, 1], &gw.eui, &[(noise.clone(), -1)]);
+    gw.send_push(&datagram).await;
+    assert_eq!(lns.recv().await.datagram, datagram);
+    lns.reply(&gw.eui, &push_ack([1, 1])).await;
+    assert_eq!(gw.recv_push().await, push_ack([1, 1]));
+    let record = sniffer.record().await;
+    assert_eq!(record.status, Status::Forwarded);
+    assert_eq!(record.blocked_by, None);
+    assert_eq!(record.malformed, Some(Malformed::Crc));
+    assert_eq!(record.mtype, MType::UnconfirmedDataUp);
+
+    // The rule does work on a valid frame of that type: it is held back and
+    // the gateway gets the proxy's own PUSH_ACK.
+    gw.send_push(&push_data([2, 2], &gw.eui, &[data_up(0x1001, 1)]))
+        .await;
+    assert_eq!(gw.recv_push().await, push_ack([2, 2]));
+    lns.assert_quiet().await;
+    let record = sniffer.record().await;
+    assert_eq!(record.status, Status::Blocked);
+    assert_eq!(record.blocked_by.as_deref(), Some("no-unconfirmed"));
+    sniffer.stop().await;
+
+    // A rule on the type a malformed downlink reads as lets it through, too.
+    let no_accepts = rule(
+        "no-accepts",
+        Some(Direction::Down),
+        vec![MType::JoinAccept],
+        false,
+        vec![],
+    );
+    let mut lns = FakeLns::new().await;
+    let mut sniffer = Sniffer::start(
+        UdpConfig::default(),
+        Upstream::Lns(lns.addr()),
+        vec![no_accepts],
+    )
+    .await;
+    let gw = sniffer.gateway(1).await;
+    gw.send_pull(&pull_data([3, 3], &gw.eui)).await;
+    lns.recv().await;
+    let downlink = pull_resp([4, 4], &short_join_accept());
+    lns.reply(&gw.eui, &downlink).await;
+    assert_eq!(gw.recv_pull().await, downlink);
+    let record = sniffer.record().await;
+    assert_eq!(record.status, Status::Forwarded);
+    assert_eq!(record.malformed, Some(Malformed::Length));
+    // A valid JoinAccept is blocked, and the LNS is told so.
+    lns.reply(&gw.eui, &pull_resp([5, 5], &join_accept())).await;
+    assert_eq!(lns.recv().await.datagram, build_tx_ack([5, 5], &gw.eui));
+    gw.assert_quiet().await;
+    assert_eq!(sniffer.record().await.status, Status::Blocked);
+    sniffer.stop().await;
+
+    // Rules that name no type still match the noise: the frame is held back
+    // and the proxy answers the gateway itself.
+    for blocking in [block_uplinks(), block_gateway_1()] {
+        let name = blocking.name.clone();
+        let lns = FakeLns::new().await;
+        let mut sniffer = Sniffer::start(
+            UdpConfig::default(),
+            Upstream::Lns(lns.addr()),
+            vec![blocking],
+        )
+        .await;
+        let gw = sniffer.gateway(1).await;
+        gw.send_push(&push_data_with([6, 6], &gw.eui, &[(noise.clone(), -1)]))
+            .await;
+        assert_eq!(gw.recv_push().await, push_ack([6, 6]), "{name}");
+        lns.assert_quiet().await;
+        let record = sniffer.record().await;
+        assert_eq!(record.status, Status::Blocked, "{name}");
+        assert_eq!(record.blocked_by.as_deref(), Some(name.as_str()));
+        assert_eq!(record.malformed, Some(Malformed::Crc), "{name}");
+        sniffer.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_frame_does_not_hold_back_its_datagram() {
+    let noise = noise_reading_as_a_join_request();
+    let valid = data_up(0x1001, 1);
+    let mixed = |token: [u8; 2], eui: &Eui64| {
+        push_data_with(token, eui, &[(noise.clone(), -1), (valid.clone(), 1)])
+    };
+
+    // Under a rule on JoinRequests, noise that reads as one does not stop
+    // the valid frame next to it: the datagram reaches the LNS as sent and
+    // the LNS answers it.
+    let mut lns = FakeLns::new().await;
+    let mut sniffer = Sniffer::start(
+        UdpConfig::default(),
+        Upstream::Lns(lns.addr()),
+        vec![block_joins()],
+    )
+    .await;
+    let gw = sniffer.gateway(1).await;
+    let datagram = mixed([1, 1], &gw.eui);
+    gw.send_push(&datagram).await;
+    assert_eq!(lns.recv().await.datagram, datagram);
+    lns.reply(&gw.eui, &push_ack([1, 1])).await;
+    assert_eq!(gw.recv_push().await, push_ack([1, 1]));
+    let records = sniffer.records(2).await;
+    for record in &records {
+        assert_eq!(record.status, Status::Forwarded);
+        assert_eq!(record.blocked_by, None);
+    }
+    assert_eq!(records[0].mtype, MType::JoinRequest);
+    assert_eq!(records[0].malformed, Some(Malformed::Crc));
+    assert_eq!(records[1].malformed, None);
+    assert_eq!(records[1].dev_addr.as_deref(), Some("00001001"));
+
+    // Control: a valid JoinRequest next to a valid frame holds the whole
+    // datagram back, and the proxy answers the gateway itself.  The valid
+    // frame's own record says it was forwarded.
+    gw.send_push(&push_data(
+        [2, 2],
+        &gw.eui,
+        &[join_request(1), valid.clone()],
+    ))
+    .await;
+    assert_eq!(gw.recv_push().await, push_ack([2, 2]));
+    lns.assert_quiet().await;
+    let records = sniffer.records(2).await;
+    assert_eq!(records[0].status, Status::Blocked);
+    assert_eq!(records[0].blocked_by.as_deref(), Some("no-joins"));
+    assert_eq!(records[1].status, Status::Forwarded);
+    assert_eq!(records[1].blocked_by, None);
+    sniffer.stop().await;
+
+    // Controls: rules that name no type match the noise, so they still hold
+    // back the whole datagram, and both frames are recorded as blocked.
+    for blocking in [block_uplinks(), block_gateway_1()] {
+        let name = blocking.name.clone();
+        let lns = FakeLns::new().await;
+        let mut sniffer = Sniffer::start(
+            UdpConfig::default(),
+            Upstream::Lns(lns.addr()),
+            vec![blocking],
+        )
+        .await;
+        let gw = sniffer.gateway(1).await;
+        gw.send_push(&mixed([3, 3], &gw.eui)).await;
+        assert_eq!(gw.recv_push().await, push_ack([3, 3]), "{name}");
+        lns.assert_quiet().await;
+        let records = sniffer.records(2).await;
+        for record in &records {
+            assert_eq!(record.status, Status::Blocked, "{name}");
+            assert_eq!(record.blocked_by.as_deref(), Some(name.as_str()));
+        }
+        assert_eq!(records[0].malformed, Some(Malformed::Crc), "{name}");
+        sniffer.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn listen_mode_captures_malformed_frames() {
+    let mut sniffer = Sniffer::start(listen_config(true), Upstream::None, vec![]).await;
+    let gw = sniffer.gateway(1).await;
+
+    gw.send_pull(&pull_data([1, 1], &gw.eui)).await;
+    gw.send_push(&mixed_push_data([1, 2], &gw.eui)).await;
+
+    // The listen ACKs are the same as for any other traffic.
+    assert_eq!(gw.recv_push().await, push_ack([1, 2]));
+    assert_eq!(gw.recv_pull().await, pull_ack([1, 1]));
+
+    let expected = mixed_uplinks();
+    let records = sniffer.records(expected.len()).await;
+    for (record, (_, _, reason)) in records.iter().zip(&expected) {
+        assert_eq!(record.status, Status::Captured);
+        assert_eq!(record.blocked_by, None);
+        assert_eq!(record.malformed, *reason);
+        if reason.is_some() {
+            assert_body_cleared(record);
+        }
+    }
+    gw.assert_quiet().await;
+    sniffer.assert_no_record().await;
     sniffer.stop().await;
 }
 

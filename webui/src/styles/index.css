@@ -11,6 +11,7 @@
   --header-bg:    #f4f4f4;
   --blocked-bg:   rgba(220, 38, 38, 0.08);
   --blocked-border: #dc2626;
+  --malformed-border: #9ca3af;
   --signal-good:  #16a34a;
   --signal-fair:  #d97706;
   --signal-poor:  #dc2626;
@@ -56,6 +57,7 @@
     --header-bg:    #1c1c1c;
     --blocked-bg:   rgba(239, 68, 68, 0.11);
     --blocked-border: #ef4444;
+    --malformed-border: #6b7280;
     --signal-good:  #4ade80;
     --signal-fair:  #fbbf24;
     --signal-poor:  #f87171;
@@ -248,6 +250,16 @@ details summary:focus-visible {
 .filter-mtype-list label:hover { background: var(--bg-hover); }
 .filter-mtype-list input[type="checkbox"] { cursor: pointer; margin: 0; }
 
+/* "Show malformed" closes the list, set apart from the types. Its row is the
+   36 px touchscreen target of docs/MOBILE.md; the type rows above keep their
+   smaller padding. */
+.filter-mtype-list .filter-malformed {
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  padding: 10px 14px;
+  min-height: 36px;
+}
+
 /* ─────────────────────────────────────────────────────────
    Column picker
 ───────────────────────────────────────────────────────── */
@@ -342,6 +354,10 @@ tr:hover td { background: var(--bg-hover) !important; }
 .row-blocked td:first-child    { box-shadow: inset 3px 0 0 var(--blocked-border); }
 .row-blocked:hover td          { filter: brightness(0.94); }
 
+/* Malformed row — dimmed in both themes. A row that is also blocked keeps its
+   red tint, dimmed with the rest. */
+.row-malformed td              { opacity: 0.6; }
+
 .mono { font-family: var(--font-mono); }
 
 /* ─── Direction ─── */
@@ -362,6 +378,36 @@ tr:hover td { background: var(--bg-hover) !important; }
 .mtype-up    { background: var(--mtype-up-bg);    color: var(--mtype-up-fg);    }
 .mtype-down  { background: var(--mtype-down-bg);  color: var(--mtype-down-fg);  }
 .mtype-other { background: var(--mtype-other-bg); color: var(--mtype-other-fg); }
+
+/* The type of a malformed frame is its first byte read as a header, which for
+   noise means nothing: no type colour, and the abbreviation struck through.
+   The 1 px border takes the place of the 1 px of vertical padding and 4 px of
+   the 5 px of side padding, so the badge keeps the size of the others and the
+   row does not grow. */
+.mtype-malformed {
+  padding: 0 4px;
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px dashed var(--malformed-border);
+  text-decoration: line-through;
+}
+
+/* The reason in the Device cell, in the UI font as it is words, not hex. The
+   column is as wide as a DevAddr, much narrower than "malformed: wrong length",
+   and widening it would squeeze the other columns of every row. The text wraps
+   instead, so a malformed row is two lines high and the reason is readable
+   without hover. */
+.malformed-tag {
+  color: var(--text-muted);
+  font-style: italic;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  line-height: 1.2;
+  white-space: normal;
+  /* A block, so the line height is the tag's own and not that of the cell's
+     monospace text, which would make each of the two lines taller. */
+  display: block;
+}
 
 /* ─── Status dot ─── */
 .status-dot {
@@ -585,6 +631,13 @@ td.col-label { padding: 0; }
   font-size: 11px;
   color: var(--text-muted);
   opacity: 0.6;
+  /* The one item that gives way when the counts are large (four counts at
+     10,000 do not fit in 800 px next to the full line), so the Live toggle is
+     never pushed off the screen. The other items cannot shrink below their
+     text. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* WebSocket indicator */

@@ -711,9 +711,11 @@ mod tests {
 
     use super::labels::Gate;
     use super::*;
+    use crate::core::decoder;
     use crate::core::labels::MAX_LABELS;
-    use crate::core::metadata::{CrcStatus, Direction, MType, Protocol, Status};
+    use crate::core::metadata::{CrcStatus, Direction, MType, Malformed, Protocol, Status};
     use crate::core::seen::SeenDevices;
+    use crate::proxy::frame_fields;
 
     /// The WebUI footer shows the version from `webui/package.json`, which is
     /// written by hand next to the crate's.  If they drift apart, the page
@@ -923,7 +925,7 @@ mod tests {
         "toa_ms",
     ];
 
-    const NEW_KEYS: [&str; 9] = [
+    const NEW_KEYS: [&str; 10] = [
         "gateway_eui",
         "join_eui",
         "dev_nonce",
@@ -933,6 +935,7 @@ mod tests {
         "class_b",
         "f_pending",
         "f_opts_len",
+        "malformed",
     ];
 
     fn expected_keys() -> BTreeSet<String> {
@@ -977,7 +980,104 @@ mod tests {
             class_b: Some(false),
             f_pending: None,
             f_opts_len: Some(5),
+            malformed: None,
         }
+    }
+
+    /// The DevAddr that [`frame_of_noise_dev_addr`] reads as.
+    pub(super) const NOISE_DEV_ADDR: &str = "6874FA22";
+
+    /// A 15-byte UnconfirmedDataUp frame whose bytes read as DevAddr
+    /// `6874FA22`: the kind of fake identifier a frame with a failed CRC used
+    /// to put in the table.
+    pub(super) fn frame_of_noise_dev_addr() -> Vec<u8> {
+        let mut frame = vec![0x40, 0x22, 0xFA, 0x74, 0x68]; // MHDR, DevAddr
+        frame.push(0x00); // FCtrl
+        frame.extend_from_slice(&[0x05, 0x00]); // FCnt
+        frame.push(0x01); // FPort
+        frame.extend_from_slice(&[0x11, 0x22]); // FRMPayload
+        frame.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // MIC
+        frame
+    }
+
+    /// The record a proxy builds for `frame` received with CRC status `crc`:
+    /// the fields come from the decoder, as they do in the backends.
+    pub(super) fn record_from_frame(frame: &[u8], crc: CrcStatus) -> MessageRecord {
+        let crc = Some(crc);
+        let fields = frame_fields(
+            decoder::decode_phy_bytes(frame, crc.as_ref()),
+            frame.len() as u16,
+            crc.as_ref(),
+        );
+        MessageRecord {
+            id: MessageRecord::new_id(),
+            crc_status: crc,
+            mtype: fields.mtype,
+            dev_addr: fields.dev_addr,
+            dev_eui: fields.dev_eui,
+            join_eui: fields.join_eui,
+            dev_nonce: fields.dev_nonce,
+            fcnt: fields.fcnt,
+            fport: fields.fport,
+            payload_size: fields.payload_size,
+            adr: fields.fctrl.map(|c| c.adr),
+            adr_ack_req: fields.fctrl.and_then(|c| c.adr_ack_req),
+            ack: fields.fctrl.map(|c| c.ack),
+            class_b: fields.fctrl.and_then(|c| c.class_b),
+            f_pending: fields.fctrl.and_then(|c| c.f_pending),
+            f_opts_len: fields.fctrl.map(|c| c.f_opts_len),
+            malformed: fields.malformed,
+            ..record_with_new_fields()
+        }
+    }
+
+    /// One record for each reason, built from frames carrying DevAddr
+    /// `6874FA22` that the decoder rejects: a failed CRC, a reserved MHDR bit
+    /// and a frame too short for its type.
+    fn malformed_records() -> Vec<(Malformed, MessageRecord)> {
+        let frame = frame_of_noise_dev_addr();
+        let mut bad_mhdr = frame.clone();
+        bad_mhdr[0] |= 0x04;
+        let records = vec![
+            (Malformed::Crc, record_from_frame(&frame, CrcStatus::Fail)),
+            (Malformed::Mhdr, record_from_frame(&bad_mhdr, CrcStatus::Ok)),
+            (
+                Malformed::Length,
+                record_from_frame(&frame[..9], CrcStatus::Ok),
+            ),
+        ];
+        for (reason, record) in &records {
+            assert_eq!(record.malformed, Some(*reason), "the decoder's verdict");
+        }
+        records
+    }
+
+    /// Every field the frame body would have filled is `null` in the JSON of a
+    /// malformed record, and the reason is its text.
+    fn assert_malformed_json(data: &Value, reason: Malformed, record: &MessageRecord) {
+        assert_eq!(keys_of(data), expected_keys());
+        assert_eq!(data["malformed"], json!(reason.as_str()));
+        for key in [
+            "dev_addr",
+            "dev_eui",
+            "join_eui",
+            "dev_nonce",
+            "fcnt",
+            "fport",
+            "adr",
+            "adr_ack_req",
+            "ack",
+            "class_b",
+            "f_pending",
+            "f_opts_len",
+        ] {
+            assert_eq!(data[key], Value::Null, "{key}");
+        }
+        // What was measured about the reception stays.
+        assert_eq!(data["mtype"], json!("UnconfirmedDataUp"));
+        assert_eq!(data["freq_mhz"], json!(868.1));
+        assert_eq!(data["rssi"], json!(-55));
+        assert_eq!(data["payload_size"], json!(record.payload_size));
     }
 
     /// Assert the new fields of a serialized record match
@@ -992,6 +1092,8 @@ mod tests {
         assert_eq!(data["class_b"], json!(false));
         assert_eq!(data["f_pending"], Value::Null);
         assert_eq!(data["f_opts_len"], json!(5));
+        // A valid record has no reason.
+        assert_eq!(data["malformed"], Value::Null);
         // Existing fields are unchanged.
         assert_eq!(data["status"], json!("Captured"));
         assert_eq!(data["direction"], json!("up"));
@@ -1074,6 +1176,43 @@ mod tests {
         assert_eq!(envelope["type"], json!("message"));
         assert_eq!(keys_of(&envelope["data"]), expected_keys());
         assert_new_field_values(&envelope["data"]);
+    }
+
+    #[tokio::test]
+    async fn messages_endpoint_returns_the_reason_of_a_malformed_record_and_no_identifiers() {
+        let rig = Setup::new().build();
+        let records = malformed_records();
+        for (_, record) in &records {
+            rig.storage.insert(record).unwrap();
+        }
+        let app = rig.app();
+
+        let reply = send(&app, "GET", "/api/messages", &[], None).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let rows = reply.json();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), records.len());
+        for (reason, record) in &records {
+            let row = rows
+                .iter()
+                .find(|r| r["id"] == json!(record.id))
+                .unwrap_or_else(|| panic!("no row for {reason:?}"));
+            assert_malformed_json(row, *reason, record);
+        }
+        // The fake identifier is nowhere in the response.
+        assert!(!reply.text().contains(NOISE_DEV_ADDR), "{}", reply.text());
+    }
+
+    #[test]
+    fn ws_envelope_carries_the_reason_of_a_malformed_record_and_no_identifiers() {
+        for (reason, record) in malformed_records() {
+            let json = make_ws_json(&record).unwrap();
+            let envelope: Value = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(envelope["type"], json!("message"));
+            assert_malformed_json(&envelope["data"], reason, &record);
+            assert!(!json.contains(NOISE_DEV_ADDR), "{json}");
+        }
     }
 
     // -- cross-origin access ------------------------------------------------

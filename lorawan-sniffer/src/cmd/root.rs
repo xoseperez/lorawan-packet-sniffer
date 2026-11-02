@@ -1027,12 +1027,111 @@ mod tests {
             class_b: None,
             f_pending: None,
             f_opts_len: None,
+            malformed: None,
         };
         let seen = SeenDevices::new();
 
         note_sighting(&seen, &api::make_ws_json(&record).unwrap());
 
         assert!(seen.seen_within("01ABCDEF", RETENTION));
+    }
+
+    /// A 15-byte UnconfirmedDataUp frame whose bytes read as DevAddr
+    /// `6874FA22`: the kind of fake identifier a frame with a failed CRC used
+    /// to put in the table.
+    fn frame_of_noise_dev_addr() -> Vec<u8> {
+        let mut frame = vec![0x40, 0x22, 0xFA, 0x74, 0x68]; // MHDR, DevAddr
+        frame.push(0x00); // FCtrl
+        frame.extend_from_slice(&[0x05, 0x00]); // FCnt
+        frame.push(0x01); // FPort
+        frame.extend_from_slice(&[0x11, 0x22]); // FRMPayload
+        frame.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // MIC
+        frame
+    }
+
+    /// A valid 23-byte JoinRequest.
+    fn join_request_frame() -> Vec<u8> {
+        let mut frame = vec![0x00];
+        frame.extend_from_slice(&[0x01, 0, 0, 0, 0, 0, 0, 0]); // JoinEUI
+        frame.extend_from_slice(&[0x08, 7, 6, 5, 4, 3, 2, 1]); // DevEUI
+        frame.extend_from_slice(&[0x34, 0x12]); // DevNonce
+        frame.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // MIC
+        frame
+    }
+
+    /// The record envelope the proxy broadcasts for `frame` received with CRC
+    /// status `crc`: the fields come from the decoder, as they do in the
+    /// backends.
+    fn envelope_of_frame(frame: &[u8], crc: crate::core::metadata::CrcStatus) -> String {
+        use crate::core::metadata::{Direction, Protocol, Status};
+
+        let crc = Some(crc);
+        let fields = crate::proxy::frame_fields(
+            crate::core::decoder::decode_phy_bytes(frame, crc.as_ref()),
+            frame.len() as u16,
+            crc.as_ref(),
+        );
+        let record = MessageRecord {
+            id: MessageRecord::new_id(),
+            timestamp: Utc::now(),
+            direction: Direction::Up,
+            status: Status::Forwarded,
+            blocked_by: None,
+            source_protocol: Protocol::Udp,
+            freq_mhz: 868.1,
+            datarate: "SF7BW125".to_string(),
+            rssi: Some(-50),
+            snr: Some(7.5),
+            crc_status: crc,
+            mtype: fields.mtype,
+            dev_addr: fields.dev_addr,
+            dev_eui: fields.dev_eui,
+            fcnt: fields.fcnt,
+            fport: fields.fport,
+            payload_size: fields.payload_size,
+            toa_ms: None,
+            gateway_eui: None,
+            join_eui: fields.join_eui,
+            dev_nonce: fields.dev_nonce,
+            adr: fields.fctrl.map(|c| c.adr),
+            adr_ack_req: fields.fctrl.and_then(|c| c.adr_ack_req),
+            ack: fields.fctrl.map(|c| c.ack),
+            class_b: fields.fctrl.and_then(|c| c.class_b),
+            f_pending: fields.fctrl.and_then(|c| c.f_pending),
+            f_opts_len: fields.fctrl.map(|c| c.f_opts_len),
+            malformed: fields.malformed,
+        };
+        api::make_ws_json(&record).unwrap().to_string()
+    }
+
+    #[test]
+    fn malformed_frames_note_no_identifier() {
+        use crate::core::metadata::CrcStatus;
+
+        let data = frame_of_noise_dev_addr();
+        let join = join_request_frame();
+        let mut bad_mhdr = data.clone();
+        bad_mhdr[0] |= 0x04;
+
+        // One frame for each reason, all of which would have been noted as a
+        // device if their bytes had been taken at face value.
+        let seen = SeenDevices::new();
+        for envelope in [
+            envelope_of_frame(&data, CrcStatus::Fail),
+            envelope_of_frame(&bad_mhdr, CrcStatus::Ok),
+            envelope_of_frame(&data[..9], CrcStatus::Ok),
+            envelope_of_frame(&join[..20], CrcStatus::Ok),
+        ] {
+            assert!(envelope.contains(r#""malformed":""#), "{envelope}");
+            note_sighting(&seen, &envelope);
+        }
+        assert_eq!(seen.len(), 0);
+
+        // Control: the same bytes, valid, are the devices they look like.
+        note_sighting(&seen, &envelope_of_frame(&data, CrcStatus::Ok));
+        note_sighting(&seen, &envelope_of_frame(&join, CrcStatus::Ok));
+        assert_eq!(seen.len(), 2);
+        assert!(seen.seen_within("6874FA22", RETENTION));
     }
 
     #[tokio::test]

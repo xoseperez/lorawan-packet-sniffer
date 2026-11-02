@@ -71,7 +71,7 @@ Gateway ──UDP/ZMQ──▶  Sniffer proxy  ──UDP/ZMQ──▶  LNS / Gat
 ### Data flow
 
 1. A proxy backend (`proxy/udp.rs` or `proxy/concentratord.rs`) receives raw packets.
-2. Each packet is decoded by `core::decoder` into a `DecodedFrame` (MType, DevAddr/DevEUI, FCnt, FPort).
+2. Each packet is decoded by `core::decoder` into a `DecodedFrame` (MType, DevAddr/DevEUI, FCnt, FPort). The decoder also takes the gateway's CRC status and classifies the frame: CRC failed (`crc`), then reserved or Major MHDR bits (`mhdr`), then a length that does not fit the type (`length`). A malformed frame comes back with only its type, size and reason, so no fake identifier or header field exists downstream; the backends' record builders just copy the fields. Type rules see no type for a malformed frame (`filter::evaluate` gets `None`).
 3. `core::filter::evaluate()` checks compiled `FilterRule`s — first match wins; no match = forward.
 4. Results are assembled into a `MessageRecord` (the canonical cross-protocol representation defined in `core::metadata`).
 5. The record is sent to two async channels: `mpsc` → `Storage` (SQLite persistence) and `broadcast` → all connected WebSocket clients.
@@ -85,11 +85,11 @@ Gateway ──UDP/ZMQ──▶  Sniffer proxy  ──UDP/ZMQ──▶  LNS / Gat
 
 ### Key types (`core/`)
 
-- `MessageRecord` — the normalized struct stored, broadcast, and returned by the REST API.
+- `MessageRecord` — the normalized struct stored, broadcast, and returned by the REST API. Its `malformed: Option<Malformed>` (`crc` | `mhdr` | `length`) is `None` for a valid frame; on a malformed one the twelve body-derived fields are `None`.
 - `MType` — LoRaWAN message type decoded from MHDR bits [7:5].
 - `FilterRule` / `FilterDecision` — compiled filter rule and its evaluation result.
 - `Storage` — thin `Clone`able wrapper around an `Arc<Mutex<rusqlite::Connection>>`.
-- Device labels live outside `MessageRecord`: the `device_labels` table is keyed by identifier (`dev_addr`, else `dev_eui`, in the record's text form), and the WebUI joins labels to rows by that key. Labels never touch the forwarding path. Every label change goes through the `LabelWriter` task in `api/labels.rs`, which commits and then publishes on `/ws/labels`.
+- Device labels live outside `MessageRecord`: the `device_labels` table is keyed by identifier (`dev_addr`, else `dev_eui`, in the record's text form), and the WebUI joins labels to rows by that key. A malformed record has no identifier, so it never enters the live list and can never be labelled. Labels never touch the forwarding path. Every label change goes through the `LabelWriter` task in `api/labels.rs`, which commits and then publishes on `/ws/labels`.
 
 ## WebUI Development
 
@@ -109,16 +109,16 @@ After any frontend change that needs to be embedded in the binary, run `make bui
 
 | File | Role |
 |---|---|
-| `src/App.tsx` | Layout shell; localStorage hooks; filtering/sorting logic (the device filter also matches labels); label dialog state; CSV export (with the last `label` column) |
-| `src/components/MessageTable.tsx` | `TableVirtuoso` table; signal-quality coloring; MType badges; Label column (`LabelCell`, clickable only on rows that have an identifier) |
+| `src/App.tsx` | Layout shell; localStorage hooks; filtering/sorting logic (the device filter also matches labels; malformed rows are hidden unless `showMalformed`, and counted after the other filters); label dialog state; CSV export (ending `…, malformed, label`) |
+| `src/components/MessageTable.tsx` | `TableVirtuoso` table; signal-quality coloring; MType badges; Label column (`LabelCell`, clickable only on rows that have an identifier); malformed rows (`row-malformed`, dashed badge, short reason in the Device cell) |
 | `src/components/LabelDialog.tsx` | Modal to set, change or remove the label of one identifier (DevAddr or DevEUI): text field limited to 64 characters, Save / Delete (only when a label exists) / Cancel, Enter saves, Escape or a click outside cancels, shows the server's error |
-| `src/components/FilterBar.tsx` | Device input (also matches labels), MType multi-select, status/gateway/time selects |
+| `src/components/FilterBar.tsx` | Device input (also matches labels), MType multi-select with the "Show malformed" checkbox at the end of its menu (the header has no room for it at 800 px), status/gateway/time selects |
 | `src/components/ColumnPicker.tsx` | Column visibility toggle (persisted to `localStorage`); the Label column is hidden by default |
-| `src/components/StatusBar.tsx` | Row counts, WS status indicator, version and copyright notice (version from `package.json` via Vite `define`), live/pause toggle |
+| `src/components/StatusBar.tsx` | Row counts (including "Malformed hidden / shown: N"), WS status indicator, version and copyright notice (version from `package.json` via Vite `define`), live/pause toggle |
 | `src/hooks/useWebSocket.ts` | WebSocket connection with auto-reconnect, generic over the path and the event handler (`/ws` for messages, `/ws/labels` for labels) |
 | `src/hooks/useLabels.ts` | Label state (`Record<identifier, label>`), fed only by `/ws/labels` (a snapshot replaces it, an event updates one entry); `saveLabel` / `removeLabel` call `PUT` / `DELETE /api/labels/{device}` and return success or the API's error message, never writing state themselves, so a late HTTP response cannot overwrite a newer event |
 | `src/styles/index.css` | **All styling** — pure CSS, no framework |
-| `src/types/messages.ts` | TypeScript types (`MessageRecord`, `WsMessage`, label snapshot and event types, etc.) and `deviceId()`, the identifier of a row (`dev_addr` ?? `dev_eui` ?? none) |
+| `src/types/messages.ts` | TypeScript types (`MessageRecord`, `WsMessage`, label snapshot and event types, etc.), `deviceId()`, the identifier of a row (`dev_addr` ?? `dev_eui` ?? none), and `malformedReason()` / `malformedShort()`, the full and the short reason of a malformed row |
 
 ### CSS Design System
 
@@ -127,6 +127,7 @@ All theming is done via CSS custom properties in `index.css`. Key variables:
 - `--dir-up` / `--dir-down` — uplink (blue) and downlink (amber) direction colors
 - `--mtype-{join,up,down,other}-{bg,fg}` — MType badge palette (join=purple, up=blue, down=amber)
 - `--blocked-bg` / `--blocked-border` — blocked row tint and left-accent color
+- `--malformed-border` — dashed border of the malformed type badge (`.mtype-malformed`); `.row-malformed` dims the row
 - `--signal-good` / `--signal-fair` / `--signal-poor` — RSSI/SNR quality colors
 - `--row-alt` — zebra-stripe even-row background
 - `--font-mono` — monospace stack for all data cells

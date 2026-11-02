@@ -1,6 +1,8 @@
 import { useMemo } from 'react';
 import { TableVirtuoso, TableComponents } from 'react-virtuoso';
-import { MessageRecord, MType, Status, deviceId, shortEui } from '../types/messages';
+import {
+  MessageRecord, MType, Status, deviceId, malformedReason, malformedShort, shortEui,
+} from '../types/messages';
 import { ColumnConfig } from './ColumnPicker';
 
 type SortDir = 'asc' | 'desc';
@@ -132,12 +134,12 @@ function FlagsCell({ msg }: { msg: MessageRecord }) {
 // Virtuoso passes `context` to custom components. It is taken out here so it is
 // not spread onto the DOM element.
 const COMPONENTS: TableComponents<MessageRecord, TableContext> = {
-  TableRow: ({ item, context: _context, ...props }) => (
-    <tr
-      {...props}
-      className={item.status === 'Blocked' ? 'row-blocked' : undefined}
-    />
-  ),
+  TableRow: ({ item, context: _context, ...props }) => {
+    const classes: string[] = [];
+    if (item.status === 'Blocked') classes.push('row-blocked');
+    if (item.malformed != null) classes.push('row-malformed');
+    return <tr {...props} className={classes.length > 0 ? classes.join(' ') : undefined} />;
+  },
   Table: ({ style, context: _context, ...props }) => (
     <table {...props} style={{ ...style, tableLayout: 'fixed', width: '100%' }} />
   ),
@@ -193,8 +195,10 @@ export function MessageTable({
 
 // The label of the row's device. The whole cell is the button, so the touch
 // target is as large as the cell, and Enter and Space work as on any button.
-// Rows without an identifier (join accepts, rejoin requests, proprietary and
-// truncated frames) get an empty, inert cell. The label is rendered as text,
+// Rows without an identifier (join accepts, rejoin requests, proprietary,
+// truncated and malformed frames) get an empty, inert cell. A malformed frame
+// has none because what would be read from it is noise, and a label on noise
+// would stick to a device that does not exist. The label is rendered as text,
 // never as HTML.
 function LabelCell({ msg, ctx }: { msg: MessageRecord; ctx: TableContext }) {
   const device = deviceId(msg);
@@ -222,6 +226,10 @@ function RowCells({
 }: { msg: MessageRecord; columns: ColumnConfig; ctx: TableContext }) {
   const device    = deviceId(msg) ?? '';
   const mcat      = MTYPE_CAT[msg.mtype] ?? 'other';
+  // Null for a valid frame. A malformed frame keeps its type, read from the
+  // first byte, but that type is not trustworthy, so its badge is drawn
+  // struck through instead of in the colour of the type.
+  const reason    = malformedReason(msg);
 
   return (
     <>
@@ -235,12 +243,23 @@ function RowCells({
       )}
       {columns.mtype && (
         <td className="col-mtype">
-          <span className={`mtype-badge mtype-${mcat}`}>
+          <span
+            className={`mtype-badge ${reason !== null ? 'mtype-malformed' : `mtype-${mcat}`}`}
+            title={reason !== null ? `Malformed: ${reason}` : undefined}
+          >
             {MTYPE_ABBREV[msg.mtype] ?? msg.mtype}
           </span>
         </td>
       )}
-      {columns.device  && <td className="col-device mono">{device}</td>}
+      {columns.device  && (
+        <td className="col-device mono">
+          {/* The cell is empty on a malformed row, so it carries the reason in
+              short words: a touch screen cannot hover to read the title. */}
+          {reason !== null
+            ? <span className="malformed-tag" title={reason}>malformed: {malformedShort(msg)}</span>
+            : device}
+        </td>
+      )}
       {columns.label   && <LabelCell msg={msg} ctx={ctx} />}
       {columns.gateway && (
         <td className="col-gateway mono" title={msg.gateway_eui ?? undefined}>

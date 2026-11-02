@@ -691,13 +691,33 @@ fn process_pull_resp(
 // MessageRecord builders
 // ---------------------------------------------------------------------------
 
+/// The CRC status a Semtech `stat` value stands for: 1 is a passed check, -1 a
+/// failed one and 0 no check at all.  Anything else is unknown.
+fn crc_status(stat: i8) -> Option<CrcStatus> {
+    match stat {
+        1 => Some(CrcStatus::Ok),
+        -1 => Some(CrcStatus::Fail),
+        0 => Some(CrcStatus::NoCrc),
+        _ => None,
+    }
+}
+
 fn build_uplink_record(
     rxpk: &RxPk,
     gateway_eui: Eui64,
     listen: bool,
     filters: &[FilterRule],
 ) -> (MessageRecord, Verdict) {
-    let frame = decoder::decode_phy(&rxpk.data);
+    let crc = crc_status(rxpk.stat);
+    let frame = decoder::decode_phy(&rxpk.data, crc.as_ref());
+    let fields = frame_fields(frame, rxpk.size, crc.as_ref());
+    let verdict = classify(
+        listen,
+        filters,
+        &Direction::Up,
+        fields.rule_mtype(),
+        Some(&gateway_eui),
+    );
     let FrameFields {
         mtype,
         dev_addr,
@@ -708,16 +728,8 @@ fn build_uplink_record(
         fport,
         fctrl,
         payload_size,
-    } = frame_fields(frame, rxpk.size);
-
-    let verdict = classify(listen, filters, &Direction::Up, &mtype, Some(&gateway_eui));
-
-    let crc = match rxpk.stat {
-        1 => Some(CrcStatus::Ok),
-        -1 => Some(CrcStatus::Fail),
-        0 => Some(CrcStatus::NoCrc),
-        _ => None,
-    };
+        malformed,
+    } = fields;
 
     (
         MessageRecord {
@@ -748,6 +760,7 @@ fn build_uplink_record(
             class_b: fctrl.and_then(|c| c.class_b),
             f_pending: fctrl.and_then(|c| c.f_pending),
             f_opts_len: fctrl.map(|c| c.f_opts_len),
+            malformed,
         },
         verdict,
     )
@@ -758,7 +771,16 @@ fn build_downlink_record(
     gateway_eui: Eui64,
     filters: &[FilterRule],
 ) -> (MessageRecord, Verdict) {
-    let frame = decoder::decode_phy(&txpk.data);
+    // A downlink has no CRC to report.
+    let frame = decoder::decode_phy(&txpk.data, None);
+    let fields = frame_fields(frame, txpk.size, None);
+    let verdict = classify(
+        false,
+        filters,
+        &Direction::Down,
+        fields.rule_mtype(),
+        Some(&gateway_eui),
+    );
     let FrameFields {
         mtype,
         dev_addr,
@@ -769,9 +791,8 @@ fn build_downlink_record(
         fport,
         fctrl,
         payload_size,
-    } = frame_fields(frame, txpk.size);
-
-    let verdict = classify(false, filters, &Direction::Down, &mtype, Some(&gateway_eui));
+        malformed,
+    } = fields;
 
     (
         MessageRecord {
@@ -802,6 +823,7 @@ fn build_downlink_record(
             class_b: fctrl.and_then(|c| c.class_b),
             f_pending: fctrl.and_then(|c| c.f_pending),
             f_opts_len: fctrl.map(|c| c.f_opts_len),
+            malformed,
         },
         verdict,
     )

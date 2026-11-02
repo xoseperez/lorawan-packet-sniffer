@@ -13,13 +13,17 @@ Two roles, usable separately or together:
             sent to --target. Every gateway sends data uplinks from one fixed
             DevAddr; --random-devaddr gives each uplink a new one, and
             --joins N adds a JoinRequest (fixed DevEUI per gateway) every N
-            uplinks.
+            uplinks, and --malformed-ratio R adds a malformed frame to a
+            fraction R of the PUSH_DATA datagrams.
   lns       A fake network server. It answers PUSH_DATA with PUSH_ACK and
             PULL_DATA with PULL_ACK, sends PULL_RESP downlinks for a fraction
             of the uplinks to the source address of the gateway's latest
             PULL_DATA, and counts TX_ACKs and the source ports used per EUI.
             Its summary also counts the uplink frames received by message
-            type and the distinct DevAddrs and DevEUIs in them.
+            type and the distinct DevAddrs and DevEUIs in them. Frames that
+            cannot be valid LoRaWAN (CRC failed, reserved MHDR bits set, wrong
+            length for their type) are counted by reason instead, and are left
+            out of those tallies and out of the downlink targets.
   all       Both in the same process and event loop.
 
 Typical setup: gateways -> sniffer -> fake LNS, so the sniffer's upstream
@@ -47,6 +51,17 @@ also fills the sniffer's list of identifiers seen live:
 
     tools/gwsim.py all --lns-bind 127.0.0.1:1701 --target 127.0.0.1:1700 \\
         --count 3 --duration 120 --uplink-interval 1 --joins 5 --random-devaddr
+
+Traffic with malformed frames. With --malformed-ratio 0.3, about one PUSH_DATA
+in three also carries one frame that breaks a LoRaWAN frame rule, taken in turn
+from a fixed list: CRC failed, reserved MHDR bits set, wrong length for the
+type, and one that breaks all three. The identifiers a decoder would read from
+those frames if it trusted them are printed at start, so you know what must
+never show up in the sniffer's records or device lists; the summaries count the
+frames by reason, sent and received:
+
+    tools/gwsim.py all --lns-bind 127.0.0.1:1701 --target 127.0.0.1:1700 \\
+        --count 3 --duration 120 --uplink-interval 1 --malformed-ratio 0.3
 
 Only the fake LNS (for example behind a sniffer, with real gateways in front):
 
@@ -78,7 +93,15 @@ structurally valid UnconfirmedDataUp frame (random MIC), downlinks an
 UnconfirmedDataDown frame. With --joins, the PUSH_DATA of every Nth uplink
 carries a second frame, a structurally valid JoinRequest: MHDR 0x00, a fixed
 JoinEUI, the gateway's DevEUI (DE:AD:BE:EF:00:00:00:00 plus the gateway index),
-a random DevNonce and a random MIC. IPv4 only.
+a random DevNonce and a random MIC. With --malformed-ratio, the PUSH_DATA of a
+fraction of the uplinks also carries one more frame, taken in turn from a fixed
+list of frames that no valid LoRaWAN 1.0 / 1.1 device would send. The frames
+are classified by the first rule that applies: "crc" (the gateway reports
+stat -1), then "mhdr" (the MHDR's reserved bits 4:2 or Major version 1:0 are
+not zero), then "length" (JoinRequest not 23 bytes, JoinAccept not 17 or 33,
+RejoinRequest not 19 or 24, a data frame under 12 bytes plus FOptsLen;
+Proprietary frames have no length rule). The fake LNS applies the same three
+rules to every uplink. IPv4 only.
 """
 
 from __future__ import annotations
@@ -94,6 +117,7 @@ import socket
 import struct
 import sys
 import time
+from typing import Callable, NamedTuple
 
 PROTOCOL_VERSION = 2
 
@@ -110,8 +134,25 @@ HEADER_WITH_EUI = HEADER.size + 8
 MHDR_JOIN_REQUEST = 0x00
 MHDR_UNCONFIRMED_UP = 0x40
 MHDR_UNCONFIRMED_DOWN = 0x60
+MTYPE_JOIN_REQUEST = 0
+MTYPE_JOIN_ACCEPT = 1
 MTYPE_UNCONFIRMED_UP = 2
 MTYPE_CONFIRMED_UP = 4
+MTYPE_REJOIN_REQUEST = 6
+MTYPE_PROPRIETARY = 7
+# MHDR bits 4:2 (reserved) and 1:0 (Major version): all zero in LoRaWAN 1.0 and 1.1.
+MHDR_RESERVED_MASK = 0x1F
+# Frame sizes that fit each message type. A data frame needs MHDR, DevAddr,
+# FCtrl, FCnt and MIC (12 bytes) plus the FOpts announced in FCtrl.
+JOIN_REQUEST_SIZE = 23
+JOIN_ACCEPT_SIZES = (17, 33)
+REJOIN_REQUEST_SIZES = (19, 24)
+DATA_FRAME_MIN_SIZE = 12
+# CRC status of an rxpk: -1 failed, 0 not checked, 1 passed.
+STAT_CRC_FAILED = -1
+STAT_CRC_OK = 1
+# Why a frame is malformed, in the order the rules apply.
+MALFORMED_REASONS = ("crc", "mhdr", "length")
 # Names as the sniffer shows them, indexed by the MHDR bits 7..5.
 MTYPE_NAMES = ("JoinRequest", "JoinAccept", "UnconfirmedDataUp", "UnconfirmedDataDown",
                "ConfirmedDataUp", "ConfirmedDataDown", "RejoinRequest", "Proprietary")
@@ -211,6 +252,103 @@ def build_downlink(devaddr: int, fcnt: int) -> bytes:
     )
 
 
+def random_bytes(count: int) -> bytes:
+    return random.getrandbits(8 * count).to_bytes(count, "big") if count > 0 else b""
+
+
+def build_data_frame(mhdr: int, devaddr: int, size: int, fport: int = 1) -> bytes:
+    """A data frame of exactly `size` bytes (at least 9): MHDR, DevAddr (LE),
+    FCtrl without FOpts, FCnt (LE), FPort, then random bytes up to the size. At
+    12 bytes or more the last four play the MIC. The caller picks MHDR and size
+    to make the frame valid or not."""
+    return (
+        bytes([mhdr])
+        + devaddr.to_bytes(4, "little")
+        + bytes([0x80])
+        + random_bytes(2)
+        + bytes([fport])
+        + random_bytes(size - 9)
+    )
+
+
+# What a decoder that trusted a malformed frame would read from it. None of
+# these may reach a record, a device list or a downlink target.
+FAKE_DEVADDR_BIG_CRC = 0x6874FA22  # 238-byte frame, CRC failed
+FAKE_DEVADDR_PLAIN_CRC = 0xD47263A5  # 23-byte frame, CRC failed, nothing else wrong
+FAKE_DEVADDR_RFU = 0x16D03003  # MHDR reserved bit set
+FAKE_DEVADDR_MAJOR = 0x16D03004  # MHDR Major version 1
+FAKE_DEVADDR_SHORT = 0x0BADADD0  # 9-byte data frame
+FAKE_DEVADDR_ALL = 0x16D03005  # CRC failed, reserved bit set and too short
+FAKE_DEVEUI_SHORT = 0xDEAD000000000020  # 20-byte JoinRequest
+
+
+class MalformedFrame(NamedTuple):
+    reason: str  # the first rule that applies: "crc", "mhdr" or "length"
+    stat: int  # CRC status the gateway reports for it
+    what: str  # for the start-up listing
+    devaddr: "int | None"  # identifiers a trusting decoder would read from it
+    deveui: "int | None"
+    build: Callable[[], bytes]
+
+
+# Gateways take these in turn, one list shared by all of them, so a short run
+# already shows every kind.
+MALFORMED_CYCLE = (
+    MalformedFrame("crc", STAT_CRC_FAILED, "1-byte ConfirmedDataDown", None, None,
+                   lambda: bytes([0xA0])),
+    MalformedFrame("crc", STAT_CRC_FAILED, "22-byte Proprietary", None, None,
+                   lambda: bytes([0xE0]) + random_bytes(21)),
+    MalformedFrame("crc", STAT_CRC_FAILED, "238-byte UnconfirmedDataUp, FPort 127",
+                   FAKE_DEVADDR_BIG_CRC, None,
+                   lambda: build_data_frame(MHDR_UNCONFIRMED_UP, FAKE_DEVADDR_BIG_CRC, 238, 127)),
+    MalformedFrame("crc", STAT_CRC_FAILED,
+                   "23-byte UnconfirmedDataUp, otherwise valid (only the CRC catches it)",
+                   FAKE_DEVADDR_PLAIN_CRC, None,
+                   lambda: build_data_frame(MHDR_UNCONFIRMED_UP, FAKE_DEVADDR_PLAIN_CRC, 23)),
+    MalformedFrame("mhdr", STAT_CRC_OK, "15-byte UnconfirmedDataUp, MHDR 0x44 (reserved bit)",
+                   FAKE_DEVADDR_RFU, None,
+                   lambda: build_data_frame(0x44, FAKE_DEVADDR_RFU, 15)),
+    MalformedFrame("mhdr", STAT_CRC_OK, "15-byte UnconfirmedDataUp, MHDR 0x41 (Major 1)",
+                   FAKE_DEVADDR_MAJOR, None,
+                   lambda: build_data_frame(0x41, FAKE_DEVADDR_MAJOR, 15)),
+    MalformedFrame("length", STAT_CRC_OK, "9-byte UnconfirmedDataUp",
+                   FAKE_DEVADDR_SHORT, None,
+                   lambda: build_data_frame(MHDR_UNCONFIRMED_UP, FAKE_DEVADDR_SHORT, 9)),
+    MalformedFrame("length", STAT_CRC_OK, "20-byte JoinRequest", None, FAKE_DEVEUI_SHORT,
+                   lambda: (bytes([MHDR_JOIN_REQUEST]) + JOIN_EUI.to_bytes(8, "little")
+                            + FAKE_DEVEUI_SHORT.to_bytes(8, "little") + random_bytes(3))),
+    MalformedFrame("length", STAT_CRC_OK, "10-byte RejoinRequest", None, None,
+                   lambda: bytes([MTYPE_REJOIN_REQUEST << 5]) + random_bytes(9)),
+    # Breaks all three rules. It is counted as "crc", the first that applies.
+    MalformedFrame("crc", STAT_CRC_FAILED,
+                   "9-byte UnconfirmedDataUp, MHDR 0x44, CRC failed (breaks all three rules)",
+                   FAKE_DEVADDR_ALL, None,
+                   lambda: build_data_frame(0x44, FAKE_DEVADDR_ALL, 9)),
+)
+
+
+class MalformedSource:
+    """Decides which PUSH_DATA datagrams carry a malformed frame, and which."""
+
+    def __init__(self, ratio: float) -> None:
+        self.ratio = ratio
+        self.next_index = 0
+
+    def pick(self) -> "MalformedFrame | None":
+        if self.ratio <= 0.0 or random.random() >= self.ratio:
+            return None
+        frame = MALFORMED_CYCLE[self.next_index % len(MALFORMED_CYCLE)]
+        self.next_index += 1
+        return frame
+
+
+def fake_identifiers():
+    """The distinct fake DevAddrs and DevEUIs of the cycle, in cycle order."""
+    devaddrs = list(dict.fromkeys(f.devaddr for f in MALFORMED_CYCLE if f.devaddr is not None))
+    deveuis = list(dict.fromkeys(f.deveui for f in MALFORMED_CYCLE if f.deveui is not None))
+    return devaddrs, deveuis
+
+
 def parse_header(data: bytes):
     """Returns (version, token, identifier) or None for a short datagram."""
     if len(data) < HEADER.size:
@@ -226,10 +364,51 @@ def rxpk_phy(rxpk) -> "bytes | None":
         return None
 
 
-def uplink_devaddr(rxpk) -> "int | None":
-    """DevAddr of a data-up frame carried in one rxpk entry, else None."""
+def length_fits(phy: bytes) -> bool:
+    """Whether the size of a non-empty frame fits its message type."""
+    mtype = phy[0] >> 5
+    if mtype == MTYPE_JOIN_REQUEST:
+        return len(phy) == JOIN_REQUEST_SIZE
+    if mtype == MTYPE_JOIN_ACCEPT:
+        return len(phy) in JOIN_ACCEPT_SIZES
+    if mtype == MTYPE_REJOIN_REQUEST:
+        return len(phy) in REJOIN_REQUEST_SIZES
+    if mtype == MTYPE_PROPRIETARY:
+        return True
+    # The four data types. FOptsLen sits in FCtrl, byte 5; a frame too short to
+    # have one is under the minimum whatever it would say.
+    f_opts_len = phy[5] & 0x0F if len(phy) >= 6 else 0
+    return len(phy) >= DATA_FRAME_MIN_SIZE + f_opts_len
+
+
+def rxpk_malformed(rxpk) -> "str | None":
+    """Why one rxpk entry cannot be a valid LoRaWAN 1.0 / 1.1 frame, else None.
+
+    The first rule that applies wins: "crc" (the gateway reports a failed CRC),
+    "mhdr" (reserved bits or Major version of the MHDR not zero), "length" (the
+    size does not fit the message type). A frame with no readable bytes has
+    neither MHDR nor length to judge: only a failed CRC marks it."""
+    if rxpk.get("stat") == STAT_CRC_FAILED:
+        return "crc"
     phy = rxpk_phy(rxpk)
-    if phy is None or len(phy) < 12 or (phy[0] >> 5) not in (MTYPE_UNCONFIRMED_UP, MTYPE_CONFIRMED_UP):
+    if not phy:
+        return None
+    if phy[0] & MHDR_RESERVED_MASK:
+        return "mhdr"
+    if not length_fits(phy):
+        return "length"
+    return None
+
+
+def uplink_devaddr(rxpk) -> "int | None":
+    """DevAddr of a valid data-up frame carried in one rxpk entry, else None.
+
+    A malformed frame has no DevAddr, so its bytes can never become a downlink
+    target."""
+    phy = rxpk_phy(rxpk)
+    if not phy or (phy[0] >> 5) not in (MTYPE_UNCONFIRMED_UP, MTYPE_CONFIRMED_UP):
+        return None
+    if rxpk_malformed(rxpk) is not None:
         return None
     return int.from_bytes(phy[1:5], "little")
 
@@ -319,7 +498,8 @@ class SimGateway:
     """One simulated forwarder with separate push and pull sockets."""
 
     def __init__(self, reactor: Reactor, index: int, eui: int, target, keepalive: float,
-                 uplink_interval: float, joins: int = 0, random_devaddr: bool = False) -> None:
+                 uplink_interval: float, joins: int = 0, random_devaddr: bool = False,
+                 malformed: "MalformedSource | None" = None) -> None:
         self.reactor = reactor
         self.index = index
         self.eui = eui
@@ -333,6 +513,7 @@ class SimGateway:
         self.uplink_interval = uplink_interval
         self.joins = joins  # a JoinRequest every this many uplinks; 0 = never
         self.random_devaddr = random_devaddr
+        self.malformed = malformed  # shared by all gateways; None = never
         self.fcnt = 0
         self.uplinks = 0
         self.t0 = time.monotonic()
@@ -344,11 +525,12 @@ class SimGateway:
         self.push_sent = 0
         self.push_acked = 0
         self.join_sent = 0
+        self.malformed_sent = dict.fromkeys(MALFORMED_REASONS, 0)  # frames, by reason
         self.pull_sent = 0
         self.pull_acked = 0
         self.pull_resp = 0
         self.tx_ack_sent = 0
-        self.stray = 0  # wrong packet type for the socket, or malformed
+        self.stray = 0  # wrong packet type for the socket, or an invalid datagram
         self.bad_token = 0  # ACK whose token matches nothing outstanding
         self.bad_downlink = 0  # PULL_RESP without a usable txpk
         self.send_errors = 0
@@ -394,14 +576,14 @@ class SimGateway:
     def _join_request(self) -> dict:
         return self._rxpk(build_join_request(JOIN_EUI, self.dev_eui, random.getrandbits(16)))
 
-    def _rxpk(self, phy: bytes) -> dict:
+    def _rxpk(self, phy: bytes, stat: int = STAT_CRC_OK) -> dict:
         freq, chan, rfch = random.choice(CHANNELS)
         return {
             "tmst": int((time.monotonic() - self.t0) * 1e6) & 0xFFFFFFFF,
             "freq": freq,
             "chan": chan,
             "rfch": rfch,
-            "stat": 1,
+            "stat": stat,
             "modu": "LORA",
             "datr": "SF7BW125",
             "codr": "4/5",
@@ -422,6 +604,9 @@ class SimGateway:
         with_join = self.joins > 0 and self.uplinks % self.joins == 0
         if with_join:
             rxpk.append(self._join_request())
+        bad = self.malformed.pick() if self.malformed is not None else None
+        if bad is not None:
+            rxpk.append(self._rxpk(bad.build(), bad.stat))
         datagram = (
             HEADER.pack(PROTOCOL_VERSION, token, PUSH_DATA)
             + self.eui_bytes
@@ -432,6 +617,8 @@ class SimGateway:
             self.push_sent += 1
             if with_join:
                 self.join_sent += 1
+            if bad is not None:
+                self.malformed_sent[bad.reason] += 1
         self.reactor.call_later(self.uplink_interval * random.uniform(0.8, 1.2), self.send_push)
 
     def send_pull(self) -> None:
@@ -518,8 +705,11 @@ class FakeLns:
         self.sock = open_udp(bind_addr, rcvbuf=4 * 1024 * 1024)
         self.bound = self.sock.getsockname()
         self.gateways = {}
-        self.malformed = 0
+        self.invalid = 0  # datagrams that are not Semtech UDP packets
         self.send_errors = 0
+        self.malformed = dict.fromkeys(MALFORMED_REASONS, 0)  # uplink frames, by reason
+        # The tallies below hold valid frames only: a malformed frame's type and
+        # identifiers are noise.
         self.mtypes = {}  # uplink frames received, by message type name
         self.devaddrs = set()  # distinct DevAddrs seen in data uplinks
         self.deveuis = set()  # distinct DevEUIs seen in join requests
@@ -549,12 +739,12 @@ class FakeLns:
     def handle(self, data: bytes, addr) -> None:
         header = parse_header(data)
         if header is None or header[0] not in (1, 2):
-            self.malformed += 1
+            self.invalid += 1
             return
         version, token, ident = header
         if ident in (PUSH_DATA, PULL_DATA, TX_ACK):
             if len(data) < HEADER_WITH_EUI:
-                self.malformed += 1
+                self.invalid += 1
                 return
             eui = int.from_bytes(data[HEADER.size:HEADER_WITH_EUI], "big")
             body = data[HEADER_WITH_EUI:]
@@ -565,7 +755,7 @@ class FakeLns:
             else:
                 self.on_tx_ack(token, eui, body, addr)
         else:
-            self.malformed += 1
+            self.invalid += 1
 
     def on_push_data(self, version: int, token: int, eui: int, body: bytes, addr) -> None:
         gw = self._gateway(eui)
@@ -589,14 +779,21 @@ class FakeLns:
                 return
 
     def count_frames(self, rxpk_list) -> None:
-        """Tally the frames of one PUSH_DATA by message type, DevAddr and DevEUI."""
+        """Tally the frames of one PUSH_DATA: malformed ones by reason, the rest
+        by message type, DevAddr and DevEUI."""
         for rxpk in rxpk_list:
-            phy = rxpk_phy(rxpk) if isinstance(rxpk, dict) else None
+            if not isinstance(rxpk, dict):
+                continue
+            reason = rxpk_malformed(rxpk)
+            if reason is not None:
+                self.malformed[reason] += 1
+                continue
+            phy = rxpk_phy(rxpk)
             if not phy:
                 continue
             name = MTYPE_NAMES[phy[0] >> 5]
             self.mtypes[name] = self.mtypes.get(name, 0) + 1
-            if name == "JoinRequest" and len(phy) >= 17:
+            if name == "JoinRequest":
                 self.deveuis.add(int.from_bytes(phy[9:17], "little"))
             devaddr = uplink_devaddr(rxpk)
             if devaddr is not None:
@@ -655,6 +852,12 @@ class FakeLns:
 # ---------------------------------------------------------------- reporting
 
 
+def malformed_counts(counts) -> str:
+    """The per-reason counters of malformed frames, in the summary lines."""
+    return "malformed %s %s" % (
+        " / ".join(MALFORMED_REASONS), " / ".join(str(counts[r]) for r in MALFORMED_REASONS))
+
+
 def gateway_summary_line(gws, elapsed: float) -> str:
     push_sent = sum(g.push_sent for g in gws)
     push_acked = sum(g.push_acked for g in gws)
@@ -666,11 +869,16 @@ def gateway_summary_line(gws, elapsed: float) -> str:
     stray = sum(g.stray + g.bad_token + g.bad_downlink for g in gws)
     errors = sum(g.send_errors for g in gws)
     joins = sum(g.join_sent for g in gws)
+    malformed = ""
+    if any(g.malformed is not None for g in gws):
+        malformed = " | " + malformed_counts(
+            {r: sum(g.malformed_sent[r] for g in gws) for r in MALFORMED_REASONS})
     return (
         "[%7.1fs] gw:  %d gateways | push acked %d/%d | pull acked %d/%d | downlinks %d"
-        " | without push ack %d | without pull ack %d | stray %d | send errors %d%s"
+        " | without push ack %d | without pull ack %d | stray %d | send errors %d%s%s"
         % (elapsed, len(gws), push_acked, push_sent, pull_acked, pull_sent, downlinks,
-           no_push, no_pull, stray, errors, " | join requests %d" % joins if joins else "")
+           no_push, no_pull, stray, errors, " | join requests %d" % joins if joins else "",
+           malformed)
     )
 
 
@@ -679,13 +887,14 @@ def lns_summary_line(lns: FakeLns, elapsed: float) -> str:
     frames = ", ".join("%s %d" % kv for kv in sorted(lns.mtypes.items())) or "none"
     return (
         "[%7.1fs] lns: %d gateways | push %d | pull %d | downlinks %d (no pull address %d)"
-        " | tx_ack %d (matched %d, errors %d) | malformed %d"
+        " | tx_ack %d (matched %d, errors %d) | invalid datagrams %d | %s"
         " | uplink frames: %s | distinct DevAddr %d, DevEUI %d"
         % (elapsed, len(lns.gateways), sum(g.push_data for g in gws),
            sum(g.pull_data for g in gws), sum(g.downlinks for g in gws),
            sum(g.no_pull_addr for g in gws), sum(g.tx_acks for g in gws),
            sum(g.tx_acks_matched for g in gws), sum(g.tx_ack_errors for g in gws),
-           lns.malformed, frames, len(lns.devaddrs), len(lns.deveuis))
+           lns.invalid, malformed_counts(lns.malformed), frames, len(lns.devaddrs),
+           len(lns.deveuis))
     )
 
 
@@ -715,8 +924,8 @@ def gateway_table(gws) -> None:
 
 def lns_table(lns: FakeLns) -> None:
     out("")
-    out("LNS: %d gateway EUIs, %d malformed datagrams, %d send errors" % (
-        len(lns.gateways), lns.malformed, lns.send_errors))
+    out("LNS: %d gateway EUIs, %d invalid datagrams, %d send errors" % (
+        len(lns.gateways), lns.invalid, lns.send_errors))
     out("%-16s %-24s %6s %6s %9s %7s %8s  %s" % (
         "EUI", "source ports", "push", "pull", "downlinks", "tx_ack", "matched", "notes"))
     two_ports = 0
@@ -740,6 +949,18 @@ def lns_table(lns: FakeLns) -> None:
             gw.push_data, gw.pull_data, gw.downlinks, gw.tx_acks, gw.tx_acks_matched,
             "; ".join(notes))).rstrip())
     out("EUIs seen from exactly 2 source ports: %d/%d" % (two_ports, len(lns.gateways)))
+
+
+def print_malformed_plan(malformed_ratio: float) -> None:
+    out("a PUSH_DATA also carries one malformed frame with probability %g, taken in turn "
+        "from this list:" % malformed_ratio)
+    for f in MALFORMED_CYCLE:
+        out("  %-6s %s" % (f.reason, f.what))
+    devaddrs, deveuis = fake_identifiers()
+    out("identifiers a decoder would read from those frames if it trusted them (none may "
+        "show up in a record, a device list or a downlink):")
+    out("  DevAddr %s" % ", ".join("%08X" % a for a in devaddrs))
+    out("  DevEUI  %s" % ", ".join(fmt_eui_colon(e) for e in deveuis))
 
 
 def short_list(euis) -> str:
@@ -843,6 +1064,11 @@ def add_gateway_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--random-devaddr", action="store_true",
                    help="every data uplink uses a new random DevAddr instead of the "
                         "gateway's fixed one (fills the sniffer's list of live identifiers)")
+    p.add_argument("--malformed-ratio", type=ratio, default=0.0, metavar="R",
+                   help="fraction of PUSH_DATA datagrams that also carry one malformed frame "
+                        "(CRC failed, reserved MHDR bits set or wrong length for the type), "
+                        "0 to 1 (default 0); the frames come in turn from a fixed list, and the "
+                        "fake identifiers they would carry are printed at start")
     p.add_argument("--allow-missing-acks", action="store_true",
                    help="exit 0 even if a gateway got no PUSH_ACK or PULL_ACK")
 
@@ -907,6 +1133,9 @@ def main(argv=None) -> int:
             sys.exit("gwsim: --eui-base plus --count overflows 64 bits")
         ensure_fd_limit(2 * count + 1 + 64)
 
+    malformed = None
+    if run_gateways and args.malformed_ratio > 0:
+        malformed = MalformedSource(args.malformed_ratio)
     reactor = Reactor()
 
     def request_stop(signum, frame):
@@ -931,7 +1160,7 @@ def main(argv=None) -> int:
                 for i in range(count):
                     gws.append(SimGateway(reactor, i, args.eui_base + i, args.target,
                                           args.keepalive, args.uplink_interval,
-                                          args.joins, args.random_devaddr))
+                                          args.joins, args.random_devaddr, malformed))
             except OSError as exc:
                 sys.exit("gwsim: cannot open sockets for gateway %d: %s "
                          "(check `ulimit -n`)" % (len(gws), exc))
@@ -948,6 +1177,8 @@ def main(argv=None) -> int:
                         len(gws) - 10, fmt_eui_colon(DEVEUI_BASE)))
             if args.random_devaddr:
                 out("every data uplink uses a new random DevAddr")
+            if malformed is not None:
+                print_malformed_plan(args.malformed_ratio)
             for g in gws:
                 g.start()
 

@@ -143,7 +143,7 @@ export function App() {
   // ------------------------------------------------------------------
   // Client-side filtering
   // ------------------------------------------------------------------
-  const filteredMessages = useMemo(() => {
+  const { rows: filteredMessages, malformedCount } = useMemo(() => {
     let result = messages;
 
     if (filters.device) {
@@ -178,6 +178,17 @@ export function App() {
       }
     }
 
+    // Last of the filters, so the count is of the malformed rows the other
+    // filters let through: the number the box hides or shows, which the user
+    // can check against the table.
+    let malformedCount = 0;
+    for (const m of result) {
+      if (m.malformed != null) malformedCount++;
+    }
+    if (!filters.showMalformed && malformedCount > 0) {
+      result = result.filter(m => m.malformed == null);
+    }
+
     if (sortDir === 'asc') {
       // Compare as times, not text: the sniffer writes as many fractional
       // digits as a timestamp needs, so ".5Z" would sort after ".500001Z".
@@ -187,7 +198,7 @@ export function App() {
       result = sortDir === 'desc' ? [...result].reverse() : result;
     }
 
-    return result;
+    return { rows: result, malformedCount };
   }, [messages, filters, sortDir, labels]);
 
   // Every gateway seen in the loaded messages (not just the filtered ones), so
@@ -216,8 +227,9 @@ export function App() {
       'payload_size', 'toa_ms', 'blocked_by', 'source_protocol',
       'gateway_eui', 'join_eui', 'dev_nonce',
       'adr', 'adr_ack_req', 'ack', 'class_b', 'f_pending', 'f_opts_len',
-      // Appended last so tools that read the columns by position keep working.
-      'label',
+      // New columns are added at the end, so tools that read the columns by
+      // position keep working.
+      'malformed', 'label',
     ];
 
     const escape = (v: string | number | boolean | null | undefined): string => {
@@ -249,6 +261,7 @@ export function App() {
         m.payload_size, m.toa_ms, m.blocked_by, m.source_protocol,
         m.gateway_eui, m.join_eui, m.dev_nonce,
         m.adr, m.adr_ack_req, m.ack, m.class_b, m.f_pending, m.f_opts_len,
+        m.malformed,
       ].map(escape).concat(labelField(m)).join(','),
     );
 
@@ -298,6 +311,8 @@ export function App() {
           total={messages.length}
           shown={filteredMessages.length}
           blocked={blockedCount}
+          malformedCount={malformedCount}
+          showMalformed={filters.showMalformed}
           wsStatus={wsStatus}
           isLive={isLive}
           onToggleLive={handleToggleLive}

@@ -21,7 +21,30 @@
 //! - version 0: the `messages` table and its indexes ([`INIT_SQL`]);
 //! - version 1: gateway, join and frame-control columns on `messages`;
 //! - version 2: the `device_labels` table, one operator-chosen label per
-//!   device identifier.
+//!   device identifier;
+//! - version 3: the `malformed` and `classified` columns on `messages`.
+//!
+//! ## Malformed frames
+//!
+//! The decoder marks a frame that cannot be a valid LoRaWAN frame and leaves
+//! its identifiers empty, so a record this version stores already says what it
+//! is.  Rows written before that, or by an older version run on the same
+//! database after a rollback, have no verdict yet.  Every row therefore
+//! carries `classified`: this version writes 1, an older version's `INSERT`
+//! does not list the column and so gets the default 0.  On every start,
+//! [`Storage::open`] finds the rows with `classified = 0`, marks the ones that
+//! fail the CRC or length rule from their stored fields, clears what was read
+//! from their bytes, and sets the flag.  A flag in each row, rather than a
+//! "checked up to here" mark, survives whatever happens to the table in
+//! between: SQLite reuses the row numbers of deleted rows, and `VACUUM` may
+//! renumber the rest.
+//!
+//! The first pass after the upgrade visits every row, since each one gets the
+//! flag.  It ends by creating a partial index over `classified = 0`, which is
+//! empty at that moment; from then on a start counts the unchecked rows
+//! through that index and returns at once when there are none.  A pass that
+//! fails (a full disk, say) rolls back whole and is repeated at the next
+//! start; it never stops the sniffer from opening the database.
 //!
 //! ## Device labels
 //!
@@ -46,20 +69,24 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use log::warn;
+use log::{warn, Level};
 use rusqlite::{params, Connection, TransactionBehavior};
 
 use crate::core::error::SnifferError;
-use crate::core::metadata::{CrcStatus, Direction, MType, MessageRecord, Protocol, Status};
+use crate::core::metadata::{
+    CrcStatus, Direction, MType, Malformed, MessageRecord, Protocol, Status,
+};
 
 const SELECT_COLS: &str = "
     id, timestamp, direction, status, blocked_by, source_protocol,
     freq_mhz, datarate, rssi, snr, crc_status,
     mtype, dev_addr, dev_eui, fcnt, fport, payload_size, toa_ms,
     gateway_eui, join_eui, dev_nonce,
-    adr, adr_ack_req, ack, class_b, f_pending, f_opts_len
+    adr, adr_ack_req, ack, class_b, f_pending, f_opts_len,
+    malformed
 ";
 
 // ---------------------------------------------------------------------------
@@ -116,9 +143,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_mtype
 /// Entry `i` upgrades a database from `user_version` `i` to `i + 1`.  Never
 /// edit or reorder an entry that has shipped; append a new one instead.
 ///
-/// SQLite adds a nullable column without rewriting the table, so upgrading a
-/// large database is fast.  Booleans are stored as INTEGER 0/1.  A new table
-/// does not touch `messages` at all.
+/// SQLite adds a column with a constant default without rewriting the table,
+/// so upgrading a large database is fast.  Booleans are stored as INTEGER 0/1.
+/// A new table does not touch `messages` at all.
 const MIGRATIONS: &[&str] = &[
     // 0 -> 1: gateway, join and frame-control fields.
     //
@@ -144,6 +171,16 @@ const MIGRATIONS: &[&str] = &[
          label      TEXT NOT NULL,
          updated_at TEXT NOT NULL
      );",
+    // 2 -> 3: malformed-frame verdict and the "checked" flag.
+    //
+    // Only DDL, so it is instant at any size.  Rows already stored read
+    // `classified = 0` without being rewritten, and so do the rows an older
+    // version stores later, because its `INSERT` lists only its own columns.
+    // That is how those rows are found again: see `classify_unchecked`.  The
+    // partial index over the flag is not created here, for the reason given
+    // on `UNCLASSIFIED_INDEX_SQL`.
+    "ALTER TABLE messages ADD COLUMN malformed  TEXT;
+     ALTER TABLE messages ADD COLUMN classified INTEGER NOT NULL DEFAULT 0;",
 ];
 
 const INSERT_SQL: &str = "
@@ -152,14 +189,71 @@ INSERT OR REPLACE INTO messages (
     freq_mhz, datarate, rssi, snr, crc_status,
     mtype, dev_addr, dev_eui, fcnt, fport, payload_size, toa_ms,
     gateway_eui, join_eui, dev_nonce,
-    adr, adr_ack_req, ack, class_b, f_pending, f_opts_len
+    adr, adr_ack_req, ack, class_b, f_pending, f_opts_len,
+    malformed, classified
 ) VALUES (
     ?1,  ?2,  ?3,  ?4,  ?5,  ?6,
     ?7,  ?8,  ?9,  ?10, ?11,
     ?12, ?13, ?14, ?15, ?16, ?17, ?18,
     ?19, ?20, ?21,
-    ?22, ?23, ?24, ?25, ?26, ?27
+    ?22, ?23, ?24, ?25, ?26, ?27,
+    ?28, 1
 )";
+
+/// Mark the stored rows that cannot be LoRaWAN frames and clear what was read
+/// from their bytes.
+///
+/// The `WHERE` clause is the stored-fields form of the decoder's rules
+/// (`decoder::crc_failed` and `decoder::length_fits`); the test that compares
+/// the two keeps them together, so change both or neither.  The first byte of
+/// a frame is not stored, so the MHDR rule cannot be applied, and a row
+/// written by 2.0.0 has no `f_opts_len`, so only the 12-byte floor applies to
+/// it.  The reason is a `CASE` on `crc_status`, which the `SET` clause reads
+/// before it changes anything.
+const CLASSIFY_MALFORMED_SQL: &str = "
+UPDATE messages
+   SET malformed   = CASE WHEN crc_status = 'fail' THEN 'crc' ELSE 'length' END,
+       classified  = 1,
+       dev_addr    = NULL, dev_eui     = NULL, join_eui = NULL, dev_nonce = NULL,
+       fcnt        = NULL, fport       = NULL,
+       adr         = NULL, adr_ack_req = NULL, ack      = NULL, class_b   = NULL,
+       f_pending   = NULL, f_opts_len  = NULL
+ WHERE classified = 0
+   AND (crc_status = 'fail'
+        OR (mtype = 'JoinRequest'   AND payload_size <> 23)
+        OR (mtype = 'JoinAccept'    AND payload_size NOT IN (17, 33))
+        OR (mtype = 'RejoinRequest' AND payload_size NOT IN (19, 24))
+        OR (mtype IN ('UnconfirmedDataUp', 'UnconfirmedDataDown',
+                      'ConfirmedDataUp',   'ConfirmedDataDown')
+            AND payload_size < 12 + COALESCE(f_opts_len, 0)))";
+
+/// Everything left unchecked after [`CLASSIFY_MALFORMED_SQL`] is a valid frame.
+///
+/// Kept apart from the first statement on purpose: one `CASE` update would
+/// repeat the malformed rule in the reason and in each of the twelve cleared
+/// columns, and the agreement test would have to keep all of those copies in
+/// step.
+const CLASSIFY_REST_SQL: &str = "UPDATE messages SET classified = 1 WHERE classified = 0";
+
+/// Partial index that finds the unchecked rows without reading the table.
+///
+/// It is created at the end of the first successful pass, when every row has
+/// just been set to 1 and the index therefore has no entries to write.
+/// Creating it in the migration would index every existing row (all of them
+/// 0 at that point) only to remove them all again a moment later.  After that
+/// it holds only the rows an older version stores, and SQLite keeps it up to
+/// date for every writer, older versions included.
+const UNCLASSIFIED_INDEX_SQL: &str = "
+CREATE INDEX IF NOT EXISTS messages_unclassified ON messages (classified)
+    WHERE classified = 0";
+
+/// Is the partial index over the unchecked rows there?  It is created by the
+/// first successful pass, so its absence means no pass has completed yet.
+const UNCLASSIFIED_INDEX_EXISTS_SQL: &str =
+    "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'messages_unclassified')";
+
+/// How many rows are still unchecked; answered from the partial index.
+const COUNT_UNCLASSIFIED_SQL: &str = "SELECT COUNT(*) FROM messages WHERE classified = 0";
 
 /// Labels whose device has no stored message.
 ///
@@ -235,7 +329,25 @@ impl Storage {
     /// Open (or create) the database at `path`, applying WAL mode and schema.
     ///
     /// Parent directories are created automatically.
+    ///
+    /// Rows stored before malformed-frame detection existed, and rows an older
+    /// version stored since, are checked here before this returns; see the
+    /// module documentation.  A failed check is logged and does not fail the
+    /// open.
     pub fn open(path: &str) -> Result<Self, SnifferError> {
+        Self::open_file(path, |_| {})
+    }
+
+    /// [`Storage::open`], with a chance to configure the connection first.
+    ///
+    /// The tests use it to set `max_page_count` so that the first allocation
+    /// of a new page fails the way a full disk would.
+    #[cfg(test)]
+    fn open_with(path: &str, before_init: impl FnOnce(&Connection)) -> Result<Self, SnifferError> {
+        Self::open_file(path, before_init)
+    }
+
+    fn open_file(path: &str, before_init: impl FnOnce(&Connection)) -> Result<Self, SnifferError> {
         let p = Path::new(path);
         if let Some(parent) = p.parent() {
             if !parent.as_os_str().is_empty() {
@@ -243,6 +355,7 @@ impl Storage {
             }
         }
         let mut conn = Connection::open(p)?;
+        before_init(&conn);
         init(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -293,6 +406,7 @@ impl Storage {
                 rec.class_b.map(|v| v as i64),
                 rec.f_pending.map(|v| v as i64),
                 rec.f_opts_len.map(|v| v as i64),
+                rec.malformed.as_ref().map(malformed_str),
             ],
         )?;
         Ok(())
@@ -464,8 +578,73 @@ impl Storage {
 // ---------------------------------------------------------------------------
 
 fn init(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let existed = table_exists(conn, "messages")?;
     conn.execute_batch(INIT_SQL)?;
-    migrate(conn)
+    let from = schema_version(conn)?;
+    migrate(conn)?;
+    let to = schema_version(conn)?;
+    if !existed {
+        emit(
+            Level::Info,
+            format!("Database created at schema version {to}"),
+        );
+    } else if to != from {
+        emit(
+            Level::Info,
+            format!("Database schema upgraded from version {from} to {to}"),
+        );
+    }
+
+    // The schema is in place, so a failure from here on must not stop the
+    // sniffer: forwarding matters more than hiding old noise.  The rows keep
+    // `classified = 0` and the next start tries again.
+    match classify_unchecked(conn) {
+        Ok(Some(checked)) => {
+            emit(
+                Level::Info,
+                format!(
+                    "Checked {} stored rows, {} malformed, in {} ms",
+                    checked.rows,
+                    checked.malformed,
+                    checked.elapsed.as_millis()
+                ),
+            );
+            // The pass has committed by now.  Shrinking the log is only
+            // housekeeping, so a failure is a warning and nothing is redone.
+            if checked.first_pass {
+                if let Err(e) = truncate_wal(conn) {
+                    emit(
+                        Level::Warn,
+                        format!(
+                            "Checked the stored rows, but could not shrink the write-ahead log: {e}; \
+                             it is removed when the sniffer next stops cleanly"
+                        ),
+                    );
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => emit(
+            Level::Error,
+            format!(
+                "Could not check stored rows for malformed frames: {e}; will retry at the next start"
+            ),
+        ),
+    }
+    Ok(())
+}
+
+/// The database's schema version (`PRAGMA user_version`).
+fn schema_version(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+}
+
+fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        params![name],
+        |r| r.get(0),
+    )
 }
 
 /// Apply every entry of [`MIGRATIONS`] newer than the database's
@@ -476,7 +655,7 @@ fn init(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 /// instead of half-migrated (SQLite DDL and `user_version` are both
 /// transactional).
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
-    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let current = schema_version(conn)?;
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let target = i as i64 + 1;
         if target <= current {
@@ -488,6 +667,159 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         tx.commit()?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Classifying stored rows
+// ---------------------------------------------------------------------------
+
+/// What a committed pass of [`classify_unchecked`] did.
+#[derive(Debug)]
+struct Checked {
+    /// Rows that were unchecked and now are checked.
+    rows: usize,
+    /// How many of them were marked malformed.
+    malformed: usize,
+    /// Whether this was the first pass, which visits every row and creates
+    /// the partial index.
+    first_pass: bool,
+    elapsed: Duration,
+}
+
+/// Check the stored rows that have not been checked, in one transaction.
+///
+/// Returns `Ok(None)` when there was nothing to do, which is every normal
+/// start.  Once the partial index exists that costs one count over an empty
+/// index.  Before it exists, which is the first start after the upgrade and
+/// every start until one pass has succeeded, every row is visited; a line in
+/// the log says so first, because on a large database that takes a while and
+/// forwarding does not start until it is over.
+///
+/// A failure rolls back the whole pass, the index included, and is returned
+/// as SQLite reported it so that a caller can tell a full disk from anything
+/// else.  Logging it is the caller's job.
+fn classify_unchecked(conn: &mut Connection) -> rusqlite::Result<Option<Checked>> {
+    let index_exists: bool = conn.query_row(UNCLASSIFIED_INDEX_EXISTS_SQL, [], |r| r.get(0))?;
+    // A new database has nothing to check: its pass only makes the index, and
+    // says nothing about it.
+    let mut empty = false;
+    if index_exists {
+        let unchecked: i64 = conn.query_row(COUNT_UNCLASSIFIED_SQL, [], |r| r.get(0))?;
+        if unchecked == 0 {
+            return Ok(None);
+        }
+        emit(
+            Level::Info,
+            format!(
+                "Checking {unchecked} stored rows recorded by an older version for malformed frames"
+            ),
+        );
+    } else {
+        // The highest row number stands in for the row count: unlike
+        // COUNT(*), it does not read the table.
+        let about: i64 =
+            conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM messages", [], |r| {
+                r.get(0)
+            })?;
+        empty = about == 0;
+        if !empty {
+            emit(
+                Level::Info,
+                format!(
+                    "Checking every stored row for malformed frames (about {about} rows); \
+                     forwarding starts when this is done"
+                ),
+            );
+        }
+    }
+
+    let started = Instant::now();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let malformed = tx.execute(CLASSIFY_MALFORMED_SQL, [])?;
+    let rest = tx.execute(CLASSIFY_REST_SQL, [])?;
+    tx.execute_batch(UNCLASSIFIED_INDEX_SQL)?;
+    tx.commit()?;
+
+    if empty {
+        return Ok(None);
+    }
+    Ok(Some(Checked {
+        rows: malformed + rest,
+        malformed,
+        first_pass: !index_exists,
+        elapsed: started.elapsed(),
+    }))
+}
+
+/// Fold the write-ahead log into the database and truncate it.
+///
+/// The first pass rewrites every row, so the log grows with the database, and
+/// SQLite does not shrink it while this connection stays open, which in the
+/// sniffer is until it stops.  Without this the file keeps that size for the
+/// whole run.
+///
+/// The checkpoint does not wait for other connections: a reader that still
+/// holds an older snapshot (a backup tool, say) makes it report `busy`, which
+/// is returned as an error here.  Nothing is lost by that.  The log is removed
+/// when the last connection closes.
+fn truncate_wal(conn: &Connection) -> Result<(), String> {
+    // Connections wait for a lock for a few seconds by default.  That is
+    // right for a write but pointless here: the start is already delayed by
+    // the pass, and the log goes away at the next clean stop anyway.
+    let wait: i64 = conn
+        .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    conn.busy_timeout(Duration::ZERO)
+        .map_err(|e| e.to_string())?;
+    let checkpoint = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+        r.get::<_, i64>(0)
+    });
+    conn.busy_timeout(Duration::from_millis(wait.max(0) as u64))
+        .map_err(|e| e.to_string())?;
+
+    match checkpoint {
+        Ok(0) => Ok(()),
+        Ok(_) => Err("another connection is still reading the database".to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Log a line, and in tests also record it for the test that is running.
+///
+/// The process-wide logger belongs to whichever test installs one first, and
+/// the tests run in parallel, so a test cannot rely on it to see what a
+/// particular `open` logged.
+fn emit(level: Level, message: String) {
+    log::log!(level, "{message}");
+    #[cfg(test)]
+    log_capture::record(level, &message);
+}
+
+/// What the current test's thread logged through [`emit`].
+#[cfg(test)]
+mod log_capture {
+    use log::Level;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LINES: RefCell<Option<Vec<(Level, String)>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn record(level: Level, message: &str) {
+        LINES.with(|lines| {
+            if let Some(lines) = lines.borrow_mut().as_mut() {
+                lines.push((level, message.to_string()));
+            }
+        });
+    }
+
+    /// Run `f` and return its result with the lines it logged on this thread.
+    pub(super) fn capture<R>(f: impl FnOnce() -> R) -> (R, Vec<(Level, String)>) {
+        LINES.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
+        let result = f();
+        let lines = LINES.with(|lines| lines.borrow_mut().take().unwrap_or_default());
+        (result, lines)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +913,10 @@ fn row_to_record(row: &rusqlite::Row) -> Result<MessageRecord, rusqlite::Error> 
         class_b: get_flag(row, 24)?,
         f_pending: get_flag(row, 25)?,
         f_opts_len: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
+        malformed: row
+            .get::<_, Option<String>>(27)?
+            .as_deref()
+            .and_then(parse_malformed),
     })
 }
 
@@ -620,6 +956,21 @@ fn crc_str(c: &CrcStatus) -> &'static str {
         CrcStatus::Ok => "ok",
         CrcStatus::Fail => "fail",
         CrcStatus::NoCrc => "no_crc",
+    }
+}
+
+fn malformed_str(m: &Malformed) -> &'static str {
+    m.as_str()
+}
+
+/// The reason for a stored `malformed` value, or `None` for anything that is
+/// not one of the three names (an empty column included).
+fn parse_malformed(s: &str) -> Option<Malformed> {
+    match s {
+        "crc" => Some(Malformed::Crc),
+        "mhdr" => Some(Malformed::Mhdr),
+        "length" => Some(Malformed::Length),
+        _ => None,
     }
 }
 
@@ -677,6 +1028,7 @@ mod tests {
             class_b: None,
             f_pending: None,
             f_opts_len: None,
+            malformed: None,
         }
     }
 
@@ -744,6 +1096,7 @@ mod tests {
             class_b: None,
             f_pending: None,
             f_opts_len: None,
+            malformed: None,
         };
         s.insert(&rec).unwrap();
         assert_eq!(s.count().unwrap(), 1);
@@ -780,6 +1133,7 @@ mod tests {
             class_b: None,
             f_pending: None,
             f_opts_len: None,
+            malformed: None,
         };
         s.insert(&rec).unwrap();
         assert_eq!(s.count().unwrap(), 1);
@@ -1026,10 +1380,12 @@ mod tests {
             "class_b",
             "f_pending",
             "f_opts_len",
+            "malformed",
+            "classified",
         ] {
             assert!(columns.iter().any(|c| c == new), "missing column {new}");
         }
-        assert_eq!(columns.len(), 27);
+        assert_eq!(columns.len(), 29);
 
         // The labels table arrives with the same upgrade, empty and usable.
         assert!(s.labels().unwrap().is_empty());
@@ -1093,7 +1449,9 @@ mod tests {
     fn new_database_is_at_the_latest_version() {
         let s = Storage::open_in_memory().unwrap();
         assert_eq!(user_version(&s), MIGRATIONS.len() as i64);
-        assert_eq!(column_names(&s).len(), 27);
+        let columns = column_names(&s);
+        assert_eq!(columns.len(), 29);
+        assert_eq!(&columns[27..], ["malformed", "classified"]);
     }
 
     #[test]
@@ -1316,8 +1674,11 @@ mod tests {
         }
 
         let s = Storage::open(&path).unwrap();
-        assert_eq!(user_version(&s), 2);
-        assert_eq!(MIGRATIONS.len(), 2);
+        assert_eq!(user_version(&s), MIGRATIONS.len() as i64);
+        assert!(
+            MIGRATIONS.len() >= 3,
+            "the upgrade passes through the labels table"
+        );
 
         // The table exists with the documented columns.
         let columns: Vec<String> = {
@@ -1356,7 +1717,7 @@ mod tests {
         );
         drop(s);
         let s = Storage::open(&path).unwrap();
-        assert_eq!(user_version(&s), 2);
+        assert_eq!(user_version(&s), MIGRATIONS.len() as i64);
         assert_eq!(s.count().unwrap(), 2);
         assert_eq!(s.labels().unwrap().len(), 2);
     }
@@ -1793,6 +2154,1366 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Malformed frames: persistence
+    // -----------------------------------------------------------------------
+
+    /// The `malformed` verdict with the body fields cleared, as the decoder
+    /// leaves a record it rejects.
+    fn malformed_record(id: &str, at: DateTime<Utc>, reason: Malformed) -> MessageRecord {
+        let mut rec = sample_record();
+        rec.id = id.to_string();
+        rec.timestamp = at;
+        rec.malformed = Some(reason);
+        rec.dev_addr = None;
+        rec.fcnt = None;
+        rec.fport = None;
+        rec
+    }
+
+    #[test]
+    fn the_stored_reason_text_round_trips_and_anything_else_reads_as_none() {
+        for reason in [Malformed::Crc, Malformed::Mhdr, Malformed::Length] {
+            assert_eq!(parse_malformed(malformed_str(&reason)), Some(reason));
+        }
+        for text in ["", "CRC", "Length", "unknown", "0", "crc "] {
+            assert_eq!(parse_malformed(text), None, "{text:?}");
+        }
+
+        // A value from a newer version, or a damaged one, reads as not
+        // malformed instead of failing the whole query.
+        let s = Storage::open_in_memory().unwrap();
+        s.insert(&sample_record()).unwrap();
+        s.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE messages SET malformed = 'bogus'", [])
+            .unwrap();
+        assert_eq!(s.query_recent(10).unwrap()[0].malformed, None);
+    }
+
+    #[test]
+    fn each_reason_and_none_round_trip_and_every_inserted_row_is_marked_checked() {
+        let s = Storage::open_in_memory().unwrap();
+        let base = Utc::now();
+
+        let mut valid = sample_record();
+        valid.id = "valid".to_string();
+        valid.timestamp = base;
+        let records = [
+            valid,
+            malformed_record("crc", base + chrono::Duration::seconds(1), Malformed::Crc),
+            malformed_record("mhdr", base + chrono::Duration::seconds(2), Malformed::Mhdr),
+            malformed_record(
+                "length",
+                base + chrono::Duration::seconds(3),
+                Malformed::Length,
+            ),
+        ];
+        for rec in &records {
+            s.insert(rec).unwrap();
+        }
+
+        let rows = s.query_recent(10).unwrap();
+        assert_eq!(rows.len(), 4);
+        for expected in &records {
+            let got = rows.iter().find(|r| r.id == expected.id).unwrap();
+            assert_eq!(got.malformed, expected.malformed, "record {}", expected.id);
+            assert_eq!(json(got), json(expected), "record {}", expected.id);
+        }
+
+        // The incremental query used by the API reads the column too.
+        let rows = s
+            .query_since(base - chrono::Duration::seconds(1), 10)
+            .unwrap();
+        let reasons: Vec<Option<Malformed>> = rows.iter().map(|r| r.malformed).collect();
+        assert_eq!(
+            reasons,
+            [
+                None,
+                Some(Malformed::Crc),
+                Some(Malformed::Mhdr),
+                Some(Malformed::Length)
+            ]
+        );
+
+        // In the table the reason is the plain text of its name, and this
+        // version says it has checked every row it writes.
+        let conn = s.conn.lock().unwrap();
+        let stored: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT id, malformed FROM messages ORDER BY timestamp")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let expected: Vec<(String, Option<String>)> = [
+            ("valid", None),
+            ("crc", Some("crc")),
+            ("mhdr", Some("mhdr")),
+            ("length", Some("length")),
+        ]
+        .into_iter()
+        .map(|(id, reason)| (id.to_string(), reason.map(str::to_string)))
+        .collect();
+        assert_eq!(stored, expected);
+        let unchecked: i64 = conn
+            .query_row(COUNT_UNCLASSIFIED_SQL, [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unchecked, 0);
+        let checked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE classified = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(checked, 4);
+    }
+
+    #[test]
+    fn replacing_a_record_keeps_it_checked() {
+        let s = Storage::open_in_memory().unwrap();
+        let mut rec = sample_record();
+        rec.id = "same".to_string();
+        s.insert(&rec).unwrap();
+        s.insert(&malformed_record("same", rec.timestamp, Malformed::Crc))
+            .unwrap();
+
+        let rows = s.query_recent(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].malformed, Some(Malformed::Crc));
+        let unchecked: i64 = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(COUNT_UNCLASSIFIED_SQL, [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(unchecked, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Rows written by older versions
+    // -----------------------------------------------------------------------
+
+    /// The `device_labels` table as the previous version created it, which
+    /// makes the database one at schema version 2.
+    const SCHEMA_2_LABELS: &str = "
+    CREATE TABLE device_labels (
+        device     TEXT PRIMARY KEY,
+        label      TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    PRAGMA user_version = 2;
+    ";
+
+    /// The column list the previous version inserted with: no `malformed`, no
+    /// `classified`.  Frozen, like the schemas above.
+    const INSERT_SCHEMA_2: &str = "
+    INSERT OR REPLACE INTO messages (
+        id, timestamp, direction, status, blocked_by, source_protocol,
+        freq_mhz, datarate, rssi, snr, crc_status,
+        mtype, dev_addr, dev_eui, fcnt, fport, payload_size, toa_ms,
+        gateway_eui, join_eui, dev_nonce,
+        adr, adr_ack_req, ack, class_b, f_pending, f_opts_len
+    ) VALUES (
+        ?1,  ?2,  ?3,  ?4,  ?5,  ?6,
+        ?7,  ?8,  ?9,  ?10, ?11,
+        ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+        ?19, ?20, ?21,
+        ?22, ?23, ?24, ?25, ?26, ?27
+    )";
+
+    /// The columns the previous version selected.  Followed by `NULL` in a
+    /// query, they give `row_to_record` the column it expects at the end.
+    const SELECT_SCHEMA_2_COLS: &str = "
+        id, timestamp, direction, status, blocked_by, source_protocol,
+        freq_mhz, datarate, rssi, snr, crc_status,
+        mtype, dev_addr, dev_eui, fcnt, fport, payload_size, toa_ms,
+        gateway_eui, join_eui, dev_nonce,
+        adr, adr_ack_req, ack, class_b, f_pending, f_opts_len
+    ";
+
+    /// The twelve fields read from a frame's body, which a malformed record
+    /// does not carry.
+    const BODY_KEYS: [&str; 12] = [
+        "dev_addr",
+        "dev_eui",
+        "join_eui",
+        "dev_nonce",
+        "fcnt",
+        "fport",
+        "adr",
+        "adr_ack_req",
+        "ack",
+        "class_b",
+        "f_pending",
+        "f_opts_len",
+    ];
+
+    /// A row as the previous version stored it.
+    #[derive(Clone)]
+    struct OldRow {
+        id: String,
+        timestamp: String,
+        direction: &'static str,
+        crc_status: Option<&'static str>,
+        mtype: &'static str,
+        dev_addr: Option<String>,
+        dev_eui: Option<String>,
+        join_eui: Option<String>,
+        dev_nonce: Option<i64>,
+        fcnt: Option<i64>,
+        fport: Option<i64>,
+        payload_size: i64,
+        /// ADR, ADRACKReq, ACK, ClassB, FPending.
+        flags: [Option<i64>; 5],
+        f_opts_len: Option<i64>,
+    }
+
+    impl OldRow {
+        /// An uplink that carries no identifier and no header field.
+        fn bare(id: &str, mtype: &'static str, size: i64) -> Self {
+            Self {
+                id: id.to_string(),
+                timestamp: "2026-03-01T10:00:00+00:00".to_string(),
+                direction: "up",
+                crc_status: Some("ok"),
+                mtype,
+                dev_addr: None,
+                dev_eui: None,
+                join_eui: None,
+                dev_nonce: None,
+                fcnt: None,
+                fport: None,
+                payload_size: size,
+                flags: [None; 5],
+                f_opts_len: None,
+            }
+        }
+
+        /// An uplink data frame with every header field filled in.
+        fn data(id: &str, mtype: &'static str, size: i64) -> Self {
+            Self {
+                dev_addr: Some("01ABCDEF".to_string()),
+                fcnt: Some(1234),
+                fport: Some(1),
+                flags: [Some(1), Some(0), Some(0), Some(1), None],
+                f_opts_len: Some(0),
+                ..Self::bare(id, mtype, size)
+            }
+        }
+
+        /// A JoinRequest with its EUIs and nonce.
+        fn join(id: &str, size: i64) -> Self {
+            Self {
+                dev_eui: Some("01:02:03:04:05:06:07:08".to_string()),
+                join_eui: Some("00:00:00:00:00:00:00:01".to_string()),
+                dev_nonce: Some(0xBEEF),
+                ..Self::bare(id, "JoinRequest", size)
+            }
+        }
+
+        fn downlink(mut self) -> Self {
+            self.direction = "down";
+            self.crc_status = None;
+            self.flags = [Some(1), None, Some(0), None, Some(1)];
+            self
+        }
+
+        fn crc(mut self, status: Option<&'static str>) -> Self {
+            self.crc_status = status;
+            self
+        }
+
+        fn f_opts(mut self, len: Option<i64>) -> Self {
+            self.f_opts_len = len;
+            self
+        }
+
+        fn dev_addr(mut self, dev_addr: &str) -> Self {
+            self.dev_addr = Some(dev_addr.to_string());
+            self
+        }
+
+        /// Seconds after the common start time, to order rows.
+        fn at(mut self, seconds: i64) -> Self {
+            let start = DateTime::parse_from_rfc3339("2026-03-01T10:00:00+00:00").unwrap();
+            self.timestamp = (start + chrono::Duration::seconds(seconds)).to_rfc3339();
+            self
+        }
+    }
+
+    /// Insert a row through the column list of the previous version.
+    fn insert_old(conn: &Connection, row: &OldRow) {
+        let up = row.direction == "up";
+        conn.prepare_cached(INSERT_SCHEMA_2)
+            .unwrap()
+            .execute(params![
+                row.id,
+                row.timestamp,
+                row.direction,
+                "forwarded",
+                None::<String>,
+                "udp",
+                868.1,
+                "SF7BW125",
+                up.then_some(-55),
+                up.then_some(8.5),
+                row.crc_status,
+                row.mtype,
+                row.dev_addr,
+                row.dev_eui,
+                row.fcnt,
+                row.fport,
+                row.payload_size,
+                Some(61.7),
+                "AA:BB:CC:DD:00:11:22:33",
+                row.join_eui,
+                row.dev_nonce,
+                row.flags[0],
+                row.flags[1],
+                row.flags[2],
+                row.flags[3],
+                row.flags[4],
+                row.f_opts_len,
+            ])
+            .unwrap();
+    }
+
+    fn insert_old_rows(path: &str, rows: &[OldRow]) {
+        let conn = Connection::open(path).unwrap();
+        for row in rows {
+            insert_old(&conn, row);
+        }
+    }
+
+    /// A file database as the previous version leaves it: schema version 2,
+    /// holding `rows`.
+    fn schema_2_database(path: &str, rows: &[OldRow]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(SCHEMA_V2_0_0).unwrap();
+        conn.execute_batch(SCHEMA_V2_1_0_UPGRADE).unwrap();
+        conn.execute_batch(SCHEMA_2_LABELS).unwrap();
+        for row in rows {
+            insert_old(&conn, row);
+        }
+        assert_eq!(schema_version(&conn).unwrap(), 2);
+    }
+
+    fn read_records(conn: &Connection, sql: &str) -> BTreeMap<String, MessageRecord> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt
+            .query_map([], row_to_record)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows.into_iter().map(|r| (r.id.clone(), r)).collect()
+    }
+
+    /// The rows of a schema 2 database, read the way the previous version did.
+    fn records_at_schema_2(path: &str) -> BTreeMap<String, MessageRecord> {
+        let conn = Connection::open(path).unwrap();
+        read_records(
+            &conn,
+            &format!("SELECT {SELECT_SCHEMA_2_COLS}, NULL FROM messages"),
+        )
+    }
+
+    fn records(s: &Storage) -> BTreeMap<String, MessageRecord> {
+        let conn = s.conn.lock().unwrap();
+        read_records(&conn, &format!("SELECT {SELECT_COLS} FROM messages"))
+    }
+
+    fn scalar(s: &Storage, sql: &str) -> i64 {
+        s.conn
+            .lock()
+            .unwrap()
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn unchecked_rows(s: &Storage) -> i64 {
+        scalar(s, COUNT_UNCLASSIFIED_SQL)
+    }
+
+    fn index_exists(s: &Storage) -> bool {
+        scalar(s, UNCLASSIFIED_INDEX_EXISTS_SQL) != 0
+    }
+
+    type Lines = Vec<(Level, String)>;
+
+    fn open_logged(path: &str) -> (Storage, Lines) {
+        let (s, lines) = log_capture::capture(|| Storage::open(path));
+        (s.unwrap(), lines)
+    }
+
+    fn logged(lines: &Lines, level: Level, text: &str) -> bool {
+        lines.iter().any(|(l, m)| *l == level && m.contains(text))
+    }
+
+    fn mentions(lines: &Lines, text: &str) -> bool {
+        lines.iter().any(|(_, m)| m.contains(text))
+    }
+
+    /// What a record becomes when it was `before` and is now judged `reason`:
+    /// the same, with the body fields gone and the reason set.
+    fn expected_json(before: &MessageRecord, reason: Option<Malformed>) -> serde_json::Value {
+        let mut expected = json(before);
+        if let Some(reason) = reason {
+            for key in BODY_KEYS {
+                expected[key] = serde_json::Value::Null;
+            }
+            expected["malformed"] = serde_json::json!(reason.as_str());
+        }
+        expected
+    }
+
+    #[test]
+    fn upgrades_a_schema_2_database_classifying_existing_rows() {
+        use Malformed::{Crc, Length};
+
+        let cases: Vec<(OldRow, Option<Malformed>)> = vec![
+            (OldRow::data("valid", "UnconfirmedDataUp", 23).at(1), None),
+            (
+                OldRow::data("crc", "UnconfirmedDataUp", 23)
+                    .crc(Some("fail"))
+                    .at(2),
+                Some(Crc),
+            ),
+            (
+                OldRow::data("short", "UnconfirmedDataUp", 9).at(3),
+                Some(Length),
+            ),
+            // 14 bytes cannot hold 3 bytes of FOpts, 15 can.
+            (
+                OldRow::data("fopts-short", "ConfirmedDataUp", 14)
+                    .f_opts(Some(3))
+                    .at(4),
+                Some(Length),
+            ),
+            (
+                OldRow::data("fopts-fits", "ConfirmedDataUp", 15)
+                    .f_opts(Some(3))
+                    .at(5),
+                None,
+            ),
+            // A row from 2.0.0 has no FOptsLen: only the 12-byte floor applies.
+            (
+                OldRow::data("no-fopts-len", "UnconfirmedDataUp", 12)
+                    .f_opts(None)
+                    .at(6),
+                None,
+            ),
+            (OldRow::join("join", 23).at(7), None),
+            (OldRow::join("join-20", 20).at(8), Some(Length)),
+            (OldRow::bare("accept-17", "JoinAccept", 17).at(9), None),
+            (
+                OldRow::bare("accept-10", "JoinAccept", 10).at(10),
+                Some(Length),
+            ),
+            (OldRow::bare("rejoin-19", "RejoinRequest", 19).at(11), None),
+            (OldRow::bare("rejoin-24", "RejoinRequest", 24).at(12), None),
+            (
+                OldRow::bare("rejoin-20", "RejoinRequest", 20).at(13),
+                Some(Length),
+            ),
+            (OldRow::bare("proprietary", "Proprietary", 5).at(14), None),
+            (OldRow::bare("unknown", "Unknown", 1).at(15), None),
+            (
+                OldRow::data("downlink", "UnconfirmedDataDown", 13)
+                    .downlink()
+                    .at(16),
+                None,
+            ),
+            (
+                OldRow::data("no-crc", "UnconfirmedDataUp", 23)
+                    .crc(Some("no_crc"))
+                    .at(17),
+                None,
+            ),
+            // The failed CRC is the reason even when the length is wrong too.
+            (
+                OldRow::data("crc-and-short", "UnconfirmedDataUp", 9)
+                    .crc(Some("fail"))
+                    .at(18),
+                Some(Crc),
+            ),
+            (
+                OldRow::data("one-byte", "ConfirmedDataDown", 1)
+                    .crc(Some("fail"))
+                    .at(19),
+                Some(Crc),
+            ),
+            (
+                OldRow::join("join-crc", 23).crc(Some("fail")).at(20),
+                Some(Crc),
+            ),
+        ];
+        let rows: Vec<OldRow> = cases.iter().map(|(row, _)| row.clone()).collect();
+
+        let tmp = TempDb::new("classify-existing");
+        let path = tmp.path();
+        schema_2_database(&path, &rows);
+        let before = records_at_schema_2(&path);
+        assert_eq!(before.len(), rows.len());
+
+        let (s, lines) = open_logged(&path);
+
+        assert_eq!(s.count().unwrap(), rows.len() as i64);
+        assert_eq!(user_version(&s), MIGRATIONS.len() as i64);
+        assert!(MIGRATIONS.len() >= 3);
+        assert_eq!(unchecked_rows(&s), 0);
+        assert_eq!(
+            scalar(&s, "SELECT COUNT(*) FROM messages WHERE classified = 1"),
+            rows.len() as i64
+        );
+        assert!(index_exists(&s));
+
+        let after = records(&s);
+        let mut marked = 0;
+        for (row, reason) in &cases {
+            let got = &after[&row.id];
+            assert_eq!(got.malformed, *reason, "row {}", row.id);
+            assert_eq!(
+                json(got),
+                expected_json(&before[&row.id], *reason),
+                "row {}",
+                row.id
+            );
+            if reason.is_some() {
+                crate::core::metadata::assert_body_cleared(got);
+                marked += 1;
+            }
+        }
+
+        // The log says what is happening before it does it, and what it did.
+        let upgraded = format!(
+            "Database schema upgraded from version 2 to {}",
+            MIGRATIONS.len()
+        );
+        assert!(logged(&lines, Level::Info, &upgraded), "{lines:?}");
+        assert!(
+            logged(
+                &lines,
+                Level::Info,
+                &format!(
+                    "Checking every stored row for malformed frames (about {} rows); \
+                     forwarding starts when this is done",
+                    rows.len()
+                )
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            logged(
+                &lines,
+                Level::Info,
+                &format!("Checked {} stored rows, {marked} malformed, in", rows.len())
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|(l, _)| matches!(l, Level::Warn | Level::Error)),
+            "{lines:?}"
+        );
+
+        // A second start finds nothing to check and changes nothing.
+        let snapshot: Vec<serde_json::Value> = after.values().map(json).collect();
+        drop(s);
+        let (s, lines) = open_logged(&path);
+        assert!(!mentions(&lines, "Checking"), "{lines:?}");
+        assert!(!mentions(&lines, "Checked"), "{lines:?}");
+        assert!(!mentions(&lines, "upgraded"), "{lines:?}");
+        let again: Vec<serde_json::Value> = records(&s).values().map(json).collect();
+        assert_eq!(again, snapshot);
+        assert_eq!(unchecked_rows(&s), 0);
+    }
+
+    #[test]
+    fn a_new_database_says_it_was_created_and_checks_nothing() {
+        let tmp = TempDb::new("created");
+        let (s, lines) = open_logged(&tmp.path());
+        assert!(
+            logged(
+                &lines,
+                Level::Info,
+                &format!("Database created at schema version {}", MIGRATIONS.len())
+            ),
+            "{lines:?}"
+        );
+        assert!(!mentions(&lines, "Check"), "{lines:?}");
+        assert!(index_exists(&s));
+        drop(s);
+
+        // Opening it again says nothing about the schema.
+        let (_s, lines) = open_logged(&tmp.path());
+        assert!(!mentions(&lines, "Database"), "{lines:?}");
+    }
+
+    /// Every stored type and size, with every FOptsLen and CRC status, goes
+    /// through the SQL classification; the verdict must be the decoder's.
+    #[test]
+    fn the_classification_agrees_with_the_decoder_rules() {
+        use crate::core::decoder::{crc_failed, length_fits};
+
+        let mtypes = [
+            MType::JoinRequest,
+            MType::JoinAccept,
+            MType::UnconfirmedDataUp,
+            MType::UnconfirmedDataDown,
+            MType::ConfirmedDataUp,
+            MType::ConfirmedDataDown,
+            MType::RejoinRequest,
+            MType::Proprietary,
+            MType::Unknown,
+        ];
+        let sizes: Vec<i64> = (0..=40).chain([255]).collect();
+        let f_opts_lens: Vec<Option<i64>> =
+            std::iter::once(None).chain((0..=15).map(Some)).collect();
+        let crcs = [
+            None,
+            Some(CrcStatus::Ok),
+            Some(CrcStatus::Fail),
+            Some(CrcStatus::NoCrc),
+        ];
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V2_0_0).unwrap();
+        conn.execute_batch(SCHEMA_V2_1_0_UPGRADE).unwrap();
+        conn.execute_batch(SCHEMA_2_LABELS).unwrap();
+
+        // Rows go in one after the other, so reading them back by row number
+        // pairs each with the inputs that made it.
+        let mut inputs = Vec::new();
+        {
+            let tx = conn.transaction().unwrap();
+            for mtype in &mtypes {
+                for &size in &sizes {
+                    for &f_opts_len in &f_opts_lens {
+                        for crc in &crcs {
+                            let id = format!("row-{}", inputs.len());
+                            let row = OldRow::data(&id, mtype_str(mtype), size)
+                                .crc(crc.as_ref().map(crc_str))
+                                .f_opts(f_opts_len);
+                            insert_old(&tx, &row);
+                            inputs.push((mtype.clone(), size, f_opts_len, crc.clone()));
+                        }
+                    }
+                }
+            }
+            tx.commit().unwrap();
+        }
+        assert_eq!(inputs.len(), 9 * 42 * 17 * 4);
+
+        init(&mut conn).unwrap();
+
+        let stored: Vec<Option<Malformed>> = conn
+            .prepare("SELECT malformed FROM messages ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| {
+                Ok(r.get::<_, Option<String>>(0)?
+                    .as_deref()
+                    .and_then(parse_malformed))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(stored.len(), inputs.len());
+
+        let (mut crc_rows, mut length_rows, mut valid_rows) = (0, 0, 0);
+        for ((mtype, size, f_opts_len, crc), got) in inputs.iter().zip(&stored) {
+            // The stored form has no FOptsLen on a 2.0.0 row, so the data
+            // rule sees 0 there.
+            let expected = if crc_failed(crc.as_ref()) {
+                Some(Malformed::Crc)
+            } else if !length_fits(mtype, *size as usize, f_opts_len.unwrap_or(0) as u8) {
+                Some(Malformed::Length)
+            } else {
+                None
+            };
+            assert_eq!(
+                *got, expected,
+                "{mtype:?}, {size} bytes, FOptsLen {f_opts_len:?}, CRC {crc:?}"
+            );
+            match expected {
+                Some(Malformed::Crc) => crc_rows += 1,
+                Some(_) => length_rows += 1,
+                None => valid_rows += 1,
+            }
+        }
+        // The comparison above would pass trivially if one class were empty.
+        assert!(crc_rows > 0 && length_rows > 0 && valid_rows > 0);
+
+        // Whatever was marked has lost its body fields, and nothing else has.
+        let cleared_wrongly: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE malformed IS NOT NULL AND (
+                    dev_addr IS NOT NULL OR dev_eui IS NOT NULL OR join_eui IS NOT NULL
+                    OR dev_nonce IS NOT NULL OR fcnt IS NOT NULL OR fport IS NOT NULL
+                    OR adr IS NOT NULL OR adr_ack_req IS NOT NULL OR ack IS NOT NULL
+                    OR class_b IS NOT NULL OR f_pending IS NOT NULL OR f_opts_len IS NOT NULL)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cleared_wrongly, 0);
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE malformed IS NULL AND dev_addr = '01ABCDEF'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, valid_rows);
+    }
+
+    /// Two copies of a schema 2 database with a label on a DevAddr seen only
+    /// in a CRC-failed row, one on a DevAddr seen in a valid row.
+    fn labelled_schema_2_database(path: &str) {
+        schema_2_database(
+            path,
+            &[
+                OldRow::data("noise", "UnconfirmedDataUp", 23)
+                    .crc(Some("fail"))
+                    .dev_addr("6874FA22")
+                    .at(1),
+                OldRow::data("real", "UnconfirmedDataUp", 23).at(2),
+            ],
+        );
+        let conn = Connection::open(path).unwrap();
+        for (device, label) in [("6874FA22", "noise"), ("01ABCDEF", "control")] {
+            conn.execute(
+                "INSERT INTO device_labels (device, label, updated_at) VALUES (?1, ?2, ?3)",
+                params![device, label, "2026-03-01T10:00:00+00:00"],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_label_on_an_identifier_seen_only_in_malformed_rows_follows_the_lifetime_rule() {
+        let long_ago = days_ago(36_500);
+
+        // Under `Keep` both labels stay, whatever became of their rows.
+        let tmp = TempDb::new("label-keep");
+        labelled_schema_2_database(&tmp.path());
+        let s = Storage::open(&tmp.path()).unwrap();
+        assert!(records(&s)["noise"].malformed.is_some());
+        let pruned = s.delete_older_than(long_ago, OrphanPolicy::Keep).unwrap();
+        assert_eq!(pruned.messages, 0);
+        assert!(pruned.labels.is_empty());
+        assert_eq!(s.labels().unwrap().len(), 2);
+
+        // Under a rule that accepts no orphan, the device that now has no
+        // stored identifier loses its label; the one on a valid row does not.
+        let tmp = TempDb::new("label-prune");
+        labelled_schema_2_database(&tmp.path());
+        let s = Storage::open(&tmp.path()).unwrap();
+        let pruned = s
+            .delete_older_than(long_ago, OrphanPolicy::KeepIf(&|_| false))
+            .unwrap();
+        assert_eq!(pruned.messages, 0);
+        assert_eq!(pruned.labels, ["6874FA22"]);
+        let labels = s.labels().unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels["01ABCDEF"], "control");
+
+        // Nothing is left to label with the fake identifier.
+        assert_eq!(
+            s.set_label("6874FA22", "again", false, 10).unwrap(),
+            LabelWrite::UnknownDevice
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Rows an older version writes after the upgrade
+    // -----------------------------------------------------------------------
+
+    /// Rows an older version records, `copies` of each kind: a CRC-failed
+    /// uplink carrying the DevAddr of the lns01 noise, a 9-byte uplink with a
+    /// DevAddr, and a valid uplink.
+    fn old_rows(prefix: &str, copies: usize) -> Vec<(OldRow, Option<Malformed>)> {
+        let mut rows = Vec::new();
+        for n in 0..copies {
+            rows.push((
+                OldRow::data(&format!("{prefix}-{n}-crc"), "UnconfirmedDataUp", 23)
+                    .crc(Some("fail"))
+                    .dev_addr("6874FA22")
+                    .at(1000 + n as i64),
+                Some(Malformed::Crc),
+            ));
+            rows.push((
+                OldRow::data(&format!("{prefix}-{n}-short"), "UnconfirmedDataUp", 9)
+                    .dev_addr("0BADADD0")
+                    .at(2000 + n as i64),
+                Some(Malformed::Length),
+            ));
+            rows.push((
+                OldRow::data(&format!("{prefix}-{n}-valid"), "UnconfirmedDataUp", 23)
+                    .at(500 + n as i64),
+                None,
+            ));
+        }
+        rows
+    }
+
+    fn plain_rows(old: &[(OldRow, Option<Malformed>)]) -> Vec<OldRow> {
+        old.iter().map(|(row, _)| row.clone()).collect()
+    }
+
+    /// Every row of `old` is in `s`, with the verdict it should have, the
+    /// body fields of a malformed one gone and those of a valid one intact.
+    /// And no row in the table is left unchecked.
+    fn assert_checked(s: &Storage, old: &[(OldRow, Option<Malformed>)]) {
+        let all = records(s);
+        for (row, reason) in old {
+            let got = &all[&row.id];
+            assert_eq!(got.malformed, *reason, "row {}", row.id);
+            assert_eq!(got.mtype, mtype_of(row.mtype), "row {}", row.id);
+            assert_eq!(got.payload_size as i64, row.payload_size, "row {}", row.id);
+            match reason {
+                Some(_) => crate::core::metadata::assert_body_cleared(got),
+                None => {
+                    assert_eq!(got.dev_addr, row.dev_addr, "row {}", row.id);
+                    assert_eq!(got.fcnt.map(i64::from), row.fcnt, "row {}", row.id);
+                }
+            }
+        }
+        assert_eq!(unchecked_rows(s), 0);
+        assert!(index_exists(s));
+    }
+
+    fn mtype_of(text: &str) -> MType {
+        [
+            MType::JoinRequest,
+            MType::JoinAccept,
+            MType::UnconfirmedDataUp,
+            MType::UnconfirmedDataDown,
+            MType::ConfirmedDataUp,
+            MType::ConfirmedDataDown,
+            MType::RejoinRequest,
+            MType::Proprietary,
+            MType::Unknown,
+        ]
+        .into_iter()
+        .find(|m| mtype_str(m) == text)
+        .unwrap()
+    }
+
+    /// A database this version has opened and filled with `rows` records of
+    /// its own, closed again.
+    fn current_database(tmp: &TempDb, rows: usize) {
+        let s = Storage::open(&tmp.path()).unwrap();
+        for n in 0..rows {
+            store_record(&s, &format!("{:08X}", 0x0A00_0000 + n), days_ago(1));
+        }
+    }
+
+    #[test]
+    fn rows_recorded_by_an_older_version_are_classified_on_the_next_start() {
+        let tmp = TempDb::new("rollback");
+        let path = tmp.path();
+        current_database(&tmp, 4);
+
+        let old = old_rows("old", 1);
+        insert_old_rows(&path, &plain_rows(&old));
+        {
+            // The older version also labelled a device it believed in.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO device_labels (device, label, updated_at) VALUES ('6874FA22', 'noise', 'x')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let (s, lines) = open_logged(&path);
+        assert!(
+            logged(
+                &lines,
+                Level::Info,
+                "Checking 3 stored rows recorded by an older version for malformed frames"
+            ),
+            "{lines:?}"
+        );
+        assert!(!mentions(&lines, "Checking every"), "{lines:?}");
+        assert!(
+            logged(
+                &lines,
+                Level::Info,
+                "Checked 3 stored rows, 2 malformed, in"
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|(l, _)| matches!(l, Level::Warn | Level::Error)),
+            "{lines:?}"
+        );
+        assert_checked(&s, &old);
+        assert_eq!(s.count().unwrap(), 7);
+        assert_eq!(
+            scalar(
+                &s,
+                "SELECT COUNT(*) FROM messages WHERE dev_addr = '6874FA22'"
+            ),
+            0
+        );
+
+        // The label on the fake DevAddr follows the lifetime rule now that no
+        // row carries that identifier.
+        let long_ago = days_ago(36_500);
+        let kept = s.delete_older_than(long_ago, OrphanPolicy::Keep).unwrap();
+        assert!(kept.labels.is_empty());
+        assert_eq!(s.labels().unwrap().len(), 1);
+        let pruned = s
+            .delete_older_than(long_ago, OrphanPolicy::KeepIf(&|_| false))
+            .unwrap();
+        assert_eq!(pruned.labels, ["6874FA22"]);
+        assert!(s.labels().unwrap().is_empty());
+
+        // The next start has nothing to check.
+        drop(s);
+        let (_s, lines) = open_logged(&path);
+        assert!(!mentions(&lines, "Check"), "{lines:?}");
+    }
+
+    #[test]
+    fn rowid_reuse_does_not_hide_older_rows() {
+        let tmp = TempDb::new("rowid-reuse");
+        let path = tmp.path();
+        current_database(&tmp, 10);
+
+        // The newest rows go, and the rows the older version writes next take
+        // their row numbers.  A mark that said "rows up to number 10 are
+        // checked" would now hide them.
+        let old = old_rows("reuse", 1);
+        {
+            let conn = Connection::open(&path).unwrap();
+            let highest: i64 = conn
+                .query_row("SELECT MAX(rowid) FROM messages", [], |r| r.get(0))
+                .unwrap();
+            conn.execute("DELETE FROM messages WHERE rowid > 5", [])
+                .unwrap();
+            for (row, _) in &old {
+                insert_old(&conn, row);
+            }
+            let lowest_new: i64 = conn
+                .query_row(
+                    "SELECT MIN(rowid) FROM messages WHERE classified = 0",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(lowest_new <= highest, "{lowest_new} > {highest}");
+        }
+
+        let (s, lines) = open_logged(&path);
+        assert!(mentions(&lines, "Checking 3 stored rows"), "{lines:?}");
+        assert_checked(&s, &old);
+        assert_eq!(s.count().unwrap(), 8);
+    }
+
+    #[test]
+    fn an_emptied_table_does_not_hide_older_rows() {
+        let tmp = TempDb::new("emptied");
+        let path = tmp.path();
+        current_database(&tmp, 5);
+
+        // Retention removed everything; the older version then refills the
+        // table past the size it had.
+        let old = old_rows("refill", 3);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("DELETE FROM messages", []).unwrap();
+            for (row, _) in &old {
+                insert_old(&conn, row);
+            }
+        }
+        assert!(old.len() > 5);
+
+        let (s, lines) = open_logged(&path);
+        assert!(mentions(&lines, "Checking 9 stored rows"), "{lines:?}");
+        assert_checked(&s, &old);
+        assert_eq!(s.count().unwrap(), 9);
+    }
+
+    #[test]
+    fn vacuum_does_not_hide_older_rows() {
+        let tmp = TempDb::new("vacuum");
+        let path = tmp.path();
+        current_database(&tmp, 10);
+
+        let old = old_rows("vacuum", 2);
+        {
+            let conn = Connection::open(&path).unwrap();
+            // Gaps in the row numbers, so that VACUUM has something to move.
+            conn.execute("DELETE FROM messages WHERE rowid IN (2, 3, 5, 8)", [])
+                .unwrap();
+            for (row, _) in &old {
+                insert_old(&conn, row);
+            }
+            conn.execute_batch("VACUUM").unwrap();
+        }
+
+        let (s, lines) = open_logged(&path);
+        assert!(mentions(&lines, "Checking 6 stored rows"), "{lines:?}");
+        assert_checked(&s, &old);
+        assert_eq!(s.count().unwrap(), 12);
+    }
+
+    #[test]
+    fn repeated_rollbacks() {
+        let tmp = TempDb::new("repeated");
+        let path = tmp.path();
+        current_database(&tmp, 6);
+
+        // First rollback.
+        let first = old_rows("first", 2);
+        insert_old_rows(&path, &plain_rows(&first));
+        let (s, lines) = open_logged(&path);
+        assert!(mentions(&lines, "Checking 6 stored rows"), "{lines:?}");
+        assert_checked(&s, &first);
+
+        // A retention pass removes the oldest rows, which are the valid ones
+        // of the first rollback, among them the one with the highest row
+        // number.  The next rows the older version writes take that number.
+        let cutoff = DateTime::parse_from_rfc3339("2026-03-01T10:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc)
+            + chrono::Duration::seconds(800);
+        let pruned = s.delete_older_than(cutoff, OrphanPolicy::Keep).unwrap();
+        assert!(pruned.messages > 0);
+        let survivors: Vec<_> = first
+            .iter()
+            .filter(|(row, _)| row.timestamp.as_str() >= cutoff.to_rfc3339().as_str())
+            .cloned()
+            .collect();
+        drop(s);
+
+        // Second rollback.
+        let second = old_rows("second", 3);
+        insert_old_rows(&path, &plain_rows(&second));
+        let (s, lines) = open_logged(&path);
+        assert!(mentions(&lines, "Checking 9 stored rows"), "{lines:?}");
+        assert_checked(&s, &second);
+        // The rows the first round already settled are as they were.
+        assert!(!survivors.is_empty());
+        assert_checked(&s, &survivors);
+    }
+
+    #[test]
+    fn a_start_after_a_crash_has_nothing_to_check() {
+        let tmp = TempDb::new("crash");
+        let path = tmp.path();
+        let s = Storage::open(&path).unwrap();
+        s.insert(&sample_record()).unwrap();
+        // Bad header and wrong length at once: the header is the reason.
+        let mut rec = malformed_record("mhdr-and-short", Utc::now(), Malformed::Mhdr);
+        rec.payload_size = 9;
+        s.insert(&rec).unwrap();
+        s.insert(&malformed_record("crc", Utc::now(), Malformed::Crc))
+            .unwrap();
+
+        // Copy the files while the sniffer still has the database open: what
+        // a power cut would leave, with the rows only in the write-ahead log.
+        let crashed = tmp.dir.join("crashed.db");
+        let wal = format!("{path}-wal");
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        std::fs::copy(&path, &crashed).unwrap();
+        std::fs::copy(&wal, tmp.dir.join("crashed.db-wal")).unwrap();
+
+        let (c, lines) = open_logged(&crashed.to_string_lossy());
+        assert_eq!(
+            c.count().unwrap(),
+            3,
+            "the rows were recovered from the log"
+        );
+        assert!(!mentions(&lines, "Check"), "{lines:?}");
+        let all = records(&c);
+        assert_eq!(all["mhdr-and-short"].malformed, Some(Malformed::Mhdr));
+        assert_eq!(all["crc"].malformed, Some(Malformed::Crc));
+        assert_eq!(unchecked_rows(&c), 0);
+
+        // The count that decides whether to check anything reads the index,
+        // not the table.
+        let conn = c.conn.lock().unwrap();
+        let plan = query_plan(&conn, COUNT_UNCLASSIFIED_SQL, &[]);
+        assert!(
+            plan.iter().any(|l| l.contains("messages_unclassified")),
+            "plan: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|l| l.contains("SCAN messages") && !l.contains("INDEX messages_unclassified")),
+            "plan: {plan:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A pass that fails
+    // -----------------------------------------------------------------------
+
+    /// Rows for the failure tests: some of every verdict, with fake
+    /// identifiers in the ones that must lose them.
+    fn failure_fixture_rows() -> Vec<(OldRow, Option<Malformed>)> {
+        let mut rows = old_rows("fx", 4);
+        rows.push((
+            OldRow::join("fx-join-20", 20).at(4000),
+            Some(Malformed::Length),
+        ));
+        rows
+    }
+
+    /// The pass failed and was rolled back whole: the database is open at the
+    /// latest schema, no row has been touched, and there is no index.
+    fn assert_untouched_after_failed_pass(
+        s: &Storage,
+        lines: &Lines,
+        before: &BTreeMap<String, MessageRecord>,
+        error_text: &str,
+    ) {
+        assert_eq!(user_version(s), MIGRATIONS.len() as i64);
+        assert!(
+            logged(
+                lines,
+                Level::Error,
+                "Could not check stored rows for malformed frames"
+            ),
+            "{lines:?}"
+        );
+        assert!(logged(lines, Level::Error, error_text), "{lines:?}");
+        assert!(
+            logged(lines, Level::Error, "will retry at the next start"),
+            "{lines:?}"
+        );
+        assert!(!mentions(lines, "Checked"), "{lines:?}");
+
+        assert_eq!(s.count().unwrap(), before.len() as i64);
+        assert_eq!(
+            scalar(s, "SELECT COUNT(*) FROM messages WHERE classified = 0"),
+            before.len() as i64
+        );
+        assert_eq!(
+            scalar(
+                s,
+                "SELECT COUNT(*) FROM messages WHERE malformed IS NOT NULL"
+            ),
+            0
+        );
+        let after = records(s);
+        for (id, rec) in before {
+            assert_eq!(json(&after[id]), json(rec), "row {id}");
+        }
+        assert!(
+            before
+                .values()
+                .any(|r| r.dev_addr.as_deref() == Some("6874FA22")),
+            "the fixture must hold the fake identifier"
+        );
+        assert!(!index_exists(s));
+    }
+
+    #[test]
+    fn a_failed_classification_is_retried_at_the_next_start() {
+        // ---- A statement that aborts ---------------------------------------
+        let cases = failure_fixture_rows();
+        let rows = plain_rows(&cases);
+        let tmp = TempDb::new("retry-abort");
+        let path = tmp.path();
+        schema_2_database(&path, &rows);
+        let before = records_at_schema_2(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_update BEFORE UPDATE ON messages WHEN old.rowid = 3
+                 BEGIN SELECT RAISE(ABORT, 'test abort'); END;",
+            )
+            .unwrap();
+
+        let (s, lines) = open_logged(&path);
+        assert_untouched_after_failed_pass(&s, &lines, &before, "test abort");
+        drop(s);
+
+        // The same database without the obstacle is classified on the next start.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_update")
+            .unwrap();
+        let (s, lines) = open_logged(&path);
+        assert!(mentions(&lines, "Checking every stored row"), "{lines:?}");
+        assert!(
+            !lines
+                .iter()
+                .any(|(l, _)| matches!(l, Level::Warn | Level::Error)),
+            "{lines:?}"
+        );
+        assert_checked(&s, &cases);
+        assert_eq!(s.count().unwrap(), rows.len() as i64);
+
+        // ---- A database that cannot grow ------------------------------------
+        // The state a failed pass leaves: migration 3 is in, every row reads
+        // unchecked, there is no index.  The limit comes after the migration
+        // because adding the columns rewrites the schema on the first page,
+        // and a migration that fails is fatal by design.
+        let tmp = TempDb::new("retry-full");
+        let path = tmp.path();
+        schema_2_database(&path, &rows);
+        let before = records_at_schema_2(&path);
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(MIGRATIONS[2]).unwrap();
+            tx.pragma_update(None, "user_version", 3).unwrap();
+            tx.commit().unwrap();
+            // Packed pages and no free page: nothing is left to hand out.
+            conn.execute_batch("VACUUM").unwrap();
+            let free: i64 = conn
+                .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(free, 0);
+        }
+        let pages: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap();
+        let limit = |conn: &Connection| {
+            conn.pragma_update(None, "max_page_count", pages).unwrap();
+        };
+
+        // The error is SQLite's "full", not just some error.
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            limit(&conn);
+            match classify_unchecked(&mut conn) {
+                Err(rusqlite::Error::SqliteFailure(e, _)) => {
+                    assert_eq!(e.code, rusqlite::ErrorCode::DiskFull, "{e:?}")
+                }
+                other => panic!("expected a full database, got {other:?}"),
+            }
+        }
+
+        let (s, lines) = log_capture::capture(|| Storage::open_with(&path, limit));
+        let s = s.unwrap();
+        assert_untouched_after_failed_pass(&s, &lines, &before, "database or disk is full");
+        drop(s);
+
+        // Without the limit the next start does the work.
+        let (s, lines) = open_logged(&path);
+        assert!(mentions(&lines, "Checking every stored row"), "{lines:?}");
+        assert!(
+            !lines
+                .iter()
+                .any(|(l, _)| matches!(l, Level::Warn | Level::Error)),
+            "{lines:?}"
+        );
+        assert_checked(&s, &cases);
+        assert_eq!(s.count().unwrap(), rows.len() as i64);
+    }
+
+    #[test]
+    fn a_failed_wal_truncation_keeps_the_classification() {
+        let rows = [
+            OldRow::data("noise", "UnconfirmedDataUp", 23)
+                .crc(Some("fail"))
+                .dev_addr("6874FA22")
+                .at(1),
+            OldRow::data("real", "UnconfirmedDataUp", 23).at(2),
+        ];
+        let tmp = TempDb::new("wal-busy");
+        let path = tmp.path();
+        schema_2_database(&path, &rows);
+        let wal = format!("{path}-wal");
+
+        // A second connection holds a read snapshot from before the pass, so
+        // the log cannot be folded into the database and truncated.
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let seen: i64 = reader
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(seen, 2);
+
+        let started = Instant::now();
+        let (s, lines) = open_logged(&path);
+        // The truncation does not wait for the reader: connections wait five
+        // seconds for a lock by default.
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+
+        assert!(
+            logged(
+                &lines,
+                Level::Warn,
+                "Checked the stored rows, but could not shrink the write-ahead log"
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            logged(
+                &lines,
+                Level::Warn,
+                "it is removed when the sniffer next stops cleanly"
+            ),
+            "{lines:?}"
+        );
+        assert!(!mentions(&lines, "will retry"), "{lines:?}");
+        assert!(!lines.iter().any(|(l, _)| *l == Level::Error), "{lines:?}");
+
+        let all = records(&s);
+        assert_eq!(all["noise"].malformed, Some(Malformed::Crc));
+        crate::core::metadata::assert_body_cleared(&all["noise"]);
+        assert_eq!(all["real"].malformed, None);
+        assert_eq!(all["real"].dev_addr.as_deref(), Some("01ABCDEF"));
+        assert_eq!(unchecked_rows(&s), 0);
+        assert_eq!(
+            scalar(&s, "SELECT COUNT(*) FROM messages WHERE classified = 1"),
+            2
+        );
+        assert!(index_exists(&s));
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+
+        // Once the reader is gone, closing the last connection removes the log.
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        drop(s);
+        assert!(
+            std::fs::metadata(&wal)
+                .map(|m| m.len() == 0)
+                .unwrap_or(true),
+            "the log is still there"
+        );
+
+        // Nothing is checked again.
+        let (s, lines) = open_logged(&path);
+        assert!(!mentions(&lines, "Check"), "{lines:?}");
+        assert_eq!(records(&s)["noise"].malformed, Some(Malformed::Crc));
+        assert_eq!(unchecked_rows(&s), 0);
+    }
+
+    #[test]
+    fn truncating_the_log_leaves_the_busy_timeout_as_it_was() {
+        let tmp = TempDb::new("busy-timeout");
+        let s = Storage::open(&tmp.path()).unwrap();
+        let conn = s.conn.lock().unwrap();
+        let wait = |c: &Connection| -> i64 {
+            c.query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = wait(&conn);
+        truncate_wal(&conn).unwrap();
+        assert_eq!(wait(&conn), before);
+        assert!(before > 0, "connections wait for a lock by default");
+    }
+
+    // -----------------------------------------------------------------------
     // Query plans
     // -----------------------------------------------------------------------
 
@@ -2126,6 +3847,376 @@ mod tests {
         println!("large_db: EXPLAIN QUERY PLAN for the orphan query:");
         for line in &plan {
             println!("large_db:   {line}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Large database: the first start after the upgrade
+    // -----------------------------------------------------------------------
+
+    /// Row `i` of the million-row fixture, and the verdict it should get.
+    ///
+    /// Every hundred rows hold the same mix, shuffled by a step that is
+    /// coprime with 100, so that neighbouring rows differ and the rows to be
+    /// marked sit on every page of the table.  Of every hundred: 80 valid
+    /// uplinks, 5 JoinRequests, 3 downlinks, 8 with a failed CRC (of mixed
+    /// types and sizes), 2 nine-byte uplinks, 1 twenty-byte JoinRequest and
+    /// 1 ten-byte JoinAccept.
+    fn large_row(i: u32) -> (OldRow, Option<Malformed>) {
+        let id = format!("{:08x}-0000-4000-8000-{:012x}", i, u64::from(i) * 7919);
+        let at = i64::from(i / 10);
+        let addr = format!("{:08X}", 0x2600_0000u32.wrapping_add(i % 50_000));
+        match (i * 37) % 100 {
+            0..=79 => (
+                OldRow::data(&id, "UnconfirmedDataUp", 23)
+                    .dev_addr(&addr)
+                    .at(at),
+                None,
+            ),
+            80..=84 => (OldRow::join(&id, 23).at(at), None),
+            85..=87 => (
+                OldRow::data(&id, "UnconfirmedDataDown", 13)
+                    .dev_addr(&addr)
+                    .downlink()
+                    .at(at),
+                None,
+            ),
+            slot @ 88..=95 => {
+                let row = match slot - 88 {
+                    0 => OldRow::data(&id, "ConfirmedDataDown", 1).dev_addr(&addr),
+                    1 => OldRow::bare(&id, "Proprietary", 22),
+                    2 => OldRow::data(&id, "UnconfirmedDataUp", 238).dev_addr(&addr),
+                    3 => OldRow::data(&id, "UnconfirmedDataUp", 23).dev_addr(&addr),
+                    4 => OldRow::join(&id, 23),
+                    5 => OldRow::join(&id, 19),
+                    6 => OldRow::bare(&id, "JoinAccept", 17),
+                    _ => OldRow::bare(&id, "Unknown", 1),
+                };
+                (row.crc(Some("fail")).at(at), Some(Malformed::Crc))
+            }
+            96..=97 => (
+                OldRow::data(&id, "UnconfirmedDataUp", 9)
+                    .dev_addr(&addr)
+                    .at(at),
+                Some(Malformed::Length),
+            ),
+            98 => (OldRow::join(&id, 20).at(at), Some(Malformed::Length)),
+            _ => (
+                OldRow::bare(&id, "JoinAccept", 10).at(at),
+                Some(Malformed::Length),
+            ),
+        }
+    }
+
+    const LARGE_ROWS: u32 = 1_000_000;
+
+    /// Environment variable that carries the database path to the child.
+    const LARGE_DB_ENV: &str = "LORAWAN_SNIFFER_LARGE_DB";
+
+    /// Prefix of the one line the child prints.
+    const LARGE_DB_REPORT: &str = "large_db_open_child: ";
+
+    /// The process's peak resident set so far, in kB (Linux).
+    fn peak_rss_kb() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+        line.split_whitespace().nth(1)?.parse().ok()
+    }
+
+    fn file_size(path: &str) -> u64 {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Open the database named by the environment, the way the sniffer does at
+    /// start, twice, and report what it cost as one JSON line.
+    ///
+    /// This is the child of `large_db_migration_classifies_a_million_rows`.
+    /// It is a separate process because the peak resident set of a process
+    /// only ever grows: the process that built the fixture could not show
+    /// what opening it needs.
+    #[test]
+    #[ignore = "child of large_db_migration_classifies_a_million_rows"]
+    fn large_db_open_child() {
+        let Ok(path) = std::env::var(LARGE_DB_ENV) else {
+            println!("{LARGE_DB_ENV} is not set; nothing to open");
+            return;
+        };
+        let wal = format!("{path}-wal");
+
+        let rss_before = peak_rss_kb();
+        let t = Instant::now();
+        let s = Storage::open(&path).unwrap();
+        let first = t.elapsed();
+        let rss_after = peak_rss_kb();
+        // Still open: what the log weighs for as long as the sniffer runs.
+        let wal_after_first_open = file_size(&wal);
+        drop(s);
+
+        let t = Instant::now();
+        let s = Storage::open(&path).unwrap();
+        let second = t.elapsed();
+        let wal_after_second_open = file_size(&wal);
+        drop(s);
+
+        println!(
+            "{LARGE_DB_REPORT}{}",
+            serde_json::json!({
+                "first_open_ms": first.as_secs_f64() * 1000.0,
+                "second_open_ms": second.as_secs_f64() * 1000.0,
+                "peak_rss_before_kb": rss_before,
+                "peak_rss_after_kb": rss_after,
+                "wal_after_first_open_bytes": wal_after_first_open,
+                "wal_after_second_open_bytes": wal_after_second_open,
+            })
+        );
+    }
+
+    /// Open a million-row database written by the previous version, in a
+    /// fresh process, and check what it did.
+    ///
+    /// Run on its own, in release mode, on a real disk (`/tmp` may be memory):
+    /// `TMPDIR=<dir> cargo test --release -- --ignored large_db_migration --nocapture`.
+    ///
+    /// It asserts the result, not the time: the figures it prints are what the
+    /// user documentation quotes.
+    #[test]
+    #[ignore = "builds a million-row database; run with --release"]
+    fn large_db_migration_classifies_a_million_rows() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let tmp = TempDb::new("large-migration");
+        let path = tmp.path();
+        let wal = format!("{path}-wal");
+        let mb = |bytes: u64| bytes as f64 / 1_048_576.0;
+
+        // ---- Build the fixture ---------------------------------------------
+        let t = Instant::now();
+        let (mut crc_rows, mut length_rows, mut valid_rows) = (0u32, 0u32, 0u32);
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V2_0_0).unwrap();
+            conn.execute_batch(SCHEMA_V2_1_0_UPGRADE).unwrap();
+            conn.execute_batch(SCHEMA_2_LABELS).unwrap();
+            let tx = conn.transaction().unwrap();
+            for i in 0..LARGE_ROWS {
+                let (row, reason) = large_row(i);
+                match reason {
+                    Some(Malformed::Crc) => crc_rows += 1,
+                    Some(_) => length_rows += 1,
+                    None => valid_rows += 1,
+                }
+                insert_old(&tx, &row);
+            }
+            tx.commit().unwrap();
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                .unwrap();
+        }
+        let build = t.elapsed();
+        assert_eq!(
+            (crc_rows, length_rows, valid_rows),
+            (80_000, 40_000, 880_000)
+        );
+        let db_bytes = file_size(&path);
+        assert_eq!(file_size(&wal), 0);
+
+        // What a plain pass over the table costs, for comparison.
+        let (page_size, page_count, cache_size, floor_cold, floor_warm) = {
+            let conn = Connection::open(&path).unwrap();
+            let pragma = |name: &str| -> i64 {
+                conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+                    .unwrap()
+            };
+            let scan = || {
+                let t = Instant::now();
+                let n: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM messages WHERE payload_size < 0",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(n, 0);
+                t.elapsed()
+            };
+            let cold = scan();
+            let warm = scan();
+            (
+                pragma("page_size"),
+                pragma("page_count"),
+                pragma("cache_size"),
+                cold,
+                warm,
+            )
+        };
+
+        // ---- Open it in a fresh process, watching the log -------------------
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "core::storage::tests::large_db_open_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(LARGE_DB_ENV, &path)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let mut peak_wal = 0u64;
+        let status = loop {
+            peak_wal = peak_wal.max(file_size(&wal));
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let wall = started.elapsed();
+        let mut output = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        assert!(status.success(), "child failed:\n{output}");
+        let report: serde_json::Value = output
+            .lines()
+            // The test harness puts its own "test ... " text in front of it.
+            .find_map(|l| l.split_once(LARGE_DB_REPORT).map(|(_, json)| json))
+            .map(|json| serde_json::from_str(json).unwrap())
+            .unwrap_or_else(|| panic!("the child reported nothing:\n{output}"));
+        let final_wal = file_size(&wal);
+        let after_bytes = file_size(&path);
+
+        // ---- Check the result -------------------------------------------------
+        let conn = Connection::open(&path).unwrap();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(schema_version(&conn).unwrap(), MIGRATIONS.len() as i64);
+        assert_eq!(count("SELECT COUNT(*) FROM messages"), LARGE_ROWS as i64);
+        let crc = count("SELECT COUNT(*) FROM messages WHERE malformed = 'crc'");
+        let length = count("SELECT COUNT(*) FROM messages WHERE malformed = 'length'");
+        let valid = count("SELECT COUNT(*) FROM messages WHERE malformed IS NULL");
+        assert_eq!((crc, length, valid), (80_000, 40_000, 880_000));
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM messages WHERE malformed IS NOT NULL AND (
+                    dev_addr IS NOT NULL OR dev_eui IS NOT NULL OR join_eui IS NOT NULL
+                    OR dev_nonce IS NOT NULL OR fcnt IS NOT NULL OR fport IS NOT NULL
+                    OR adr IS NOT NULL OR adr_ack_req IS NOT NULL OR ack IS NOT NULL
+                    OR class_b IS NOT NULL OR f_pending IS NOT NULL OR f_opts_len IS NOT NULL)"
+            ),
+            0
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM messages WHERE classified = 1"),
+            LARGE_ROWS as i64
+        );
+        assert_eq!(count(COUNT_UNCLASSIFIED_SQL), 0);
+        assert_eq!(count(UNCLASSIFIED_INDEX_EXISTS_SQL), 1);
+        // A sample of rows, valid and marked, is what the generator made.
+        let mut sampled = 0;
+        for i in (0..LARGE_ROWS).step_by(997) {
+            let (row, reason) = large_row(i);
+            let got = conn
+                .query_row(
+                    &format!("SELECT {SELECT_COLS} FROM messages WHERE id = ?1"),
+                    params![row.id],
+                    row_to_record,
+                )
+                .unwrap();
+            assert_eq!(got.malformed, reason, "row {i}");
+            assert_eq!(got.payload_size as i64, row.payload_size, "row {i}");
+            match reason {
+                None => {
+                    assert_eq!(got.dev_addr, row.dev_addr, "row {i}");
+                    assert_eq!(got.dev_eui, row.dev_eui, "row {i}");
+                    assert_eq!(got.fcnt.map(i64::from), row.fcnt, "row {i}");
+                    assert_eq!(got.f_opts_len.map(i64::from), row.f_opts_len, "row {i}");
+                }
+                Some(_) => crate::core::metadata::assert_body_cleared(&got),
+            }
+            sampled += 1;
+        }
+        assert!(sampled > 1000);
+
+        // ---- The figures ----------------------------------------------------
+        let number = |key: &str| report[key].as_f64().unwrap_or(f64::NAN);
+        let ratio = peak_wal as f64 / db_bytes as f64;
+        let headroom = ((ratio * 1.5) * 10.0).ceil() / 10.0;
+        let rss_after_mb = number("peak_rss_after_kb") / 1024.0;
+        println!();
+        println!(
+            "large_db_migration: {LARGE_ROWS} rows built in {:.1} s; \
+             mix per hundred: 80 valid uplinks, 5 JoinRequests, 3 downlinks, 8 CRC-failed, \
+             2 nine-byte uplinks, 1 twenty-byte JoinRequest, 1 ten-byte JoinAccept",
+            build.as_secs_f64()
+        );
+        println!(
+            "large_db_migration: database {:.1} MiB before ({db_bytes} bytes, {page_count} pages of \
+             {page_size} bytes), {:.1} MiB after; cache_size {cache_size} (negative is kibibytes)",
+            mb(db_bytes),
+            mb(after_bytes)
+        );
+        println!(
+            "large_db_migration: plain full scan (SELECT COUNT(*) ... WHERE payload_size < 0): \
+             {:.0} ms first, {:.0} ms again",
+            floor_cold.as_secs_f64() * 1000.0,
+            floor_warm.as_secs_f64() * 1000.0
+        );
+        println!(
+            "large_db_migration: first open (migration 3 and the first pass) {:.0} ms; \
+             second open {:.2} ms; child ran {:.1} s end to end",
+            number("first_open_ms"),
+            number("second_open_ms"),
+            wall.as_secs_f64()
+        );
+        println!(
+            "large_db_migration: write-ahead log: peak {:.1} MiB ({peak_wal} bytes) = {ratio:.2} x the \
+             database size before; {} bytes right after the first open returned, {} bytes after the \
+             second, {final_wal} bytes once the child had exited",
+            mb(peak_wal),
+            number("wal_after_first_open_bytes"),
+            number("wal_after_second_open_bytes")
+        );
+        println!(
+            "large_db_migration: free space to advise: peak ratio x 1.5, rounded up to one decimal = \
+             {headroom:.1} x the database size"
+        );
+        println!(
+            "large_db_migration: child peak RSS (VmHWM): {} kB before the first open, {} kB after \
+             ({rss_after_mb:.1} MiB)",
+            report["peak_rss_before_kb"], report["peak_rss_after_kb"]
+        );
+        println!(
+            "large_db_migration: rows by verdict: crc {crc}, length {length}, not malformed {valid}; \
+             {sampled} sampled rows checked against the generator"
+        );
+
+        // The plans do not depend on the size of the table, so they are shown
+        // on an empty database: before the index exists (the first pass) and
+        // after (every later start).
+        let mut plans = Connection::open_in_memory().unwrap();
+        plans.execute_batch(INIT_SQL).unwrap();
+        migrate(&mut plans).unwrap();
+        for (when, with_index) in [
+            ("first pass, no index yet", false),
+            ("later starts, with the index", true),
+        ] {
+            if with_index {
+                plans.execute_batch(UNCLASSIFIED_INDEX_SQL).unwrap();
+            }
+            for (name, sql) in [
+                ("CLASSIFY_MALFORMED_SQL", CLASSIFY_MALFORMED_SQL),
+                ("CLASSIFY_REST_SQL", CLASSIFY_REST_SQL),
+                ("COUNT_UNCLASSIFIED_SQL", COUNT_UNCLASSIFIED_SQL),
+            ] {
+                println!(
+                    "large_db_migration: EXPLAIN QUERY PLAN ({when}) {name}: {}",
+                    query_plan(&plans, sql, &[]).join(" | ")
+                );
+            }
         }
     }
 }

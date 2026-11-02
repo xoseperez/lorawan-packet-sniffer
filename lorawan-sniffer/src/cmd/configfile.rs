@@ -128,6 +128,10 @@ const TEMPLATE: &str = r##"
 #   enabled     = true
 #   direction   = "up"
 #   suppress_ack = false
+#   # Message types to match; omit or leave empty to match every type. A rule
+#   # with a list never matches a malformed frame (CRC failed, bad header or
+#   # wrong length): its type is only its first byte read as a header, which
+#   # means nothing for noise. A rule without a list still matches them.
 #   mtype       = ["ConfirmedDataUp"]
 #   # Optional: only apply to these gateways (EUIs, with or without ':' or
 #   # '-'). Omit to apply to every gateway.

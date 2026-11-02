@@ -126,6 +126,10 @@
 #   # LoRaWAN MTypes to match. Omit or leave empty to match all MTypes.
 #   # Valid values: JoinRequest, JoinAccept, UnconfirmedDataUp, UnconfirmedDataDown,
 #   #               ConfirmedDataUp, ConfirmedDataDown, RejoinRequest, Proprietary
+#   # A rule with a list never matches a malformed frame (CRC failed, bad
+#   # header or wrong length): its type is only its first byte read as a
+#   # header, which means nothing for noise. A rule without a list still
+#   # matches malformed frames.
 #   mtype = ["ConfirmedDataUp"]
 #
 #   # Stealth mode: when true, the ACK is suppressed so the sender is
