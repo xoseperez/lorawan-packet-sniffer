@@ -20,7 +20,8 @@ Version 2 is a rewrite in Rust. The original version 1 (v0.x releases) lives on 
 - **MQTT publishing** — optionally publish every captured message as JSON to an MQTT broker over TCP or TLS (including mutual TLS), with a configurable topic template
 - **Self-forwarding protection** — refuses to start with an upstream that is its own port, and cuts any packet loop that still happens at runtime
 - **Persistent storage** — SQLite database with configurable retention; databases from earlier versions are upgraded in place
-- **Real-time WebUI** — React 19 SPA with WebSocket feed, live/pause toggle, client-side filters (device or label, gateway, MType, status, time range), sortable table, column visibility, color-coded signal quality (SNR thresholds are spreading-factor-aware), dark/light theme, CSV export
+- **Real-time WebUI** — React 19 SPA with WebSocket feed, live/pause toggle, filters that search the database (device or label, gateway, MType, status, time range), sortable table, column visibility, color-coded signal quality (SNR thresholds are spreading-factor-aware), dark/light theme, CSV export
+- **History from the database** — a time range loads the newest 5,000 matching records from the database, with the exact count of what matches; live records are merged in, and every reconnect reloads the range so the table has no hole (see [WebUI history](#webui-history))
 - **Device labels** — give a device a name from the WebUI ("Qingping T&H Havana" instead of `00E8A80B`); the label is stored in the database, shown on every row of that device, found by the device filter, included in the CSV export, and updated in every open WebUI at once
 - **Single binary** — React frontend is embedded at compile time; no separate web server needed
 - **Self-contained** — ZeroMQ and SQLite are compiled into the binary; no runtime system dependencies
@@ -487,9 +488,9 @@ The one change to [blocking rules](#blocking-rules): a rule with an `mtype` list
 
 - Malformed rows are **hidden by default**. A **Show malformed** checkbox at the end of the Type menu shows them. It is off by default and the browser remembers it, like the other filters.
 - Shown malformed rows are dimmed, and their type badge is dashed and struck through, with the hover text `Malformed: <reason>`. The Device cell, empty on these rows, says why in short words, so it can be read on a touch screen: `malformed: CRC failed`, `malformed: bad header` or `malformed: wrong length`. Hovering gives the full reason: "CRC check failed", "not a LoRaWAN 1.0/1.1 header" or "wrong length for a join request / join accept / rejoin request / data uplink / data downlink / frame".
-- The status bar shows **Malformed hidden: N** while the box is off and **Malformed shown: N** while it is on: how many malformed rows there are among the loaded rows that pass the other filters. Total and Blocked count every loaded row, malformed ones included.
+- The status bar shows **Malformed hidden: N** while the box is off and **Malformed shown: N** while it is on: how many malformed records in the database match the other filters (time range, device, type, status, gateway), as counted at the last load plus those received live since (see [the footer](#the-strip-and-the-footer)). With the box off, hidden malformed records are in neither Matching nor Shown.
 - The other filters (device, gateway, type, status, time) apply to malformed rows as well when they are shown, and the CSV export covers the rows shown.
-- Filtering is done in the browser, which loads the newest 500 records and keeps at most 10,000. Hidden malformed rows still take their place in those limits, so on a noisy gateway fewer useful rows are loaded than the numbers suggest.
+- The sniffer leaves hidden malformed records out when it loads the table, so they take no place among the 5,000 rows loaded, and the browser hides the live ones. Without WAL the sniffer cannot do that and the browser hides them after loading, so on a noisy gateway fewer useful rows are loaded than the numbers suggest (see [Databases without WAL](#databases-without-wal)).
 
 ### MQTT consumers
 
@@ -509,7 +510,7 @@ The database goes to schema version 3 on the first start. The upgrade runs in pl
 The sniffer then checks the rows already stored, **before it starts forwarding**, and marks those that are malformed:
 
 - It can apply two rules to stored rows: `crc`, from the stored CRC status, and `length`, from the stored type, size and FOptsLen. It clears the body-derived fields of the rows it marks. The `mhdr` rule cannot be applied, because the first byte is not stored. Rows written by 2.0.0 have no FOptsLen, so only the 12-byte minimum applies to their data frames.
-- **Time.** Every stored row is rewritten once, so the time grows with the database. For 1,000,000 rows (a 344 MB database) it took about 4 s on a development machine with NVMe storage. Slower storage, such as an SD card or eMMC, takes longer. Forwarding starts when the check is done.
+- **Time.** Every stored row is rewritten once, so the time grows with the database. For 1,000,000 rows (a 344 MB database) it took about 4 s on a development machine with NVMe storage, and about 80 s on a RAK7391 (Compute Module 4, eMMC), whose storage writes far more slowly. A single gateway's database over 30 days typically holds a few hundred thousand rows, so on a RAK7391 that is roughly 10 to 25 s. Forwarding starts when the check is done, and it happens once per database.
 - **Free disk space.** SQLite's write-ahead log grows while the check runs. Keep at least as much free space as the database file takes (1.0× its size) on the disk that holds it. This figure comes from the peak log size measured on 1,000,000 rows (0.64× the database), plus 50 % headroom.
 - **Log.** Before the check starts the sniffer says how much it will do, so a long first start is not mistaken for a hang:
 
@@ -551,7 +552,7 @@ A malformed frame has no identifier, so it never enters the list of identifiers 
 
 Every row with that identifier changes at once, past and live, in this browser and in every other open WebUI, with no reload. A WebUI that loses its connection gets the current labels again when it reconnects. If two people edit the same label at almost the same time, the last write wins everywhere.
 
-The **device filter** also matches labels: typing `havana` keeps the rows whose label, DevAddr or DevEUI contains it, in any case. The **CSV export** has a `label` column after the existing ones, filled for labelled rows even when the Label column is hidden. The label is always written in double quotes, with inner quotes doubled. A label that starts with `=`, `+`, `-` or `@` gets a leading apostrophe in the CSV (`'=1+1`), so a spreadsheet opens it as text and not as a formula; the apostrophe may be visible there. The label itself is not changed in the WebUI or the API.
+The **device filter** also matches labels: typing `havana` keeps the rows whose label, DevAddr or DevEUI contains it, in any case, searching the whole selected range in the database (see [WebUI history](#webui-history)). The **CSV export** has a `label` column after the existing ones, filled for labelled rows even when the Label column is hidden. The label is always written in double quotes, with inner quotes doubled. A label that starts with `=`, `+`, `-` or `@` gets a leading apostrophe in the CSV (`'=1+1`), so a spreadsheet opens it as text and not as a formula; the apostrophe may be visible there. The label itself is not changed in the WebUI or the API.
 
 Labels are not added to MQTT payloads. Other programs can read them from `GET /api/labels` (see [Label endpoints](#label-endpoints)).
 
@@ -576,6 +577,78 @@ An OTAA device gets a new DevAddr every time it joins, and a DevAddr can later b
 
 There is no authentication. Anyone who can open the WebUI can add, change and remove labels, just as they can already read all the captured traffic. The [Host and Origin checks](#cross-origin-access) only keep other web sites out; they are not a login.
 
+## WebUI history
+
+The time selector (Last 5m, 15m, 1h, 24h, All time) and the filters ask the sniffer's database, not just the rows the page already holds.
+
+### What the table loads
+
+- **A load** happens when the page opens, when the time range changes and when any filter changes. The WebUI asks for the newest records that fall in the range and match every filter, up to **5,000**, and replaces the table's rows with them. "All time" loads the newest 5,000 in the database.
+- **Filters search the database.** A device that has been quiet for a day is found by its DevAddr, DevEUI or label even when its records lie beyond the newest 5,000 of the range. The server and the browser apply the same rules to a record, and one set of test vectors checks both.
+- **Label matching** folds case the way JavaScript's `toLowerCase` does, so `ÑANDÚ` finds `ñandú`. A DevAddr or DevEUI is matched as text, in any case, colons included. A label change reloads the table when the device box is not empty: rows that now match appear and rows that no longer match leave.
+- **Typing** in the device box loads after a pause of about 0.4 s, not on every key. A change to anything else loads at once.
+- **While a load runs,** the table keeps its rows and Matching reads "Loading…". A newer load cancels the older one and ignores its answer. A failed load keeps the rows and says why in the strip below the table.
+- **Live records** that match the filters are added to the loaded rows without duplicates, by `id`. A record that is in both is kept as the database holds it. Rows leave as they age out of the range, checked every 5 s even when nothing arrives. The table holds at most **10,000** rows, the oldest dropped first. A row that retention deletes from the database stays until it leaves the range or the next load.
+- **Pause.** While paused, live records wait in a buffer. Changing the range or a filter still loads and replaces the rows. A reload the WebUI starts by itself (after a reconnect, or a retry, see below) is held until you resume, then applied together with the live records received after it was sent. A buffer that overflowed (10,000 records) is replaced by a full load on resume.
+- **The CSV export** covers the rows shown.
+
+### The strip and the footer
+
+When more records match than were loaded, a strip between the table and the footer says so, for example **Showing the newest 5,000 of 12,345 matching messages in the last 24 h**. The range reads "the last 5 min", "the last 15 min", "the last hour", "the last 24 h" or "the database". There is no "Load older": a narrower range or a more specific filter shows the rest.
+
+The strip also carries these messages when they apply. It shows them in this order, joined on one line, and the full text is in its tooltip:
+
+| Message | When |
+|---|---|
+| Could not load messages: *reason*. The table still shows the earlier rows. (in error colours) | The last load failed. The reason is the sniffer's `error` text, "the sniffer did not answer within 30 s", "could not reach the sniffer (…)" or the HTTP status |
+| *n* records could not be saved to the database since the sniffer last started (the count restarts at 0 with it); see its log. | The database failed to store records (see [After a reconnect](#after-a-reconnect-no-hole)) |
+| The newest records may be missing: the database is behind. Retrying. | The storage writer had not caught up when a load asked |
+
+The footer counts:
+
+| Item | Meaning |
+|---|---|
+| **Matching** | Records that match the time range and the filters: the rows shown plus the older matches the last load counted. "Loading…" while a load is waiting or in flight, "–" before the first one |
+| **Shown** | Rows in the table |
+| **Blocked** | Blocked records among the rows shown |
+| **Malformed hidden / shown** | Malformed records that match the other filters, as counted at the last load plus those received live since. It does not shrink as rows age out until the next load. "–" when the sniffer could not count them |
+
+Matching is exact when nothing was capped and every row shown is in the database. It can be high, never low: when the range was capped, when a row shown live failed to be stored (it is not in the database, and it counts until the next load replaces the rows), and without WAL, where it also counts the malformed records the browser hides. The malformed figure is a little high when a malformed record arrived while a load was in flight and was already in its answer, because it is then counted twice.
+
+### After a reconnect: no hole
+
+Whenever the live connection (`/ws`) opens, the first time included, the WebUI loads the selected range again and merges the live records it received since. A table that was cut off from the feed (a sniffer restart, a network drop) is complete once the reload arrives: it holds every matching record of the range that the database holds, up to the cap, in order and without duplicates.
+
+This does not rest on timing. Four things are kept true by the code:
+
+1. The sniffer queues a record for storage before it broadcasts it.
+2. A `/ws` client is subscribed before the handshake is answered, so everything broadcast after the browser's socket opens reaches it.
+3. The WebUI sends the reload after its socket has opened, with `settle=true`.
+4. The storage writer works through its queue in order, and answers a `settle=true` request only after it has processed everything queued before it.
+
+A saved record was therefore either queued before the reload's wait, and is in the answer, or broadcast after the subscription, and arrived live. How long a gateway task took between stamping a record and sending it does not matter, and neither does the order of the stamps.
+
+- **Cost.** Up to 5,000 rows per reconnect. After a drop the WebUI waits about 3 s, then 6, 12 and so on up to 60 s, each wait picked at random between half and all of its length, and starts again at 3 s after a connection that lasted a minute. A link that keeps dropping costs one reload a minute, and the pages of a restarted sniffer do not all reload at the same instant. Rows held from before the drop that are older than the newest 5,000 of the range leave the table, and the strip counts them.
+- **The guarantee starts once the live connection has opened.** If it has not opened 3 s after the page loads, the WebUI loads the range anyway so the page is not empty. That load is best effort: records saved after it are missing until the connection opens, and the reload then repairs the table. The WebUI does not poll while it is disconnected; the status bar shows the connection.
+- **Two kinds of record are not in the database:** one the sniffer dropped because its storage queue was full (a rate-limited warning, `Storage queue full, dropping record`), and one the database failed to store (the error `Storage write error: …`, or `Storage writer task panicked: …`). Both are still sent live. A WebUI that was connected shows them until the next load that replaces the rows; one that was not connected never sees them. The strip counts the failed stores since the sniffer last started.
+- **When the database is behind.** The sniffer waits up to 5 s for the storage writer to catch up. If it has not, it answers from what is saved and says so (`X-History-Settled: false`). The strip then reads "The newest records may be missing: the database is behind. Retrying.", the rows already shown live are kept, and the WebUI reloads after about 5 s, then 10, 20, 40 and every 60 s (each picked at random between half and all of it) until an answer is complete. It never gives up: a writer that stays stuck costs one reload a minute for each open page. A reload that fails for a passing reason (a network error, no answer within 30 s, a "busy" answer) joins the same series. Any other failure, such as a server error, is shown and not retried; the next reconnect or filter change tries again.
+- **Forwarding never waits** for any of this.
+
+### Databases without WAL
+
+History reads use a second, read-only connection, so a long scan never holds up the writer that saves records. That needs the database in WAL mode, which is the default; some network filesystems cannot hold a WAL database. When the database is not in WAL mode the sniffer logs a warning at startup (`The database is not in WAL mode (<mode>); history filters are unavailable`), and:
+
+- loading by time range alone works;
+- a request with any other filter is refused with `503` (code `no_wal`): the strip shows the error, which names WAL, and the table keeps its rows;
+- the default view hides malformed records, which the server cannot do without a scan on the writer. The WebUI therefore loads the range with them and hides them itself. The server caps the range at 5,000 before the browser hides anything, so on a noisy gateway fewer than 5,000 rows may show, valid rows older than the 5,000th record are left out, and Matching is an upper bound that counts the hidden malformed records too;
+- the malformed count shows "–".
+
+### How long a load takes
+
+On a development machine, with 1,000,000 records over 7 days, the newest 5,000 of a range with their count took about 150 ms, and a filtered "Last 7 days" load 0.3 to 0.6 s. With 4,300,000 records over 30 days (the default retention), a device search over all time took about 1.5 to 1.7 s, because text cannot use an index and the whole range is read. The record writer was not delayed: its longest wait for the database lock while history queries ran was under 0.01 ms.
+
+On a RAK7391 (Compute Module 4, eMMC), with the same 1,000,000 records over 7 days: the last 24 h load in about 0.3 s; "Last 7 days" with malformed rows hidden in about 1.7 s; a device search over 7 days in about 2.5 s; every filter combined in about 4 s. A single gateway's database is usually several times smaller, and the times shrink with it. The writer still never waits for the lock, but while a long query reads the eMMC a single write can take a second or two; at one gateway's traffic that only delays saving by that much.
+
 ## Architecture
 
 ```
@@ -597,15 +670,84 @@ All messages are normalized into a unified `MessageRecord` before storage and br
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/ws` | WebSocket — real-time message feed (`message` events only) |
+| `GET` | `/ws` | WebSocket — real-time message feed (`message` events only). A client that falls behind is closed with code 1013 (see [Message history](#message-history)) |
 | `GET` | `/ws/labels` | WebSocket — the device labels, then every change |
-| `GET` | `/api/messages` | REST — historical messages (`since`, `limit` query params) |
+| `GET` | `/api/messages` | REST — message history: time range, filters, counts (see [Message history](#message-history)) |
 | `GET` | `/api/labels` | REST — every device label |
 | `PUT` | `/api/labels/{device}` | REST — set or replace a device label |
 | `DELETE` | `/api/labels/{device}` | REST — remove a device label |
 | `GET` | `/*` | Embedded React SPA |
 
 Every request, including the WebSockets, must pass the [Host check](#host-check).
+
+### Message history
+
+`GET /api/messages` returns a JSON array of [message records](#message-records), **oldest first**. With no parameters it returns the newest 500. The WebUI uses the parameters below to load a time range (see [WebUI history](#webui-history)).
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `limit` | `500` | Most records to return, brought into the range 1 to 5,000. A value that is not a number gets axum's own plain-text `400` (`Failed to deserialize query string: …`) |
+| `since` | none | Return records strictly after this RFC 3339 time. A value that cannot be read is ignored |
+| `from` | none | Return records at or after this RFC 3339 time. A value that cannot be read gets `400`, and so does `from` together with a `since` that can be read (an unreadable `since` is still ignored) |
+| `newest` | `true` without a time bound, `false` with one | `true` keeps the newest `limit` records of the range, `false` the oldest `limit`. The answer is oldest first either way. The default follows the bound that was read, so `since=garbage` still returns the newest records. Any other value gets `400` |
+| `count` | `false` | `true` adds `X-Total-Count` and `X-Malformed-Count`. Any other value gets `400` |
+| `settle` | `false` | `true` waits for the storage writer first and adds `X-History-Settled`. Any other value gets `400` |
+| `device` | any | Text to find in the DevAddr, the DevEUI or the label of the record's identifier, in any case (labels use Unicode case folding). Used as given, not trimmed. Empty means any |
+| `mtype` | any | Message type names separated by commas, spelled as under [Blocking rules](#blocking-rules), plus `Unknown`. An unknown name gets `400` |
+| `status` | any | `forwarded`, `blocked` or `captured`, in any case. Empty or `all` means any; anything else gets `400` |
+| `gateway` | any | A gateway EUI, compared exactly as the record carries it (`AA:BB:CC:DD:00:11:22:33`). Empty means any |
+| `malformed` | `include` | `exclude` leaves malformed records out. Any value but `include` and `exclude` gets `400` |
+
+Every filter must match (they are combined with AND), by the same rules the WebUI applies to live records. A call that uses only `limit` and `since` returns what it always did.
+
+**Headers**
+
+| Header | Sent | Value |
+|---|---|---|
+| `X-Total-Count` | with `count=true` | How many records match the time bound and every filter, not only the ones returned. With `malformed=exclude`, malformed records are not counted |
+| `X-Malformed-Count` | with `count=true` | How many malformed records match every filter except `malformed`, whether they were returned or left out. Left out when the sniffer cannot count them (the database is not in WAL mode) |
+| `X-History-Settled` | with `settle=true` | `true` when the storage writer had processed everything queued before the request, `false` when the 5 s wait ran out, or the storage writer had stopped, and the answer comes from what is saved |
+| `X-Storage-Write-Failures` | on every response of this route | How many records the database has failed to store since the sniffer started. It is 0 again after a restart |
+
+"Processed" means saved, or its failure was logged and counted. It does not mean that everything queued was saved, which is why the failure count has a header of its own. `X-Storage-Write-Failures` is also on `400`, `500` and `503` answers and on requests rejected for a bad parameter such as `limit=abc`, with their status and body unchanged. A request refused by the [Host check](#host-check) does not carry it: that check runs before any route. A script in another origin can read the four headers: the CORS response for a listed origin exposes them.
+
+**Answers**
+
+| Status | Meaning |
+|---|---|
+| `200` | The array, with the headers above |
+| `400` | `{"error": "<message>"}`, for example `{"error": "use either from or since, not both"}`, for a bad `from`, `from` together with `since`, or a bad `newest`, `count`, `settle`, `mtype`, `status` or `malformed` |
+| `503` | `{"error": "<message>", "code": "no_wal"}`: the database is not in WAL mode and the request has a filter other than the time range, `malformed=exclude` included (`history filters need the database in WAL mode; see the log`). Or `{"error": "<message>", "code": "busy"}`: the database stayed locked for more than 1 s (`the database is busy; try again`). Retrying helps with `busy`, not with `no_wal` |
+| `500` | The database failed, with no body, as before |
+
+**Settling.** A request with `settle=true` sends a marker into the storage queue and waits, up to 5 s, until the writer reaches it. Everything the sniffer queued before the request, which includes every record it had already broadcast on `/ws`, is then in the answer, unless its storage failed. Use it when you reload a table after a reconnect: send it after your new `/ws` socket has opened. The one 5 s budget also covers waiting behind another request's marker; there is at most one marker in the queue at a time. When the budget runs out the sniffer logs a rate-limited warning, `Storage writer is behind; history served without waiting for it`. A request without `settle` never waits for any of this.
+
+**Load.** Queries take turns, one at a time, and at most three large responses are sent at once, so several slow clients cannot add up to much memory. A response keeps its place until the client has downloaded nearly all of it, so pages on a slow link (a VPN, say) can make another page's load wait behind them. A request waits for its turn. If the client disconnects, the request stops: one that has not started never runs, and a running scan is interrupted within a moment (logged at DEBUG as `History query cancelled: the client went away`). Behind nginx this needs `proxy_ignore_client_abort off`, which is nginx's default and what set-up A under [Host check](#host-check) uses.
+
+**URL encoding.** In a URL query a `+` means a space, so write an offset such as `+02:00` as `%2B02:00`, or use `Z`. `curl -G --data-urlencode` takes care of it:
+
+```bash
+FROM=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%S.000Z)
+
+# the newest 5,000 records of the last 24 h, with the counts in the response headers
+curl -s -D - -o messages.json -G http://localhost:8888/api/messages \
+     --data-urlencode "from=$FROM" --data-urlencode newest=true \
+     --data-urlencode limit=5000 --data-urlencode count=true
+
+# only the count: forwarded join requests of one gateway whose device or label contains "havana"
+curl -s -D - -o /dev/null -G http://localhost:8888/api/messages \
+     --data-urlencode "from=$FROM" --data-urlencode newest=true --data-urlencode limit=1 \
+     --data-urlencode count=true --data-urlencode device=havana \
+     --data-urlencode mtype=JoinRequest --data-urlencode status=forwarded \
+     --data-urlencode gateway=AA:BB:CC:DD:00:11:22:33
+
+# the same range after the storage writer has caught up with everything queued so far
+curl -s -D - -o /dev/null -G http://localhost:8888/api/messages \
+     --data-urlencode "from=$FROM" --data-urlencode newest=true --data-urlencode limit=1 \
+     --data-urlencode count=true --data-urlencode settle=true
+```
+
+**`/ws` closes clients that fall behind.** A `/ws` client that falls behind (more than 512 records queued for it), or whose connection stops accepting data for 10 s, is closed with code 1013 ("try again later", reason `fell behind; reconnect and reload`) instead of silently missing records. The record frames are unchanged. A client that reconnects should reload what it shows from `/api/messages` with `settle=true`, sent after its new socket has opened, and should wait longer between attempts after each drop, as the WebUI does.
 
 ### Label endpoints
 
@@ -736,6 +878,8 @@ server {
 }
 ```
 
+Leave `proxy_ignore_client_abort` at its default, `off`: nginx then closes its connection to the sniffer when the browser goes away, which is what lets the sniffer stop the [history query](#message-history) that browser asked for.
+
 *Set-up B: let the proxy send an IP address as `Host` and list the public origin in `cors_origins`.* An IP `Host` always passes the check, and the browser's `Origin` no longer matches it, so the public origin has to be listed.
 
 ```toml
@@ -770,15 +914,30 @@ These two `location` blocks replace the ones in set-up A's `server` block. Witho
 - FOpts MAC commands are not decoded; only their length is exported.
 - **Some noise stays visible.** The checks only catch frames that cannot be valid LoRaWAN. Non-LoRaWAN LoRa traffic with a good CRC, a first byte that reads as a valid header and a length that happens to fit looks like real traffic. The sniffer cannot check the MIC, which needs the session keys.
 - **Old rows have no `mhdr` reason.** The first byte is not stored, so when the stored rows are checked after the upgrade only `crc` and `length` can be applied.
+- **History loads at most 5,000 records.** A range or filter with more matches shows the newest 5,000 and a notice that counts the rest; there is no paging, and the CSV export covers the rows shown. Narrow the range or add a filter to see the rest.
+- **History filters need the database in WAL mode.** Without it only the time range works, and the default view may show fewer than 5,000 rows (see [Databases without WAL](#databases-without-wal)).
+- **A reload has no hole only once the live connection has opened,** and not for a record the sniffer never stored: the storage queue was full, or the database failed to write it. Such a record is shown live until the next load that replaces the rows (see [After a reconnect](#after-a-reconnect-no-hole)).
+- **Many WebUI pages at once.** The sniffer is meant for one or two people watching at a time. History queries run one at a time, every reconnect reloads up to 5,000 records, and at most three large responses are sent at once. As a stress test, 10 pages reloading "Last 24h" together after a restart, on 1,000,000 records, were all answered within 0.15 s, with the sniffer peaking at about 52 MB; most of that was the label list each page receives, at the 10,000-label maximum (about 28 MB with 100 labels). Pages on slow links hold their place until they have downloaded their answer, so with several of those open, other pages' loads wait; past 30 s the WebUI shows an error and the next load tries again.
 - **Label editing has no authentication.** Anyone who can open the WebUI can add, change and remove [device labels](#device-labels). The Host and Origin checks keep other web sites out, not other people. Restrict who can reach the port (bind to `127.0.0.1`, a firewall, a VPN, or a reverse proxy that asks for a login).
 
 ## Testing
 
 ```bash
 cargo test
+cd webui && npm test
 ```
 
-The tests include loopback tests for multi-gateway routing, listen mode and the loop protection, and MQTT tests against an in-process fake broker.
+The tests include loopback tests for multi-gateway routing, listen mode and the loop protection, MQTT tests against an in-process fake broker, and history queries on in-memory and file databases.
+
+`npm test` runs the WebUI's history logic with Node alone, no browser: the request rules, merging, counts and back-off. It also checks the filter vectors in `webui/test/history-vectors.json`, which a Rust test sends through the real `/api/messages` router too, so the server and the browser agree on which records match. `make test` runs both suites.
+
+One test, ignored by default, measures history queries on a database of 1,000,000 records and reports how long they take and how long the record writer waits meanwhile. Run it in release mode and put the temporary database on a real disk, since `/tmp` is memory on many systems:
+
+```bash
+TMPDIR=/path/on/disk cargo test --release -- --ignored large_db_history --nocapture
+```
+
+`HISTORY_ROWS` and `HISTORY_DAYS` change the size (the default is 1,000,000 records over 7 days); it takes several minutes.
 
 Two helper scripts live in `tools/`:
 

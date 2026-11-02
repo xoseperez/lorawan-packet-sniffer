@@ -17,6 +17,7 @@ use crate::core::eui::Eui64;
 use crate::core::filter::{self, FilterRule};
 use crate::core::metadata::{CrcStatus, Direction, MType, Malformed, MessageRecord, Status};
 use crate::core::ratelimit::RateLimitedLog;
+use crate::core::writer::WriterItem;
 use crate::mqtt::MqttStats;
 
 use crate::api;
@@ -161,7 +162,7 @@ pub(super) fn classify(
 /// ZeroMQ threads and tokio tasks can each hold one.
 #[derive(Clone)]
 pub struct Outputs {
-    storage: mpsc::Sender<MessageRecord>,
+    storage: mpsc::Sender<WriterItem>,
     live: broadcast::Sender<Arc<String>>,
     mqtt: Option<MqttSink>,
     /// Rate limit for the storage drop warning.  Each output has its own, so
@@ -181,7 +182,7 @@ struct MqttSink {
 impl Outputs {
     /// Outputs for the SQLite writer queue and the WebSocket broadcast
     /// channel.  MQTT is off until [`Outputs::with_mqtt`] adds it.
-    pub fn new(storage: mpsc::Sender<MessageRecord>, live: broadcast::Sender<Arc<String>>) -> Self {
+    pub fn new(storage: mpsc::Sender<WriterItem>, live: broadcast::Sender<Arc<String>>) -> Self {
         Self {
             storage,
             live,
@@ -203,13 +204,39 @@ impl Outputs {
         }
     }
 
-    /// Log the record, broadcast it to WebSocket clients, queue it for MQTT
-    /// (when configured) and queue it for storage.
+    /// Log the record, queue it for MQTT (when configured) and for storage,
+    /// and broadcast it to WebSocket clients.
     ///
     /// Never waits.  A full or closed queue drops the record, with a
     /// rate-limited warning, and the other outputs are unaffected.
     pub fn emit(&self, record: MessageRecord) {
         log_message(&record);
+
+        if let Some(mqtt) = &self.mqtt {
+            if !try_queue(&mqtt.tx, record.clone(), "MQTT", &mqtt.drops) {
+                mqtt.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // Queue for storage first, then look for listeners and broadcast.  A
+        // WebUI that reloads its history subscribes to the broadcast, then
+        // queues a marker that the storage writer answers once it has saved
+        // everything queued before it.  For such a WebUI, one of two things
+        // holds for this record, however long this thread stalled between
+        // stamping it and getting here: the WebUI subscribed before the
+        // broadcast below and receives the record live, or it subscribed
+        // later, so its marker is queued after this record and the reload
+        // includes it.  Looking for listeners before queueing would let a
+        // WebUI subscribe in between and get neither.
+        //
+        // The copy lets the record be queued first: the queue takes ownership,
+        // and the broadcast needs the record afterwards.
+        try_queue(
+            &self.storage,
+            WriterItem::Record(record.clone()),
+            "Storage",
+            &self.storage_drops,
+        );
 
         // Serialising costs real time, so skip it when nobody is listening.
         if self.live.receiver_count() > 0 {
@@ -219,29 +246,16 @@ impl Outputs {
                 let _ = self.live.send(json);
             }
         }
-
-        if let Some(mqtt) = &self.mqtt {
-            if !try_queue(&mqtt.tx, record.clone(), "MQTT", &mqtt.drops) {
-                mqtt.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        try_queue(&self.storage, record, "Storage", &self.storage_drops);
     }
 }
 
-/// Queue `record` on `tx` without waiting.  Returns `false`, after a
-/// rate-limited log line, when the record was dropped.
+/// Queue `item` on `tx` without waiting.  Returns `false`, after a
+/// rate-limited log line, when the item was dropped.
 ///
 /// A full queue means the consumer is slow, which can clear.  A closed queue
 /// means the consumer is gone for good, so it is logged as an error.
-fn try_queue(
-    tx: &mpsc::Sender<MessageRecord>,
-    record: MessageRecord,
-    output: &str,
-    drops: &RateLimitedLog,
-) -> bool {
-    match tx.try_send(record) {
+fn try_queue<T>(tx: &mpsc::Sender<T>, item: T, output: &str, drops: &RateLimitedLog) -> bool {
+    match tx.try_send(item) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {
             drops.warn(format_args!("{output} queue full, dropping record"));
@@ -337,6 +351,7 @@ fn log_line(rec: &MessageRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::writer::{record_channel, RecordReceiver};
 
     /// JoinRequest with JoinEUI 0x0000000000000001, DevEUI 0102030405060708
     /// and DevNonce 0x1234 (all little-endian on the wire).
@@ -682,14 +697,8 @@ mod tests {
 
     /// Outputs with a storage queue of `storage_cap` and a subscribed
     /// WebSocket channel; the receivers are returned so they stay alive.
-    fn outputs(
-        storage_cap: usize,
-    ) -> (
-        Outputs,
-        mpsc::Receiver<MessageRecord>,
-        broadcast::Receiver<Arc<String>>,
-    ) {
-        let (storage_tx, storage_rx) = mpsc::channel(storage_cap);
+    fn outputs(storage_cap: usize) -> (Outputs, RecordReceiver, broadcast::Receiver<Arc<String>>) {
+        let (storage_tx, storage_rx) = record_channel(storage_cap);
         let (live_tx, live_rx) = broadcast::channel(256);
         (Outputs::new(storage_tx, live_tx), storage_rx, live_rx)
     }
@@ -707,6 +716,43 @@ mod tests {
         assert_eq!(json["type"], "message");
         assert_eq!(json["data"]["id"], id.as_str());
         assert_eq!(drops(&out.storage_drops), (0, 0));
+    }
+
+    /// A record that reaches a WebSocket client must already be in the
+    /// storage queue.  A history request queues its marker behind the queue's
+    /// contents once the client is subscribed, so a record that was
+    /// broadcast first and queued afterwards could be in neither place the
+    /// page looks.
+    #[test]
+    fn emit_queues_each_record_before_it_broadcasts_it() {
+        const RECORDS: usize = 10_000;
+        let (storage_tx, _storage_rx) = record_channel(RECORDS + 1);
+        let (live_tx, mut live_rx) = broadcast::channel(RECORDS + 1);
+        let queue = storage_tx.clone();
+        let out = Outputs::new(storage_tx, live_tx);
+
+        // A thread on the other side of the broadcast channel, looking at the
+        // queue the moment each record arrives.
+        let watcher = std::thread::spawn(move || {
+            let mut broadcast_first = 0;
+            for received in 1..=RECORDS {
+                live_rx.blocking_recv().unwrap();
+                let queued = queue.max_capacity() - queue.capacity();
+                if queued < received {
+                    broadcast_first += 1;
+                }
+            }
+            broadcast_first
+        });
+        for _ in 0..RECORDS {
+            out.emit(test_record());
+        }
+
+        assert_eq!(
+            watcher.join().unwrap(),
+            0,
+            "records that reached a listener before they were queued"
+        );
     }
 
     #[test]

@@ -170,6 +170,11 @@ jobs:
           npm ci
           npm run build
 
+      # The history logic and the filter vectors that the Rust tests read too.
+      - name: Test the WebUI
+        working-directory: webui
+        run: npm test
+
       # Installs what rust-toolchain.toml asks for; rustup does not always do
       # that on its own the first time cargo runs.
       - name: Install the Rust toolchain

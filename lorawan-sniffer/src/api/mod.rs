@@ -32,6 +32,14 @@
 //!
 //! Client → server: ignored on both sockets.
 //!
+//! A `/ws` client that falls behind, or that stops accepting data for 10
+//! seconds, is closed with code 1013 ("try again later"; the close frame is
+//! attempted for at most a second) and dropped, instead of being left to miss
+//! records without knowing.  The WebUI reconnects and reloads its range.
+//! The socket is subscribed to the record feed before the handshake is
+//! answered, so every record broadcast after the browser's `open` event
+//! reaches it.
+//!
 //! ## Labels
 //!
 //! `PUT` takes `{"label": "text"}` and answers `200 {"device": "...",
@@ -63,22 +71,76 @@
 //! to, or with one listed in `cors_origins`.  Origins listed in
 //! `cors_origins` may also read the API through CORS, and write labels.
 //!
-//! ## `/api/messages` query params
+//! ## `/api/messages`
 //!
-//! - `since`: ISO-8601 timestamp — return only messages after this time (asc)
-//! - `limit`: max rows (default 500)
+//! `GET`, a JSON array of records, oldest first, at most 5,000.
+//!
+//! | Parameter  | Meaning |
+//! |------------|---------|
+//! | `since`    | Only records strictly after this RFC 3339 time; the oldest `limit` of them.  Unparsable: ignored. |
+//! | `from`     | Only records at or after this RFC 3339 time.  Unparsable, or together with a valid `since`: 400. |
+//! | `newest`   | `true` keeps the newest `limit` matches, `false` the oldest.  Default: `false` when a bound was understood, `true` otherwise. |
+//! | `limit`    | Most records, 1 to 5,000, default 500; clamped.  Not a number: axum's own 400. |
+//! | `device`   | Text found in the DevAddr, the DevEUI or the label of the record's identifier, case-insensitively. |
+//! | `mtype`    | Comma-separated type names (`UnconfirmedDataUp,JoinRequest`).  Unknown name: 400. |
+//! | `status`   | `forwarded`, `blocked`, `captured` (any case) or `all`.  Else: 400. |
+//! | `gateway`  | Gateway EUI, compared exactly as records carry it. |
+//! | `malformed`| `include` (default) or `exclude`.  Else: 400. |
+//! | `count`    | `true` adds `X-Total-Count` and `X-Malformed-Count`.  Default `false`. |
+//! | `settle`   | `true` waits for the storage writer first (see below).  Default `false`. |
+//!
+//! An empty `device`, `mtype`, `status` or `gateway` means any.  `newest`,
+//! `count` and `settle` take exactly `true` or `false`.  Errors in the new
+//! parameters are `400 {"error": "<message>"}`.
+//!
+//! Headers of the answer:
+//!
+//! - `X-Total-Count`: records that match (with `malformed=exclude`, the
+//!   malformed ones are not among them), as many as there are, not only
+//!   those returned.  `count=true`.
+//! - `X-Malformed-Count`: malformed records that match every other
+//!   condition, whether the request returns them or not.  `count=true`.
+//!   Absent when the database cannot count them without a scan on the
+//!   connection that saves records (it is not in WAL mode).
+//! - `X-History-Settled`: `true` when the storage writer had processed
+//!   everything queued before the request, `false` when that took more than 5
+//!   seconds and the answer is what was saved by then.  `settle=true`.
+//!   "Processed" is not "saved": a record whose insert failed was counted
+//!   instead.
+//! - `X-Storage-Write-Failures`: inserts that failed since the sniffer
+//!   started (the count restarts at 0 with it).  On every answer of this
+//!   route, errors from the query string included; not on the Host check's
+//!   403, which is answered before any route.
+//!
+//! The 503s are `{"error": "<message>", "code": "<code>"}`: `no_wal` when a
+//! filter is asked of a database that is not in WAL mode (a request with only
+//! a time bound still works), and `busy` when the database stayed locked for a
+//! second.
+//!
+//! One history query runs at a time, and at most three answers are held in
+//! memory at once; further requests wait their turn.  A request whose client
+//! has gone stops its query.
+//!
+//! A request without `from`, `newest` or any of the new parameters returns
+//! exactly what it always did: `?limit=N` the newest N, `?since=T&limit=N` the
+//! oldest N after T.
 
 pub mod host;
 pub mod labels;
+mod messages;
 
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{
         rejection::JsonRejection,
-        ws::{rejection::WebSocketUpgradeRejection, Message, WebSocket, WebSocketUpgrade},
-        DefaultBodyLimit, Path, Query, State,
+        ws::{
+            rejection::WebSocketUpgradeRejection, CloseFrame, Message, WebSocket, WebSocketUpgrade,
+        },
+        DefaultBodyLimit, Path, State,
     },
     http::{header, HeaderMap, Method, StatusCode, Uri},
     middleware,
@@ -86,19 +148,21 @@ use axum::{
     routing::{get, put},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
 use rust_embed::RustEmbed;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, Semaphore};
 use tower_http::cors::CorsLayer;
 
 use self::host::{check_host, AllowedHosts};
 use self::labels::{LabelWriter, WriterError};
 use crate::core::labels::{normalize_label, parse_device_id};
+use crate::core::linelog::warn_line;
+use crate::core::ratelimit::RateLimitedLog;
 use crate::core::{
     metadata::MessageRecord,
     storage::{LabelWrite, Storage},
+    writer::WriterItem,
 };
 
 // ---------------------------------------------------------------------------
@@ -116,6 +180,30 @@ struct Frontend;
 /// a kilobyte; a larger body is not a label, and refusing it early keeps the
 /// default 2 MB read off an endpoint anyone on the network can reach.
 const MAX_LABEL_BODY_BYTES: usize = 4 * 1024;
+
+/// History queries that run at once.  A scan can take hundreds of
+/// milliseconds on a large database, and the reader has one connection, so a
+/// second query would only wait behind the first.
+const HISTORY_QUERIES: usize = 1;
+
+/// Full history answers held in memory at once, from the start of their
+/// query until the client has taken them.  An answer of 5,000 records is
+/// about 3 MB, so three keep the sniffer's memory near 10 MB above its
+/// baseline however many tabs ask.
+const HISTORY_BODIES: usize = 3;
+
+/// The longest a frame may take to be accepted by a `/ws` client.  Beyond it
+/// the client has stopped reading, and waiting longer would hold this
+/// handler, and the memory behind it, for as long as the peer likes.
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest the close frame of a client that fell behind is given.  The
+/// client is not reading, so the frame may never get out; it is a courtesy,
+/// not something to wait for.
+const WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The close code for "try again later".
+const WS_TRY_AGAIN_LATER: u16 = 1013;
 
 // ---------------------------------------------------------------------------
 // App state
@@ -135,6 +223,12 @@ pub struct ApiContext {
     /// Host names (besides IP addresses and `localhost`) the API answers to,
     /// as configured; `["*"]` turns the Host check off.
     pub allowed_hosts: Vec<String>,
+    /// The storage writer's queue, to put markers on.  Weak, so that the API
+    /// never keeps the queue open after the proxy, which owns the strong
+    /// handles, has stopped.
+    pub writer_queue: mpsc::WeakSender<WriterItem>,
+    /// Inserts that did not save, counted by the writer.
+    pub write_failures: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -145,6 +239,16 @@ pub struct AppState {
     writer: LabelWriter,
     /// Origins other than the sniffer's own that may use the API.
     allowed_origins: Arc<Vec<String>>,
+    /// One history query at a time ([`HISTORY_QUERIES`]).
+    history: Arc<Semaphore>,
+    /// Large answers in memory ([`HISTORY_BODIES`]).
+    history_bodies: Arc<Semaphore>,
+    /// One permit, owned by the marker that is in the writer queue, if any.
+    history_settle: Arc<Semaphore>,
+    writer_queue: mpsc::WeakSender<WriterItem>,
+    write_failures: Arc<AtomicU64>,
+    /// Limits the warning for a writer that does not answer in time.
+    settle_log: Arc<RateLimitedLog>,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,10 +256,38 @@ pub struct AppState {
 // ---------------------------------------------------------------------------
 
 pub fn router(ctx: ApiContext) -> Router {
+    build_router(ctx).0
+}
+
+/// [`router`], and the state behind it, which the tests look into.
+fn build_router(ctx: ApiContext) -> (Router, AppState) {
+    let state = AppState {
+        broadcast_tx: ctx.broadcast_tx,
+        labels_tx: ctx.labels_tx,
+        storage: ctx.storage,
+        writer: ctx.writer,
+        allowed_origins: Arc::new(ctx.cors_origins),
+        history: Arc::new(Semaphore::new(HISTORY_QUERIES)),
+        history_bodies: Arc::new(Semaphore::new(HISTORY_BODIES)),
+        history_settle: Arc::new(Semaphore::new(1)),
+        writer_queue: ctx.writer_queue,
+        write_failures: ctx.write_failures,
+        settle_log: Arc::new(RateLimitedLog::new()),
+    };
+
+    // Every answer of this route says how many inserts have failed.  A route
+    // layer, not a line in the handler: axum refuses a bad query string
+    // before the handler runs.
+    let messages =
+        get(messages::messages_handler).route_layer(middleware::map_response_with_state(
+            state.write_failures.clone(),
+            messages::add_failure_header,
+        ));
+
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/ws/labels", get(labels_ws_handler))
-        .route("/api/messages", get(messages_handler))
+        .route("/api/messages", messages)
         .route("/api/labels", get(list_labels))
         .route(
             "/api/labels/:device",
@@ -168,9 +300,9 @@ pub fn router(ctx: ApiContext) -> Router {
     // Without CORS headers a browser only lets pages served by the sniffer
     // read the API.  Answering every origin would let any web site the
     // operator visits read the captured traffic from their browser.
-    if !ctx.cors_origins.is_empty() {
-        let origins: Vec<axum::http::HeaderValue> = ctx
-            .cors_origins
+    if !state.allowed_origins.is_empty() {
+        let origins: Vec<axum::http::HeaderValue> = state
+            .allowed_origins
             .iter()
             .filter_map(|o| o.parse().ok())
             .collect();
@@ -180,21 +312,26 @@ pub fn router(ctx: ApiContext) -> Router {
                 // A label write is a PUT or DELETE with a JSON body, and
                 // browsers ask permission for both before sending it.
                 .allow_methods([Method::GET, Method::PUT, Method::DELETE])
-                .allow_headers([header::CONTENT_TYPE]),
+                .allow_headers([header::CONTENT_TYPE])
+                // A script on a listed origin can only read the headers the
+                // server names; these carry the counts and the flags of the
+                // history answer.
+                .expose_headers([
+                    messages::TOTAL_COUNT,
+                    messages::MALFORMED_COUNT,
+                    messages::HISTORY_SETTLED,
+                    messages::STORAGE_WRITE_FAILURES,
+                ]),
         );
     }
 
     // Added last, so it is the outermost layer: a request for a foreign host
     // is refused before anything else sees it, CORS preflights included.
     let allowed_hosts = Arc::new(AllowedHosts::new(&ctx.allowed_hosts));
-    app.layer(middleware::from_fn_with_state(allowed_hosts, check_host))
-        .with_state(AppState {
-            broadcast_tx: ctx.broadcast_tx,
-            labels_tx: ctx.labels_tx,
-            storage: ctx.storage,
-            writer: ctx.writer,
-            allowed_origins: Arc::new(ctx.cors_origins),
-        })
+    let app = app
+        .layer(middleware::from_fn_with_state(allowed_hosts, check_host))
+        .with_state(state.clone());
+    (app, state)
 }
 
 // ---------------------------------------------------------------------------
@@ -215,9 +352,17 @@ async fn ws_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
     match ws {
-        Ok(ws) => ws
-            .on_upgrade(move |socket| handle_socket(socket, state.broadcast_tx.subscribe()))
-            .into_response(),
+        Ok(ws) => {
+            // Subscribe now, not inside `on_upgrade`: that closure runs after
+            // the 101 answer has gone out, and a record broadcast in between
+            // would reach neither this socket nor, if the page reloads its
+            // range on opening, necessarily the reload.  A record broadcast
+            // after the subscription reaches the socket; one broadcast before
+            // it was queued for storage before the page asked for anything.
+            let records = state.broadcast_tx.subscribe();
+            ws.on_upgrade(move |socket| handle_socket(socket, records))
+                .into_response()
+        }
         Err(rejection) => rejection.into_response(),
     }
 }
@@ -266,12 +411,28 @@ async fn handle_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Arc<St
                 match result {
                     Ok(json) => {
                         let text = (*json).clone();
-                        if socket.send(Message::Text(text)).await.is_err() {
-                            break;
+                        match tokio::time::timeout(WS_SEND_TIMEOUT, socket.send(Message::Text(text))).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => break,
+                            Err(_) => {
+                                warn_line!(
+                                    "WebSocket client did not accept a message within {}s; closing it",
+                                    WS_SEND_TIMEOUT.as_secs()
+                                );
+                                close_fallen_behind(&mut socket).await;
+                                break;
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("WebSocket client lagged {} messages", n);
+                        // The records it missed are gone for it.  Closing the
+                        // socket makes the page reconnect and reload its
+                        // range, which is how it gets them back; leaving it
+                        // open would show a table with a hole and nothing
+                        // to say so.
+                        warn_line!("WebSocket client lagged {} messages; closing it", n);
+                        close_fallen_behind(&mut socket).await;
+                        break;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -285,6 +446,17 @@ async fn handle_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Arc<St
         }
     }
     debug!("WebSocket client disconnected");
+}
+
+/// Tell a client that fell behind to come back, if it will listen.  A client
+/// that is not reading cannot be told, so this gives up after a second and the
+/// caller drops the socket either way.
+async fn close_fallen_behind(socket: &mut WebSocket) {
+    let close = Message::Close(Some(CloseFrame {
+        code: WS_TRY_AGAIN_LATER,
+        reason: "fell behind; reconnect and reload".into(),
+    }));
+    let _ = tokio::time::timeout(WS_CLOSE_TIMEOUT, socket.send(close)).await;
 }
 
 async fn labels_ws_handler(
@@ -371,54 +543,6 @@ async fn send_label_set(socket: &mut WebSocket, storage: &Storage) -> bool {
         .send(Message::Text(make_labels_json(&labels)))
         .await
         .is_ok()
-}
-
-// ---------------------------------------------------------------------------
-// REST: GET /api/messages
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct MessagesParams {
-    /// Return messages strictly after this ISO-8601 timestamp (ascending).
-    since: Option<String>,
-    /// Maximum number of rows (default 500).
-    limit: Option<i64>,
-}
-
-/// Returned JSON is a plain array of `MessageRecord` objects.
-async fn messages_handler(
-    State(state): State<AppState>,
-    Query(params): Query<MessagesParams>,
-) -> impl IntoResponse {
-    let since: Option<DateTime<Utc>> = params
-        .since
-        .as_deref()
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&Utc));
-
-    let limit = params.limit.unwrap_or(500).clamp(1, 5000);
-    let storage = state.storage.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        if let Some(since) = since {
-            storage.query_since(since, limit)
-        } else {
-            storage.query_recent(limit)
-        }
-    })
-    .await;
-
-    match result {
-        Ok(Ok(records)) => Json(records).into_response(),
-        Ok(Err(e)) => {
-            error!("Messages query error: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-        Err(e) => {
-            error!("Messages query task panicked: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -696,14 +820,18 @@ fn make_labels_json(labels: &BTreeMap<String, String>) -> String {
 
 #[cfg(test)]
 mod label_tests;
+#[cfg(test)]
+mod message_tests;
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
     use axum::body::Body;
     use axum::http::Request;
+    use chrono::Utc;
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
     use tokio_util::sync::CancellationToken;
@@ -711,6 +839,7 @@ mod tests {
 
     use super::labels::Gate;
     use super::*;
+    use crate::cmd::root::{run_writer, CHANNEL_CAPACITY};
     use crate::core::decoder;
     use crate::core::labels::MAX_LABELS;
     use crate::core::metadata::{CrcStatus, Direction, MType, Malformed, Protocol, Status};
@@ -744,9 +873,12 @@ mod tests {
     pub(super) struct Setup {
         max_labels: usize,
         labels_capacity: usize,
+        broadcast_capacity: usize,
         gated: bool,
         cors_origins: Vec<String>,
         allowed_hosts: Vec<String>,
+        storage: Option<Storage>,
+        record_writer: bool,
     }
 
     impl Setup {
@@ -754,10 +886,32 @@ mod tests {
             Setup {
                 max_labels: MAX_LABELS,
                 labels_capacity: 256,
+                broadcast_capacity: 512,
                 gated: false,
                 cors_origins: vec![],
                 allowed_hosts: vec![],
+                storage: None,
+                record_writer: true,
             }
+        }
+
+        /// A smaller record broadcast channel, to make a client fall behind.
+        pub(super) fn broadcast_capacity(mut self, capacity: usize) -> Self {
+            self.broadcast_capacity = capacity;
+            self
+        }
+
+        /// Serve this database instead of an in-memory one.
+        pub(super) fn storage(mut self, storage: Storage) -> Self {
+            self.storage = Some(storage);
+            self
+        }
+
+        /// Leave the storage writer's queue to the test: no writer task is
+        /// started, and the receiving end is in [`Rig::record_rx`].
+        pub(super) fn without_record_writer(mut self) -> Self {
+            self.record_writer = false;
+            self
         }
 
         /// A lower label limit, to reach it with a handful of labels.
@@ -790,9 +944,11 @@ mod tests {
 
         /// Needs a running tokio runtime: the label writer is a task.
         pub(super) fn build(self) -> Rig {
-            let storage = Storage::open_in_memory().unwrap();
+            let storage = self
+                .storage
+                .unwrap_or_else(|| Storage::open_in_memory().unwrap());
             let seen = SeenDevices::new();
-            let (broadcast_tx, _) = broadcast::channel(512);
+            let (broadcast_tx, _) = broadcast::channel(self.broadcast_capacity);
             let (labels_tx, _) = broadcast::channel(self.labels_capacity);
             let cancel = CancellationToken::new();
             let gate = self.gated.then(Gate::closed);
@@ -805,13 +961,31 @@ mod tests {
                 gate.clone(),
                 cancel.clone(),
             );
-            let router = router(ApiContext {
+            // The storage writer's queue, as the sniffer builds it; the API
+            // gets the weak end.
+            let (record_tx, record_rx) = mpsc::channel(CHANNEL_CAPACITY);
+            let write_failures = Arc::new(AtomicU64::new(0));
+            let writer_cancel = CancellationToken::new();
+            let record_rx = if self.record_writer {
+                tokio::spawn(run_writer(
+                    record_rx,
+                    storage.clone(),
+                    write_failures.clone(),
+                    writer_cancel.clone(),
+                ));
+                None
+            } else {
+                Some(record_rx)
+            };
+            let (router, state) = build_router(ApiContext {
                 broadcast_tx: broadcast_tx.clone(),
                 labels_tx: labels_tx.clone(),
                 storage: storage.clone(),
                 writer: writer.clone(),
                 cors_origins: self.cors_origins,
                 allowed_hosts: self.allowed_hosts,
+                writer_queue: record_tx.downgrade(),
+                write_failures: write_failures.clone(),
             });
             Rig {
                 storage,
@@ -821,6 +995,11 @@ mod tests {
                 writer,
                 cancel,
                 gate,
+                record_tx,
+                record_rx,
+                writer_cancel,
+                write_failures,
+                state,
                 router,
             }
         }
@@ -835,6 +1014,14 @@ mod tests {
         pub(super) writer: LabelWriter,
         pub(super) cancel: CancellationToken,
         pub(super) gate: Option<Arc<Gate>>,
+        /// The proxy's end of the storage writer's queue.
+        pub(super) record_tx: mpsc::Sender<WriterItem>,
+        /// The writer's end, when the test runs the writer itself.
+        pub(super) record_rx: Option<mpsc::Receiver<WriterItem>>,
+        /// Stops the storage writer.
+        pub(super) writer_cancel: CancellationToken,
+        pub(super) write_failures: Arc<AtomicU64>,
+        pub(super) state: AppState,
         router: Router,
     }
 

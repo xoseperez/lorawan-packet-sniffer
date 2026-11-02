@@ -878,6 +878,7 @@ dependencies = [
  "chrono",
  "clap",
  "handlebars",
+ "http-body",
  "http-body-util",
  "humantime-serde",
  "log",

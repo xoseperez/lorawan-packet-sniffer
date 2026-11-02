@@ -1,11 +1,21 @@
 import { WsStatus } from '../hooks/useWebSocket';
 
 interface Props {
-  total: number;
+  /**
+   * Records that match the time range and filters: the rows shown plus the
+   * older matches the last load counted. Null when not known yet.
+   */
+  matching: number | null;
+  /** A load is waiting or in flight: Matching reads "Loading…". */
+  busy: boolean;
   shown: number;
+  /** Blocked rows among the shown ones. */
   blocked: number;
-  /** Malformed rows among the loaded rows that pass the other filters. */
-  malformedCount: number;
+  /**
+   * Malformed records that match the other filters, as counted at the last
+   * load plus those received live since. Null when the server did not say.
+   */
+  malformed: number | null;
   /** Whether the "Show malformed" box is ticked. */
   showMalformed: boolean;
   wsStatus: WsStatus;
@@ -19,24 +29,69 @@ const WS_LABEL: Record<WsStatus, string> = {
   disconnected: 'Disconnected',
 };
 
+const MATCHING_TITLE =
+  'Records that match the time range and filters: the rows shown plus the older ' +
+  'matches the database counted at the last load. It can be high, never low.';
+
+const SHOWN_TITLE = 'Rows in the table.';
+
+const BLOCKED_TITLE = 'Blocked records among the rows shown.';
+
 const MALFORMED_TITLE =
-  'Frames that cannot be valid LoRaWAN (CRC failed, bad header or wrong length), ' +
-  'among the rows that pass the other filters. Tick "Show malformed" in the Type ' +
-  'menu to show them. Total and Blocked count every loaded row, malformed ones included.';
+  'Frames that cannot be valid LoRaWAN (CRC failed, bad header or wrong length) ' +
+  'that match the other filters, counted at the last load plus those received since. ' +
+  'It does not shrink as rows age out until the next load. Tick "Show malformed" ' +
+  'in the Type menu to show them.';
+
+const MALFORMED_UNKNOWN_TITLE =
+  'Not available: the sniffer could not count them (an older version, or a database ' +
+  'that is not in WAL mode).';
+
+/** A number for a count item; the raw value goes in `data-value` for scripts. */
+function Count({
+  stat, label, value, title, text,
+}: {
+  stat: string;
+  label: string;
+  value: number | null;
+  title: string;
+  /** Replaces the number (for "Loading…"). */
+  text?: string;
+}) {
+  return (
+    <span
+      className="status-count"
+      data-stat={stat}
+      data-value={text === undefined && value !== null ? value : undefined}
+      title={title}
+    >
+      {label}: {text ?? (value === null ? '–' : value.toLocaleString())}
+    </span>
+  );
+}
 
 export function StatusBar({
-  total, shown, blocked, malformedCount, showMalformed, wsStatus, isLive, onToggleLive,
+  matching, busy, shown, blocked, malformed, showMalformed, wsStatus, isLive, onToggleLive,
 }: Props) {
   return (
     <div className="status-bar">
-      <span>Total: {total.toLocaleString()}</span>
-      <span>Shown: {shown.toLocaleString()}</span>
-      <span>Blocked: {blocked.toLocaleString()}</span>
-      {/* Always rendered, also at 0, so the bar does not change when a malformed
-          row arrives. */}
-      <span title={MALFORMED_TITLE}>
-        Malformed {showMalformed ? 'shown' : 'hidden'}: {malformedCount.toLocaleString()}
-      </span>
+      <Count
+        stat="matching"
+        label="Matching"
+        value={matching}
+        title={MATCHING_TITLE}
+        text={busy ? 'Loading…' : undefined}
+      />
+      <Count stat="shown" label="Shown" value={shown} title={SHOWN_TITLE} />
+      <Count stat="blocked" label="Blocked" value={blocked} title={BLOCKED_TITLE} />
+      {/* Always rendered, also at 0 or "–", so the bar does not change when a
+          malformed row arrives. */}
+      <Count
+        stat="malformed"
+        label={`Malformed ${showMalformed ? 'shown' : 'hidden'}`}
+        value={malformed}
+        title={malformed === null ? MALFORMED_UNKNOWN_TITLE : MALFORMED_TITLE}
+      />
 
       <span
         className={`ws-indicator ws-${wsStatus}`}

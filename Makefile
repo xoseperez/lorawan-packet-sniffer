@@ -7,7 +7,7 @@ DOCKER_TAG   ?= latest
 DIST_DIR := dist
 
 .PHONY: build build-full run fmt clippy test \
-	webui-install webui-build webui-dev \
+	webui-install webui-build webui-dev webui-test \
 	build-x86_64-unknown-linux-musl \
 	build-aarch64-unknown-linux-musl \
 	build-all dist \
@@ -26,6 +26,11 @@ webui-build: webui-install
 # Start the Vite dev server (proxies /ws and /api to localhost:8888).
 webui-dev: webui-install
 	cd $(WEBUI_DIR) && npm run dev
+
+# Run the WebUI's tests: the history logic and the filter vectors it shares
+# with the Rust tests.
+webui-test: webui-install
+	cd $(WEBUI_DIR) && npm test
 
 # ── Rust ────────────────────────────────────────────────────────────────────
 
@@ -51,7 +56,7 @@ fmt:
 clippy:
 	cargo clippy
 
-test:
+test: webui-test
 	cargo test
 
 # ── Cross-compile release binaries ──────────────────────────────────────────

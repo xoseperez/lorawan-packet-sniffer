@@ -2,13 +2,22 @@
 //!
 //! ## Design
 //!
-//! `Storage` wraps a `rusqlite::Connection` behind an `Arc<Mutex<>>` so it
-//! can be cheaply cloned and shared across tokio tasks via
-//! `tokio::task::spawn_blocking`.
+//! `Storage` holds up to two `rusqlite::Connection`s, each behind an
+//! `Arc<Mutex<>>`, so it can be cheaply cloned and shared across tokio tasks
+//! via `tokio::task::spawn_blocking`.  The writer connection saves records,
+//! labels and the retention sweep; the optional reader connection answers
+//! history queries (see "History reads" below).
 //!
-//! All timestamps are persisted as RFC 3339 text (`2026-02-23T10:30:00.123Z`),
-//! which is lexicographically sortable and understood by SQLite's built-in date
-//! functions.
+//! All timestamps are persisted with `DateTime::to_rfc3339()`: UTC written as
+//! `+00:00`, followed by 0, 3, 6 or 9 fraction digits, whichever is the least
+//! that holds the value (`2026-02-23T10:30:00+00:00`,
+//! `2026-02-23T10:30:00.123+00:00`).  The text is understood by SQLite's
+//! built-in date functions, and it sorts as time does: the fields are
+//! fixed-width and most significant first, and the `+` that ends the time of
+//! day (0x2B) sorts below `.` and the digits, so a whole second comes before
+//! its fractions, and a shorter fraction before a longer one that extends it
+//! (`…:00.5+00:00` before `…:00.500001+00:00`).  Time bounds are rendered with
+//! the same function, so a bound compares correctly with every stored form.
 //!
 //! ## Schema versions
 //!
@@ -60,6 +69,36 @@
 //! transaction that expires the messages, so a label is never judged against
 //! a half-pruned table.
 //!
+//! ## History reads
+//!
+//! [`Storage::query_history`] can scan a large part of the table: a device
+//! text cannot use an index, and on a million rows that is hundreds of
+//! milliseconds.  Run on the writer's connection it would hold that
+//! connection's mutex for all that time and stall every insert behind it.
+//!
+//! [`Storage::open`] therefore opens a second, read-only connection, but only
+//! once `PRAGMA journal_mode` reads back `wal`.  In WAL mode a reader sees a
+//! consistent snapshot and neither blocks the writer's commits nor is blocked
+//! by them.  Outside WAL a reader would block every commit, and a scan on the
+//! writer would block every insert; both are worse than refusing the request.
+//! So without WAL there is no reader, a request with a row filter fails with
+//! [`SnifferError::HistoryUnavailable`], and a time-only request (an index
+//! range and at most [`MAX_HISTORY_ROWS`] rows) still runs on the writer, as
+//! every read did before.  An in-memory database, used by tests, keeps
+//! everything on its one connection: a second `:memory:` connection would be
+//! a different, empty database.
+//!
+//! A query runs in one deferred read transaction, so the labels, the counts
+//! and the rows it reads belong to one snapshot, and it can be cancelled: a
+//! progress handler looks at a flag every few thousand VM steps and
+//! interrupts the statement, and a guard removes the handler on every way out
+//! so the next query on the connection is not affected.
+//!
+//! The reader is declared before the writer in [`Storage`], so it closes
+//! first.  The last connection to close checkpoints the log and deletes the
+//! `-wal` and `-shm` files, and a read-only connection cannot checkpoint:
+//! closing it last would leave both files behind.
+//!
 //! ## Concurrency note
 //!
 //! `rusqlite::Connection` is `Send` but not `Sync`.  `Arc<Mutex<Connection>>`
@@ -68,14 +107,21 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use log::{warn, Level};
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::types::{Value, ValueRef};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags, ToSql, TransactionBehavior};
 
 use crate::core::error::SnifferError;
+use crate::core::history::{
+    devices_with_matching_label, fold_case, HistoryPage, HistoryQuery, LowerBound, MAX_HISTORY_ROWS,
+};
 use crate::core::metadata::{
     CrcStatus, Direction, MType, Malformed, MessageRecord, Protocol, Status,
 };
@@ -92,6 +138,10 @@ const SELECT_COLS: &str = "
 // ---------------------------------------------------------------------------
 // SQL
 // ---------------------------------------------------------------------------
+
+/// The size the write-ahead log file is truncated back to after SQLite
+/// restarts it (`PRAGMA journal_size_limit`, on the writer).
+const WAL_SIZE_LIMIT_BYTES: i64 = 8 * 1024 * 1024;
 
 /// The schema as shipped in v2.0.0, before versioned migrations existed.
 ///
@@ -279,6 +329,61 @@ INSERT INTO device_labels (device, label, updated_at) VALUES (?1, ?2, ?3)
 ON CONFLICT(device) DO UPDATE SET label = excluded.label, updated_at = excluded.updated_at";
 
 // ---------------------------------------------------------------------------
+// History SQL
+// ---------------------------------------------------------------------------
+//
+// Every statement below is assembled from these fragments and none has a
+// value formatted into its text: values are always bound.
+
+/// How long the history connection waits for a lock before the query fails
+/// with [`SnifferError::Busy`].
+///
+/// rusqlite's default is five seconds, and SQLite's progress handler, which is
+/// what cancels a query, does not run while a busy handler waits.  A second is
+/// the longest a cancelled request may be kept in a lock wait.
+const READER_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// SQLite virtual-machine steps between two looks at a query's cancel flag.
+const CANCEL_CHECK_STEPS: i32 = 10_000;
+
+/// Every range query names this index.  Left to choose, the planner picks the
+/// message-type index plus a temporary B-tree sort for a type filter, which
+/// turns into a sort of most of the table for a common type.
+const RANGE_FROM: &str = "FROM messages INDEXED BY idx_messages_timestamp";
+
+const AFTER_SQL: &str = "timestamp > :bound";
+const FROM_SQL: &str = "timestamp >= :bound";
+
+/// Device text: a substring of the DevAddr or the DevEUI, or a label match.
+///
+/// `instr` takes its needle literally, where `LIKE` would give `%` and `_` a
+/// meaning.  `lower` is ASCII-only, which is all a hex identifier needs, and
+/// the needle arrives already folded by [`fold_case`].  The label belongs to
+/// the record's identifier: the DevAddr, or the DevEUI when there is none.
+const DEVICE_SQL: &str = "(instr(lower(dev_addr), :needle) > 0 \
+     OR instr(lower(dev_eui), :needle) > 0 \
+     OR (dev_addr IS NOT NULL AND dev_addr IN (SELECT value FROM json_each(:ids))) \
+     OR (dev_addr IS NULL AND dev_eui IN (SELECT value FROM json_each(:ids))))";
+
+const MTYPE_SQL: &str = "mtype IN (SELECT value FROM json_each(:mtypes))";
+const STATUS_SQL: &str = "status = :status";
+const GATEWAY_SQL: &str = "gateway_eui = :gateway";
+const MALFORMED_SQL: &str = "malformed IS NOT NULL";
+
+/// The rows a filtered scan chose, read in full, oldest first.
+///
+/// The scan reads only `rowid` and the filter columns: selecting all the
+/// columns of a million matches took several times as long.  Ties in the
+/// timestamp are ordered by `rowid`, as the index orders them.
+fn fetch_by_rowid_sql() -> String {
+    format!(
+        "SELECT {SELECT_COLS} FROM messages \
+         WHERE rowid IN (SELECT value FROM json_each(?1)) \
+         ORDER BY timestamp ASC, rowid ASC"
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -322,7 +427,23 @@ pub struct Pruned {
 /// Thread-safe, cheaply-cloneable SQLite storage handle.
 #[derive(Clone)]
 pub struct Storage {
+    // Field order is drop order, and `reader` must close before `conn`.  The
+    // last connection to close checkpoints the write-ahead log and deletes
+    // the `-wal` and `-shm` files; a read-only connection cannot checkpoint,
+    // so if it closed last it would leave both behind.  The clones of a
+    // `Storage` share these `Arc`s, so the same order holds for whichever
+    // clone is dropped last.
+    /// The read-only connection for history queries; `None` unless the
+    /// database is in WAL mode.
+    reader: Option<Arc<Mutex<Connection>>>,
+    /// The connection that saves records.
     conn: Arc<Mutex<Connection>>,
+    /// Row-filtered history queries may run on `conn`.  True only for an
+    /// in-memory database, which cannot have a second connection.
+    filters_on_writer: bool,
+    /// What the history queries of this handle did, for the tests.
+    #[cfg(test)]
+    probe: Arc<QueryProbe>,
 }
 
 impl Storage {
@@ -334,6 +455,11 @@ impl Storage {
     /// version stored since, are checked here before this returns; see the
     /// module documentation.  A failed check is logged and does not fail the
     /// open.
+    ///
+    /// Once the schema is in place the journal mode is read back.  Only in WAL
+    /// mode is the read-only connection for history queries opened; in any
+    /// other mode a warning is logged and queries with a row filter are
+    /// refused (see the module documentation).
     pub fn open(path: &str) -> Result<Self, SnifferError> {
         Self::open_file(path, |_| {})
     }
@@ -347,28 +473,70 @@ impl Storage {
         Self::open_file(path, before_init)
     }
 
+    /// [`Storage::open`] on a database that ends up outside WAL mode, as one
+    /// on a filesystem without shared memory does.
+    #[cfg(test)]
+    pub(crate) fn open_without_wal(path: &str) -> Result<Self, SnifferError> {
+        let mut conn = connect(path)?;
+        init(&mut conn)?;
+        conn.pragma_update(None, "journal_mode", "DELETE")?;
+        Ok(Self::with_reader(path, conn))
+    }
+
     fn open_file(path: &str, before_init: impl FnOnce(&Connection)) -> Result<Self, SnifferError> {
-        let p = Path::new(path);
-        if let Some(parent) = p.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        let mut conn = Connection::open(p)?;
+        let mut conn = connect(path)?;
         before_init(&conn);
         init(&mut conn)?;
-        Ok(Self {
+        // While history queries run back to back there is always a reader, so
+        // SQLite cannot restart the write-ahead log and the file keeps
+        // growing (about 11 MiB/s under a minute of sustained queries on a
+        // 1,000,000-row database).  The log restarts once the readers are
+        // gone, but the file keeps its size.  This limit lets the writer
+        // truncate it back after a restart; lock waits and write times were
+        // unchanged with it in the large-database measurement.
+        conn.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
+        Ok(Self::with_reader(path, conn))
+    }
+
+    /// Complete a handle around the writer `conn`, opening the reader if the
+    /// database allows one.
+    fn with_reader(path: &str, conn: Connection) -> Self {
+        Self {
+            reader: open_reader(path, &conn).map(|r| Arc::new(Mutex::new(r))),
             conn: Arc::new(Mutex::new(conn)),
-        })
+            filters_on_writer: false,
+            #[cfg(test)]
+            probe: Arc::default(),
+        }
     }
 
     /// Open an in-memory database (useful for tests).
+    ///
+    /// It has no reader connection: a second `:memory:` connection would be a
+    /// different, empty database.  History queries run on its one connection.
     pub fn open_in_memory() -> Result<Self, SnifferError> {
         let mut conn = Connection::open_in_memory()?;
         init(&mut conn)?;
         Ok(Self {
+            reader: None,
             conn: Arc::new(Mutex::new(conn)),
+            filters_on_writer: true,
+            #[cfg(test)]
+            probe: Arc::default(),
         })
+    }
+
+    /// A handle on the same writer that answers every history query on it, as
+    /// an in-memory database does.  The large-database test uses it to show
+    /// what the reader connection saves the writer from.
+    #[cfg(test)]
+    fn on_writer_only(&self) -> Self {
+        Self {
+            reader: None,
+            conn: Arc::clone(&self.conn),
+            filters_on_writer: true,
+            probe: Arc::clone(&self.probe),
+        }
     }
 
     /// Persist a `MessageRecord` to the database.
@@ -376,39 +544,7 @@ impl Storage {
     /// Uses `INSERT OR REPLACE` so duplicate IDs are handled gracefully.
     pub fn insert(&self, rec: &MessageRecord) -> Result<(), SnifferError> {
         let conn = self.conn.lock().map_err(|_| SnifferError::LockPoisoned)?;
-        conn.execute(
-            INSERT_SQL,
-            params![
-                rec.id,
-                rec.timestamp.to_rfc3339(),
-                direction_str(&rec.direction),
-                status_str(&rec.status),
-                rec.blocked_by.as_deref(),
-                protocol_str(&rec.source_protocol),
-                rec.freq_mhz,
-                rec.datarate,
-                rec.rssi.map(|v| v as i64),
-                rec.snr.map(|v| v as f64),
-                rec.crc_status.as_ref().map(crc_str),
-                mtype_str(&rec.mtype),
-                rec.dev_addr.as_deref(),
-                rec.dev_eui.as_deref(),
-                rec.fcnt.map(|v| v as i64),
-                rec.fport.map(|v| v as i64),
-                rec.payload_size as i64,
-                rec.toa_ms,
-                rec.gateway_eui.as_deref(),
-                rec.join_eui.as_deref(),
-                rec.dev_nonce.map(|v| v as i64),
-                rec.adr.map(|v| v as i64),
-                rec.adr_ack_req.map(|v| v as i64),
-                rec.ack.map(|v| v as i64),
-                rec.class_b.map(|v| v as i64),
-                rec.f_pending.map(|v| v as i64),
-                rec.f_opts_len.map(|v| v as i64),
-                rec.malformed.as_ref().map(malformed_str),
-            ],
-        )?;
+        insert_record(&conn, rec)?;
         Ok(())
     }
 
@@ -533,44 +669,294 @@ impl Storage {
         Ok(n)
     }
 
-    /// Return the most recent `limit` messages, ordered by timestamp ascending.
-    pub fn query_recent(&self, limit: i64) -> Result<Vec<MessageRecord>, SnifferError> {
-        let conn = self.conn.lock().map_err(|_| SnifferError::LockPoisoned)?;
-        let sql = format!(
-            "SELECT {cols} FROM messages ORDER BY timestamp DESC LIMIT ?1",
-            cols = SELECT_COLS
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(params![limit])?;
-        let mut records = Vec::new();
-        while let Some(row) = rows.next()? {
-            records.push(row_to_record(row)?);
+    /// Answer a history request: the records that match `q`, oldest first, and
+    /// on request how many match.
+    ///
+    /// `cancel` is looked at before the query starts and then every few
+    /// thousand steps of it.  Once it is set the query stops and this returns
+    /// [`SnifferError::Cancelled`]; whoever set it is no longer waiting for the
+    /// answer.
+    ///
+    /// Which connection answers depends on the request:
+    /// - the reader, when there is one;
+    /// - otherwise the writer, for a request with only a time bound (an index
+    ///   range and at most [`MAX_HISTORY_ROWS`] rows), or for any request on
+    ///   an in-memory database;
+    /// - otherwise none: [`SnifferError::HistoryUnavailable`], because the
+    ///   scan would stall the writer.
+    ///
+    /// A lock held past one second on the reader gives
+    /// [`SnifferError::Busy`].  So the time between setting `cancel` and the
+    /// return is one progress tick, or up to that second when the query is
+    /// waiting for a lock.
+    ///
+    /// Two shapes, both in one read transaction, so the labels, the counts and
+    /// the rows come from one snapshot:
+    ///
+    /// - **Time bound only.**  The count is an index count, the rows are the
+    ///   first `limit` of the index range.  The malformed count is a range
+    ///   scan that reads the table, so it is computed only where a scan may
+    ///   run, and is `None` otherwise.
+    /// - **Row filters.**  One scan along the timestamp index reads `rowid`
+    ///   and the columns the filters need, counts every match and keeps the
+    ///   first `limit` row numbers; only those rows are then read in full.
+    ///   Without a count the scan stops once it has `limit` rows.
+    pub fn query_history(
+        &self,
+        q: &HistoryQuery,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<HistoryPage, SnifferError> {
+        #[cfg(test)]
+        let _probe = self.probe.enter();
+        let (handle, scans_allowed) = match &self.reader {
+            Some(reader) => (reader, true),
+            None if self.filters_on_writer => (&self.conn, true),
+            None if !q.filter.has_row_filter() => (&self.conn, false),
+            None => return Err(SnifferError::HistoryUnavailable),
+        };
+        let conn = handle.lock().map_err(|_| SnifferError::LockPoisoned)?;
+        let result =
+            run_history(&conn, q, &cancel, scans_allowed).map_err(|e| history_error(e, &cancel));
+        #[cfg(test)]
+        if matches!(result, Err(SnifferError::Cancelled)) {
+            self.probe.cancelled.fetch_add(1, Ordering::SeqCst);
         }
-        // Return in ascending order (oldest first).
-        records.reverse();
-        Ok(records)
+        result
+    }
+}
+
+/// What the history queries of a [`Storage`] did, for tests that need to know
+/// whether two of them ever overlapped.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct QueryProbe {
+    /// Queries inside `query_history` right now, including one that is
+    /// waiting for the connection.
+    running: AtomicUsize,
+    /// The most that was ever running at once.
+    most_running: AtomicUsize,
+    /// Queries that went in.
+    started: AtomicUsize,
+    /// Queries that came out as cancelled.
+    cancelled: AtomicUsize,
+}
+
+#[cfg(test)]
+impl QueryProbe {
+    fn enter(&self) -> ProbeGuard<'_> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most_running.fetch_max(now, Ordering::SeqCst);
+        ProbeGuard(self)
     }
 
-    /// Return up to `limit` messages with timestamp strictly after `since`,
-    /// ordered by timestamp ascending (oldest first).
-    pub fn query_since(
-        &self,
-        since: DateTime<Utc>,
-        limit: i64,
-    ) -> Result<Vec<MessageRecord>, SnifferError> {
-        let conn = self.conn.lock().map_err(|_| SnifferError::LockPoisoned)?;
-        let sql = format!(
-            "SELECT {cols} FROM messages WHERE timestamp > ?1 ORDER BY timestamp ASC LIMIT ?2",
-            cols = SELECT_COLS
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(params![since.to_rfc3339(), limit])?;
-        let mut records = Vec::new();
-        while let Some(row) = rows.next()? {
-            records.push(row_to_record(row)?);
-        }
-        Ok(records)
+    pub(crate) fn running(&self) -> usize {
+        self.running.load(Ordering::SeqCst)
     }
+
+    pub(crate) fn most_running(&self) -> usize {
+        self.most_running.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn started(&self) -> usize {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn cancelled(&self) -> usize {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+struct ProbeGuard<'a>(&'a QueryProbe);
+
+#[cfg(test)]
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Hooks for the tests of other modules.
+#[cfg(test)]
+impl Storage {
+    /// Hold the lock the record writer needs, so that its next insert waits
+    /// for the guard to be dropped.  Reads on the history connection do not
+    /// need that lock, which is the point of having one.
+    pub(crate) fn hold_writer(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap()
+    }
+
+    /// Save `records` in one transaction, which is how a test loads thousands.
+    pub(crate) fn insert_many(
+        &self,
+        records: impl IntoIterator<Item = MessageRecord>,
+    ) -> Result<(), SnifferError> {
+        let mut conn = self.conn.lock().map_err(|_| SnifferError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        for record in records {
+            insert_record(&tx, &record)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Save `count` plain uplinks of 5,000 devices, one a second from the
+    /// start of 2026-03-01, by SQL, which is much faster than building the
+    /// records.  A filtered scan over this many takes long enough for a test
+    /// to cancel it.
+    pub(crate) fn insert_generated(&self, count: i64) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < ?2 - 1)
+             INSERT INTO messages (id, timestamp, direction, status, source_protocol,
+                                   freq_mhz, datarate, mtype, dev_addr, payload_size, classified)
+             SELECT 'gen-' || i,
+                    strftime('%Y-%m-%dT%H:%M:%S', ?1 + i, 'unixepoch') || '+00:00',
+                    'up', 'forwarded', 'udp', 868.1, 'SF7BW125', 'UnconfirmedDataUp',
+                    printf('%08X', 0x26000000 + (i % 5000)), 23, 1
+               FROM n",
+            params![1_772_359_200_i64, count],
+        )
+        .unwrap();
+    }
+
+    /// What the history queries of this handle (and its clones) did.
+    pub(crate) fn probe(&self) -> Arc<QueryProbe> {
+        Arc::clone(&self.probe)
+    }
+
+    /// A handle on the database at `path`, which must already hold the
+    /// schema, whose history connection finds the whole file locked by the
+    /// connection returned with it.
+    ///
+    /// The three connections are opened before any of them touches the file:
+    /// once a reader and a writer have attached, no connection can switch to
+    /// exclusive locking.
+    pub(crate) fn locked_by_another_connection(path: &str) -> (Self, Connection) {
+        let reader = connect_reader(path).unwrap();
+        let writer = Connection::open(path).unwrap();
+        let holder = Connection::open(path).unwrap();
+        holder
+            .pragma_update(None, "locking_mode", "EXCLUSIVE")
+            .unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        // A write, so that the lock is taken and not only promised.
+        insert_record(&holder, &tests::sample_record()).unwrap();
+        let storage = Self {
+            reader: Some(Arc::new(Mutex::new(reader))),
+            conn: Arc::new(Mutex::new(writer)),
+            filters_on_writer: false,
+            probe: Arc::default(),
+        };
+        (storage, holder)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connections
+// ---------------------------------------------------------------------------
+
+/// Open the writer connection to the database at `path`, creating its parent
+/// directories.
+fn connect(path: &str) -> Result<Connection, SnifferError> {
+    let p = Path::new(path);
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(Connection::open(p)?)
+}
+
+/// The read-only connection for history queries, if the database allows it.
+///
+/// The journal mode is read back from `writer` rather than assumed: setting
+/// it to WAL can quietly fail (a filesystem without shared memory, say), and
+/// outside WAL a reader would block every commit of the writer.  Failing to
+/// open the connection is a warning, not an error: the sniffer's job is to
+/// forward and save, and history without filters still works.
+fn open_reader(path: &str, writer: &Connection) -> Option<Connection> {
+    let mode: String = match writer.query_row("PRAGMA journal_mode", [], |r| r.get(0)) {
+        Ok(mode) => mode,
+        Err(e) => {
+            emit(
+                Level::Warn,
+                format!("Could not read the journal mode: {e}; history filters are unavailable"),
+            );
+            return None;
+        }
+    };
+    if !mode.eq_ignore_ascii_case("wal") {
+        emit(
+            Level::Warn,
+            format!("The database is not in WAL mode ({mode}); history filters are unavailable"),
+        );
+        return None;
+    }
+    match connect_reader(path) {
+        Ok(reader) => Some(reader),
+        Err(e) => {
+            emit(
+                Level::Warn,
+                format!(
+                    "Could not open the read-only history connection: {e}; \
+                     history filters are unavailable"
+                ),
+            );
+            None
+        }
+    }
+}
+
+/// Open `path` read-only, for queries that must not write and must not wait
+/// long for a lock.
+fn connect_reader(path: &str) -> rusqlite::Result<Connection> {
+    let reader = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    reader.pragma_update(None, "query_only", "ON")?;
+    reader.busy_timeout(READER_BUSY_TIMEOUT)?;
+    Ok(reader)
+}
+
+fn insert_record(conn: &Connection, rec: &MessageRecord) -> rusqlite::Result<usize> {
+    conn.execute(
+        INSERT_SQL,
+        params![
+            rec.id,
+            rec.timestamp.to_rfc3339(),
+            direction_str(&rec.direction),
+            status_str(&rec.status),
+            rec.blocked_by.as_deref(),
+            protocol_str(&rec.source_protocol),
+            rec.freq_mhz,
+            rec.datarate,
+            rec.rssi.map(|v| v as i64),
+            rec.snr.map(|v| v as f64),
+            rec.crc_status.as_ref().map(crc_str),
+            mtype_str(&rec.mtype),
+            rec.dev_addr.as_deref(),
+            rec.dev_eui.as_deref(),
+            rec.fcnt.map(|v| v as i64),
+            rec.fport.map(|v| v as i64),
+            rec.payload_size as i64,
+            rec.toa_ms,
+            rec.gateway_eui.as_deref(),
+            rec.join_eui.as_deref(),
+            rec.dev_nonce.map(|v| v as i64),
+            rec.adr.map(|v| v as i64),
+            rec.adr_ack_req.map(|v| v as i64),
+            rec.ack.map(|v| v as i64),
+            rec.class_b.map(|v| v as i64),
+            rec.f_pending.map(|v| v as i64),
+            rec.f_opts_len.map(|v| v as i64),
+            rec.malformed.as_ref().map(malformed_str),
+        ],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -840,6 +1226,333 @@ fn has_stored_record(conn: &Connection, device: &str) -> rusqlite::Result<bool> 
 }
 
 // ---------------------------------------------------------------------------
+// History queries
+// ---------------------------------------------------------------------------
+
+/// The conditions of a history query and the values they bind.
+///
+/// Built once per request and shared by every statement of it, so the count,
+/// the scan and the fetch can never disagree about which rows match.
+struct Conditions {
+    /// The static SQL fragments, ANDed together.
+    parts: Vec<&'static str>,
+    /// The named values the fragments use.
+    values: Vec<(&'static str, Value)>,
+}
+
+impl Conditions {
+    /// `label_ids` is the JSON list of identifiers whose label matches the
+    /// device text; it is present exactly when the request has device text.
+    fn new(q: &HistoryQuery, label_ids: Option<String>) -> Self {
+        let mut c = Self {
+            parts: Vec::new(),
+            values: Vec::new(),
+        };
+        match q.lower {
+            Some(LowerBound::After(at)) => c.add(AFTER_SQL, [(":bound", at.to_rfc3339().into())]),
+            Some(LowerBound::From(at)) => c.add(FROM_SQL, [(":bound", at.to_rfc3339().into())]),
+            None => {}
+        }
+        if let (Some(text), Some(ids)) = (q.filter.device_text(), label_ids) {
+            c.add(
+                DEVICE_SQL,
+                [(":needle", fold_case(text).into()), (":ids", ids.into())],
+            );
+        }
+        if !q.filter.mtypes.is_empty() {
+            let names: Vec<&str> = q.filter.mtypes.iter().map(mtype_str).collect();
+            let names = serde_json::to_string(&names).expect("a list of names is valid JSON");
+            c.add(MTYPE_SQL, [(":mtypes", names.into())]);
+        }
+        if let Some(status) = &q.filter.status {
+            c.add(
+                STATUS_SQL,
+                [(":status", status_str(status).to_string().into())],
+            );
+        }
+        if let Some(gateway) = q.filter.gateway_text() {
+            c.add(GATEWAY_SQL, [(":gateway", gateway.to_string().into())]);
+        }
+        c
+    }
+
+    fn add<const N: usize>(&mut self, part: &'static str, values: [(&'static str, Value); N]) {
+        self.parts.push(part);
+        self.values.extend(values);
+    }
+
+    /// ` WHERE …` with the conditions and then `extra`, or nothing.
+    fn where_sql(&self, extra: &[&str]) -> String {
+        let all: Vec<&str> = self
+            .parts
+            .iter()
+            .copied()
+            .chain(extra.iter().copied())
+            .collect();
+        if all.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", all.join(" AND "))
+        }
+    }
+
+    /// The bound values, for a statement made from these conditions.  Extra
+    /// names would be an error, so a statement that also binds `:limit` adds
+    /// it to this list itself.
+    fn bindings(&self) -> Vec<(&str, &dyn ToSql)> {
+        self.values
+            .iter()
+            .map(|(name, value)| (*name, value as &dyn ToSql))
+            .collect()
+    }
+
+    /// `COUNT(*)` of the rows the conditions let through, over the timestamp
+    /// index alone when the conditions are the time bound.
+    fn count_sql(&self) -> String {
+        format!("SELECT COUNT(*) {RANGE_FROM}{}", self.where_sql(&[]))
+    }
+
+    /// `COUNT(*)` of the malformed rows among them.
+    fn malformed_count_sql(&self) -> String {
+        format!(
+            "SELECT COUNT(*) {RANGE_FROM}{}",
+            self.where_sql(&[MALFORMED_SQL])
+        )
+    }
+
+    /// The first `:limit` rows in full, in index order.
+    fn page_sql(&self, newest: bool) -> String {
+        format!(
+            "SELECT {SELECT_COLS} {RANGE_FROM}{} ORDER BY timestamp {} LIMIT :limit",
+            self.where_sql(&[]),
+            direction_sql(newest)
+        )
+    }
+
+    /// Every matching row's number and whether it is malformed, in index order.
+    fn scan_sql(&self, newest: bool) -> String {
+        format!(
+            "SELECT rowid, malformed {RANGE_FROM}{} ORDER BY timestamp {}",
+            self.where_sql(&[]),
+            direction_sql(newest)
+        )
+    }
+}
+
+fn direction_sql(newest: bool) -> &'static str {
+    if newest {
+        "DESC"
+    } else {
+        "ASC"
+    }
+}
+
+/// Removes the progress handler when dropped, on every way out of a query.
+///
+/// The handler captures the request's flag.  Left on the connection it would
+/// cancel the next query as soon as that flag was set, and the next query
+/// belongs to someone else.
+struct CancelGuard<'a>(&'a Connection);
+
+impl<'a> CancelGuard<'a> {
+    fn install(conn: &'a Connection, cancel: &Arc<AtomicBool>) -> Self {
+        let flag = Arc::clone(cancel);
+        conn.progress_handler(
+            CANCEL_CHECK_STEPS,
+            Some(move || flag.load(Ordering::Relaxed)),
+        );
+        Self(conn)
+    }
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        self.0.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+/// The error SQLite itself raises for an interrupted statement, so that a
+/// check between two statements ends a query the way a check inside one does.
+fn interrupted() -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+        None,
+    )
+}
+
+fn check_cancel(cancel: &AtomicBool) -> rusqlite::Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(interrupted())
+    } else {
+        Ok(())
+    }
+}
+
+/// An interrupt that the request's own flag asked for is a cancellation;
+/// a lock that outlasted the wait is a busy database; anything else is a
+/// database error.
+fn history_error(e: rusqlite::Error, cancel: &AtomicBool) -> SnifferError {
+    match e.sqlite_error_code() {
+        Some(ErrorCode::OperationInterrupted) if cancel.load(Ordering::Relaxed) => {
+            SnifferError::Cancelled
+        }
+        Some(ErrorCode::DatabaseBusy) => SnifferError::Busy,
+        _ => SnifferError::Database(e),
+    }
+}
+
+/// Run `q` on `conn`; see [`Storage::query_history`].  `scans_allowed` says
+/// whether a scan that reads the table may run here.
+fn run_history(
+    conn: &Connection,
+    q: &HistoryQuery,
+    cancel: &Arc<AtomicBool>,
+    scans_allowed: bool,
+) -> rusqlite::Result<HistoryPage> {
+    check_cancel(cancel)?;
+    let limit = q.limit.min(MAX_HISTORY_ROWS);
+    // Declared before the transaction so that it is dropped after it: the
+    // handler stays in place for the rollback too.
+    let _guard = CancelGuard::install(conn, cancel);
+    let tx = conn.unchecked_transaction()?;
+
+    let label_ids = match q.filter.device_text() {
+        Some(text) => Some(matching_label_ids(&tx, text)?),
+        None => None,
+    };
+    let conditions = Conditions::new(q, label_ids);
+    check_cancel(cancel)?;
+    if q.filter.has_row_filter() {
+        filtered_history(&tx, q, &conditions, limit, cancel)
+    } else {
+        ranged_history(&tx, q, &conditions, limit, scans_allowed, cancel)
+    }
+}
+
+/// The identifiers whose label contains `text`, as a JSON list for `json_each`.
+fn matching_label_ids(conn: &Connection, text: &str) -> rusqlite::Result<String> {
+    let mut stmt = conn.prepare("SELECT device, label FROM device_labels")?;
+    let labels = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let ids = devices_with_matching_label(
+        &fold_case(text),
+        labels
+            .iter()
+            .map(|(device, label)| (device.as_str(), label.as_str())),
+    );
+    Ok(serde_json::to_string(&ids).expect("a list of identifiers is valid JSON"))
+}
+
+fn count_rows(
+    conn: &Connection,
+    sql: &str,
+    bindings: &[(&str, &dyn ToSql)],
+) -> rusqlite::Result<u64> {
+    let n: i64 = conn.query_row(sql, bindings, |r| r.get(0))?;
+    Ok(n as u64)
+}
+
+/// A request with only a time bound: an index count, and the first `limit` rows
+/// of the index range.
+fn ranged_history(
+    conn: &Connection,
+    q: &HistoryQuery,
+    conditions: &Conditions,
+    limit: usize,
+    scans_allowed: bool,
+    cancel: &AtomicBool,
+) -> rusqlite::Result<HistoryPage> {
+    let (mut total, mut malformed) = (None, None);
+    if q.count {
+        total = Some(count_rows(
+            conn,
+            &conditions.count_sql(),
+            &conditions.bindings(),
+        )?);
+        check_cancel(cancel)?;
+        if scans_allowed {
+            malformed = Some(count_rows(
+                conn,
+                &conditions.malformed_count_sql(),
+                &conditions.bindings(),
+            )?);
+            check_cancel(cancel)?;
+        }
+    }
+
+    let mut bindings = conditions.bindings();
+    let limit_value = limit as i64;
+    bindings.push((":limit", &limit_value));
+    let mut stmt = conn.prepare(&conditions.page_sql(q.newest))?;
+    let mut rows = stmt.query(&*bindings)?;
+    let mut records = Vec::new();
+    while let Some(row) = rows.next()? {
+        records.push(row_to_record(row)?);
+    }
+    if q.newest {
+        records.reverse();
+    }
+    Ok(HistoryPage {
+        records,
+        total,
+        malformed,
+    })
+}
+
+/// A request with row filters: one scan that counts and chooses, then a fetch
+/// of the chosen rows.
+fn filtered_history(
+    conn: &Connection,
+    q: &HistoryQuery,
+    conditions: &Conditions,
+    limit: usize,
+    cancel: &AtomicBool,
+) -> rusqlite::Result<HistoryPage> {
+    let hide_malformed = q.filter.hide_malformed;
+    let mut chosen: Vec<i64> = Vec::new();
+    let (mut total, mut malformed) = (0u64, 0u64);
+    // With no rows to keep and nothing to count there is nothing to scan for.
+    if limit > 0 || q.count {
+        let mut stmt = conn.prepare(&conditions.scan_sql(q.newest))?;
+        let mut rows = stmt.query(&*conditions.bindings())?;
+        while let Some(row) = rows.next()? {
+            // Counted here, not in SQL, so that the one scan yields both
+            // counts whichever way the box is set.
+            if !matches!(row.get_ref(1)?, ValueRef::Null) {
+                malformed += 1;
+                if hide_malformed {
+                    continue;
+                }
+            }
+            total += 1;
+            if chosen.len() < limit {
+                chosen.push(row.get(0)?);
+            }
+            if !q.count && chosen.len() >= limit {
+                break;
+            }
+        }
+    }
+    check_cancel(cancel)?;
+
+    let mut records = Vec::with_capacity(chosen.len());
+    if !chosen.is_empty() {
+        let ids = serde_json::to_string(&chosen).expect("a list of numbers is valid JSON");
+        let mut stmt = conn.prepare(&fetch_by_rowid_sql())?;
+        let mut rows = stmt.query(params![ids])?;
+        while let Some(row) = rows.next()? {
+            records.push(row_to_record(row)?);
+        }
+    }
+    Ok(HistoryPage {
+        records,
+        total: q.count.then_some(total),
+        malformed: q.count.then_some(malformed),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Row deserialization
 // ---------------------------------------------------------------------------
 
@@ -993,13 +1706,20 @@ fn mtype_str(m: &MType) -> &'static str {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod history_large_tests;
+#[cfg(test)]
+mod history_tests;
+#[cfg(test)]
+pub(crate) use tests::TempDb;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::eui::Eui64;
     use crate::core::metadata::{CrcStatus, Direction, MType, MessageRecord, Protocol, Status};
     use chrono::Utc;
 
-    fn sample_record() -> MessageRecord {
+    pub(super) fn sample_record() -> MessageRecord {
         MessageRecord {
             id: MessageRecord::new_id(),
             timestamp: Utc::now(),
@@ -1030,6 +1750,36 @@ mod tests {
             f_opts_len: None,
             malformed: None,
         }
+    }
+
+    /// The newest `n` records, oldest first: what `/api/messages?limit=n`
+    /// returns.
+    fn recent(s: &Storage, n: usize) -> Vec<MessageRecord> {
+        let q = HistoryQuery {
+            lower: None,
+            filter: Default::default(),
+            limit: n,
+            newest: true,
+            count: false,
+        };
+        s.query_history(&q, Arc::new(AtomicBool::new(false)))
+            .unwrap()
+            .records
+    }
+
+    /// The oldest `n` records strictly after `at`: what
+    /// `/api/messages?since=at&limit=n` returns.
+    fn since(s: &Storage, at: DateTime<Utc>, n: usize) -> Vec<MessageRecord> {
+        let q = HistoryQuery {
+            lower: Some(LowerBound::After(at)),
+            filter: Default::default(),
+            limit: n,
+            newest: false,
+            count: false,
+        };
+        s.query_history(&q, Arc::new(AtomicBool::new(false)))
+            .unwrap()
+            .records
     }
 
     #[test]
@@ -1253,12 +2003,12 @@ mod tests {
 
     /// A database file in a private temp directory, removed on drop even when
     /// the test fails.
-    struct TempDb {
+    pub(crate) struct TempDb {
         dir: std::path::PathBuf,
     }
 
     impl TempDb {
-        fn new(label: &str) -> Self {
+        pub(crate) fn new(label: &str) -> Self {
             use std::sync::atomic::{AtomicU32, Ordering};
             static COUNTER: AtomicU32 = AtomicU32::new(0);
             let dir = std::env::temp_dir().join(format!(
@@ -1271,7 +2021,7 @@ mod tests {
             Self { dir }
         }
 
-        fn path(&self) -> String {
+        pub(crate) fn path(&self) -> String {
             self.dir.join("sniffer.db").to_string_lossy().into_owned()
         }
     }
@@ -1396,7 +2146,7 @@ mod tests {
         assert!(s.delete_label("01ABCDEF").unwrap());
 
         // Old rows survive intact; every new field reads as absent.
-        let rows = s.query_recent(10).unwrap();
+        let rows = recent(&s, 10);
         assert_eq!(rows.len(), 2);
         let forwarded = rows.iter().find(|r| r.id == "old-forwarded").unwrap();
         assert_eq!(forwarded.status, Status::Forwarded);
@@ -1429,9 +2179,7 @@ mod tests {
         fresh.f_opts_len = Some(3);
         s.insert(&fresh).unwrap();
         assert_eq!(s.count().unwrap(), 3);
-        let back = s
-            .query_recent(10)
-            .unwrap()
+        let back = recent(&s, 10)
             .into_iter()
             .find(|r| r.id == "new-row")
             .unwrap();
@@ -1527,7 +2275,7 @@ mod tests {
             s.insert(rec).unwrap();
         }
 
-        let rows = s.query_recent(10).unwrap();
+        let rows = recent(&s, 10);
         assert_eq!(rows.len(), 4);
         for expected in &records {
             let got = rows.iter().find(|r| r.id == expected.id).unwrap();
@@ -1546,7 +2294,7 @@ mod tests {
 
         // They also come back through the incremental query used by the API.
         let since = base - chrono::Duration::seconds(1);
-        let rows = s.query_since(since, 10).unwrap();
+        let rows = self::since(&s, since, 10);
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[1].id, "down");
         assert_eq!(rows[1].f_opts_len, Some(15));
@@ -1696,7 +2444,7 @@ mod tests {
 
         // The rows from before the upgrade are intact.
         assert_eq!(s.count().unwrap(), 2);
-        let rows = s.query_recent(10).unwrap();
+        let rows = recent(&s, 10);
         let data = rows.iter().find(|r| r.id == "data").unwrap();
         assert_eq!(data.dev_addr.as_deref(), Some("01ABCDEF"));
         assert_eq!(data.gateway_eui.as_deref(), Some("AA:BB:CC:DD:00:11:22:33"));
@@ -2188,7 +2936,7 @@ mod tests {
             .unwrap()
             .execute("UPDATE messages SET malformed = 'bogus'", [])
             .unwrap();
-        assert_eq!(s.query_recent(10).unwrap()[0].malformed, None);
+        assert_eq!(recent(&s, 10)[0].malformed, None);
     }
 
     #[test]
@@ -2213,7 +2961,7 @@ mod tests {
             s.insert(rec).unwrap();
         }
 
-        let rows = s.query_recent(10).unwrap();
+        let rows = recent(&s, 10);
         assert_eq!(rows.len(), 4);
         for expected in &records {
             let got = rows.iter().find(|r| r.id == expected.id).unwrap();
@@ -2222,9 +2970,7 @@ mod tests {
         }
 
         // The incremental query used by the API reads the column too.
-        let rows = s
-            .query_since(base - chrono::Duration::seconds(1), 10)
-            .unwrap();
+        let rows = since(&s, base - chrono::Duration::seconds(1), 10);
         let reasons: Vec<Option<Malformed>> = rows.iter().map(|r| r.malformed).collect();
         assert_eq!(
             reasons,
@@ -2279,7 +3025,7 @@ mod tests {
         s.insert(&malformed_record("same", rec.timestamp, Malformed::Crc))
             .unwrap();
 
-        let rows = s.query_recent(10).unwrap();
+        let rows = recent(&s, 10);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].malformed, Some(Malformed::Crc));
         let unchecked: i64 = s

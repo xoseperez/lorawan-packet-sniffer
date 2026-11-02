@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,12 +10,15 @@ use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::core::error::SnifferError;
 use crate::core::eui::Eui64;
 use crate::core::filter::FilterRule;
+use crate::core::linelog::error_line;
 use crate::core::metadata::MessageRecord;
 use crate::core::ratelimit::RateLimitedLog;
 use crate::core::seen::SeenDevices;
 use crate::core::storage::Storage;
+use crate::core::writer::WriterItem;
 
 use crate::api::labels::{LabelWriter, WriterError};
 use crate::api::{self, ApiContext};
@@ -37,7 +41,7 @@ const LABELS_CHANNEL_CAPACITY: usize = 64;
 
 /// Buffered capacity of the record channel (records/messages).
 /// LoRaWAN rates are << 1000/s, so 1024 is plenty.
-const CHANNEL_CAPACITY: usize = 1024;
+pub(crate) const CHANNEL_CAPACITY: usize = 1024;
 
 /// How long a stop request waits for the storage writer to save the records
 /// still queued.  Long enough for a full channel on a slow SD card, short
@@ -95,8 +99,15 @@ pub async fn run(config: &Configuration) -> Result<()> {
     })?;
     info!("Database opened at '{}'", config.sniffer.database.path);
 
-    // Channel: proxy tasks → storage writer
-    let (record_tx, record_rx) = mpsc::channel::<MessageRecord>(CHANNEL_CAPACITY);
+    // Channel: proxy tasks → storage writer.  The API keeps a weak handle to
+    // queue markers on, so that it never holds the queue open once the proxy
+    // has stopped.
+    let (record_tx, record_rx) = mpsc::channel::<WriterItem>(CHANNEL_CAPACITY);
+    let writer_queue = record_tx.downgrade();
+
+    // Inserts that did not save, since the sniffer started.  The writer counts
+    // them and the API reports the count.
+    let write_failures = Arc::new(AtomicU64::new(0));
 
     // Broadcast hub: proxy tasks → WebSocket clients (pre-serialised JSON).
     // Capacity 512: at LoRaWAN rates this is never hit; slow WS clients lag.
@@ -146,8 +157,9 @@ pub async fn run(config: &Configuration) -> Result<()> {
     // -----------------------------------------------------------------------
     let writer_storage = storage.clone();
     let writer_cancel = cancel.clone();
+    let writer_failures = write_failures.clone();
     let writer = tokio::spawn(async move {
-        run_writer(record_rx, writer_storage, writer_cancel).await;
+        run_writer(record_rx, writer_storage, writer_failures, writer_cancel).await;
     });
 
     // -----------------------------------------------------------------------
@@ -162,6 +174,8 @@ pub async fn run(config: &Configuration) -> Result<()> {
         writer: label_writer.clone(),
         cors_origins: config.sniffer.api.cors_origins.clone(),
         allowed_hosts: config.sniffer.api.allowed_hosts.clone(),
+        writer_queue,
+        write_failures,
     };
     tokio::spawn(async move {
         run_api(api_context, api_bind, api_cancel).await;
@@ -269,31 +283,79 @@ pub async fn run(config: &Configuration) -> Result<()> {
 // Background tasks
 // ---------------------------------------------------------------------------
 
-/// Receive `MessageRecord`s and persist them to SQLite.
-async fn run_writer(
-    mut rx: mpsc::Receiver<MessageRecord>,
+/// Take items from the writer queue, one at a time, and persist them to
+/// SQLite.
+///
+/// Each item is finished before the next is taken, which is what gives a
+/// marker its meaning: when it is answered, everything queued before it has
+/// been processed, saved or counted in `failures` (see [`WriterItem`]).  The
+/// count goes up before the next item is taken, so before any later marker is
+/// answered, and whoever reads it after that answer sees it.
+pub(crate) async fn run_writer(
+    rx: mpsc::Receiver<WriterItem>,
     storage: Storage,
+    failures: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) {
+    process_items(rx, move |record| storage.insert(&record), failures, cancel).await;
+}
+
+/// [`run_writer`] with the insert passed in, so that tests can make it fail,
+/// panic or wait.
+pub(crate) async fn process_items<F>(
+    mut rx: mpsc::Receiver<WriterItem>,
+    insert: F,
+    failures: Arc<AtomicU64>,
+    cancel: CancellationToken,
+) where
+    F: Fn(MessageRecord) -> Result<(), SnifferError> + Clone + Send + Sync + 'static,
+{
     loop {
+        // A stop is looked at first, so that a queue that never empties
+        // cannot keep the writer from draining and exiting.
         tokio::select! {
-            Some(record) = rx.recv() => {
-                let s = storage.clone();
-                match tokio::task::spawn_blocking(move || s.insert(&record)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => error!("Storage write error: {}", e),
-                    Err(e)    => error!("Storage writer task panicked: {}", e),
-                }
-            }
+            biased;
             _ = cancel.cancelled() => {
-                // Drain remaining records before exiting.
-                while let Ok(record) = rx.try_recv() {
-                    let s = storage.clone();
-                    let _ = tokio::task::spawn_blocking(move || s.insert(&record)).await;
+                // Drain remaining items before exiting.  A marker still in
+                // the queue is answered like any other, so that a request
+                // waiting for it does not wait out its time.
+                while let Ok(item) = rx.try_recv() {
+                    process_item(item, &insert, &failures).await;
                 }
                 debug!("Storage writer task stopped");
                 break;
             }
+            Some(item) = rx.recv() => {
+                process_item(item, &insert, &failures).await;
+            }
+        }
+    }
+}
+
+/// Save one record, or answer one marker.
+async fn process_item<F>(item: WriterItem, insert: &F, failures: &AtomicU64)
+where
+    F: Fn(MessageRecord) -> Result<(), SnifferError> + Clone + Send + Sync + 'static,
+{
+    match item {
+        WriterItem::Record(record) => {
+            let insert = insert.clone();
+            match tokio::task::spawn_blocking(move || insert(record)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error_line!("Storage write error: {}", e);
+                    failures.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    error_line!("Storage writer task panicked: {}", e);
+                    failures.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        WriterItem::Settle { done, permit } => {
+            // The requester may have given up; the answer then goes nowhere.
+            let _ = done.send(());
+            drop(permit);
         }
     }
 }

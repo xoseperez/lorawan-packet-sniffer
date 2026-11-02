@@ -1,0 +1,360 @@
+{
+  "format": [
+    "Shared test vectors for the history filter. Two suites read this file: webui/test/history.test.mjs (Node) and the router test in lorawan-sniffer/src/api/message_tests.rs (Rust). Both must give the same answers.",
+    "Top-level keys: format (this text), labels, records, cases.",
+    "labels: object, identifier -> label text. The identifier is a DevAddr or a DevEUI exactly as a record carries it (EUIs colon-separated, upper case). A record's label is the one stored for its identifier, which is dev_addr, else dev_eui. Store these through the label store (they are what GET /api/labels returns).",
+    "records: array of the stored records, sorted by timestamp ascending (true time order), ids unique. Fields: id, timestamp (ISO 8601 UTC with Z; 0, 3 or 6 fraction digits, as the sniffer writes them), mtype (MType name), status (Forwarded | Blocked | Captured), gateway_eui (string or null), dev_addr (string or null), dev_eui (string or null), malformed (null, crc, mhdr or length). Every other field of a record is irrelevant to the filters: use any value. A record can have both dev_addr and dev_eui (r10): its identifier, for labels, is the DevAddr.",
+    "cases: array of {name, filter, query, expect, expectMalformed}. Names are unique.",
+    "filter: the browser's HistoryFilter with the time bound as text: {device, mtypes, status, from, gateway, hideMalformed}. device is the text as typed (never trimmed). mtypes: MType names, empty = any. status: all | Forwarded | Blocked | Captured. gateway: exact text, empty = any. from: ISO 8601 text with milliseconds and Z, the inclusive lower bound, or null. hideMalformed: true leaves malformed records out. The Node suite converts from to epoch milliseconds; the Rust suite does not read filter at all.",
+    "query: the filter part of the /api/messages query string, exactly as the browser builds it: from, device, mtype, status, gateway, malformed, in that order, each value percent-encoded (a + is %2B, a space %20), filters that select everything left out, and malformed=exclude only when hideMalformed is true. It can be empty. Rust: GET /api/messages?<query>&newest=true&count=true&limit=5000 (when query is empty, drop the first &). status is sent as in the filter (Forwarded), which the server accepts in any case.",
+    "expect: the ids of the records the request must return, in the order returned (oldest first, which is the order of records). Rust: the response ids equal expect, and X-Total-Count equals its length. The Node suite checks the same list with matchesFilter.",
+    "expectMalformed: the number of malformed records that match every filter except hideMalformed, whether hideMalformed hides them or not. Rust: X-Malformed-Count equals it. The Node suite checks it with countsAsMalformed."
+  ],
+  "labels": {
+    "26011BDA": "Ñandú quiet sensor",
+    "1D2E3F40": "İstanbul sensor",
+    "2E3F4051": "ΟΔΟΣ ΟΔΟΣ",
+    "3F405162": "Straße sensor",
+    "3E4F5A6B": "Valve 50%_ line",
+    "5A6B7C8D": "Cold room a b+c",
+    "6B7C8D9E": "Cold room a b c",
+    "7C8D9EAF": "Qingping T&H Havana",
+    "70:B3:D5:7E:D0:01:23:45": "Greenhouse node",
+    "11:22:33:44:55:66:77:88": "Roof both-id"
+  },
+  "records": [
+    {"id": "r01-nandu", "timestamp": "2026-10-30T10:00:00Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "26011BDA", "dev_eui": null, "malformed": null},
+    {"id": "r02-plain", "timestamp": "2026-10-30T10:01:00Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "0A1B2C3D", "dev_eui": null, "malformed": null},
+    {"id": "r03-join", "timestamp": "2026-10-30T10:02:00Z", "mtype": "JoinRequest", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:34", "dev_addr": null, "dev_eui": "70:B3:D5:7E:D0:01:23:45", "malformed": null},
+    {"id": "r04-istanbul", "timestamp": "2026-10-30T10:03:00Z", "mtype": "ConfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "1D2E3F40", "dev_eui": null, "malformed": null},
+    {"id": "r05-greek", "timestamp": "2026-10-30T10:04:00Z", "mtype": "UnconfirmedDataDown", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "2E3F4051", "dev_eui": null, "malformed": null},
+    {"id": "r06-strasse", "timestamp": "2026-10-30T10:05:00Z", "mtype": "UnconfirmedDataUp", "status": "Blocked", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "3F405162", "dev_eui": null, "malformed": null},
+    {"id": "r07-percent", "timestamp": "2026-10-30T10:06:00Z", "mtype": "ConfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "3E4F5A6B", "dev_eui": null, "malformed": null},
+    {"id": "r08-plus", "timestamp": "2026-10-30T10:07:00Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "5A6B7C8D", "dev_eui": null, "malformed": null},
+    {"id": "r09-spaces", "timestamp": "2026-10-30T10:08:00Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:34", "dev_addr": "6B7C8D9E", "dev_eui": null, "malformed": null},
+    {"id": "r10-both-identifiers", "timestamp": "2026-10-30T10:09:00Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "4C5D6E7F", "dev_eui": "11:22:33:44:55:66:77:88", "malformed": null},
+    {"id": "r11-roof-join", "timestamp": "2026-10-30T10:10:00Z", "mtype": "JoinRequest", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": null, "dev_eui": "11:22:33:44:55:66:77:88", "malformed": null},
+    {"id": "r12-havana", "timestamp": "2026-10-30T10:11:00Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:34", "dev_addr": "7C8D9EAF", "dev_eui": null, "malformed": null},
+    {"id": "r13-unknown", "timestamp": "2026-10-30T10:12:00Z", "mtype": "Unknown", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": null, "dev_eui": null, "malformed": null},
+    {"id": "r14-join-accept", "timestamp": "2026-10-30T10:13:00Z", "mtype": "JoinAccept", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": null, "dev_eui": null, "malformed": null},
+    {"id": "r15-captured", "timestamp": "2026-10-30T10:14:00Z", "mtype": "UnconfirmedDataUp", "status": "Captured", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "0A1B2C3D", "dev_eui": null, "malformed": null},
+    {"id": "r16-no-gateway", "timestamp": "2026-10-30T10:15:00Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": null, "dev_addr": "0A1B2C3D", "dev_eui": null, "malformed": null},
+    {"id": "r17-bad-crc", "timestamp": "2026-10-30T10:16:00Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": null, "dev_eui": null, "malformed": "crc"},
+    {"id": "r18-bad-header", "timestamp": "2026-10-30T10:17:00Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:34", "dev_addr": null, "dev_eui": null, "malformed": "mhdr"},
+    {"id": "r19-bad-length", "timestamp": "2026-10-30T10:18:00Z", "mtype": "ConfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": null, "dev_eui": null, "malformed": "length"},
+    {"id": "r20-unknown-bad-crc", "timestamp": "2026-10-30T10:19:00Z", "mtype": "Unknown", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": null, "dev_eui": null, "malformed": "crc"},
+    {"id": "r21-1ms-before-from", "timestamp": "2026-10-30T11:59:59.999Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "AB000001", "dev_eui": null, "malformed": null},
+    {"id": "r22-half-ms-before", "timestamp": "2026-10-30T11:59:59.999500Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "AB000002", "dev_eui": null, "malformed": null},
+    {"id": "r23-at-from", "timestamp": "2026-10-30T12:00:00Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "AB000003", "dev_eui": null, "malformed": null},
+    {"id": "r24-half-ms-after", "timestamp": "2026-10-30T12:00:00.000500Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "AB000004", "dev_eui": null, "malformed": null},
+    {"id": "r25-1ms-after", "timestamp": "2026-10-30T12:00:00.001Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "AB000005", "dev_eui": null, "malformed": null},
+    {"id": "r26-late-nandu", "timestamp": "2026-10-30T13:00:00Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "26011BDA", "dev_eui": null, "malformed": null},
+    {"id": "r27-late-blocked", "timestamp": "2026-10-30T13:01:00Z", "mtype": "ConfirmedDataUp", "status": "Blocked", "gateway_eui": "AA:BB:CC:DD:00:11:22:34", "dev_addr": "0A1B2C3D", "dev_eui": null, "malformed": null},
+    {"id": "r28-late-join", "timestamp": "2026-10-30T13:02:00Z", "mtype": "JoinRequest", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:34", "dev_addr": null, "dev_eui": "70:B3:D5:7E:D0:01:23:45", "malformed": null},
+    {"id": "r29-late-captured", "timestamp": "2026-10-30T13:03:00Z", "mtype": "UnconfirmedDataUp", "status": "Captured", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": "7C8D9EAF", "dev_eui": null, "malformed": null},
+    {"id": "r30-late-bad-crc", "timestamp": "2026-10-30T13:04:00Z", "mtype": "UnconfirmedDataUp", "status": "Forwarded", "gateway_eui": "AA:BB:CC:DD:00:11:22:33", "dev_addr": null, "dev_eui": null, "malformed": "crc"}
+  ],
+  "cases": [
+    {
+      "name": "empty filter",
+      "filter": {"device": "", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "",
+      "expect": ["r01-nandu", "r02-plain", "r03-join", "r04-istanbul", "r05-greek", "r06-strasse", "r07-percent", "r08-plus", "r09-spaces", "r10-both-identifiers", "r11-roof-join", "r12-havana", "r13-unknown", "r14-join-accept", "r15-captured", "r16-no-gateway", "r17-bad-crc", "r18-bad-header", "r19-bad-length", "r20-unknown-bad-crc", "r21-1ms-before-from", "r22-half-ms-before", "r23-at-from", "r24-half-ms-after", "r25-1ms-after", "r26-late-nandu", "r27-late-blocked", "r28-late-join", "r29-late-captured", "r30-late-bad-crc"],
+      "expectMalformed": 5
+    },
+    {
+      "name": "malformed hidden, the default view",
+      "filter": {"device": "", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": true},
+      "query": "malformed=exclude",
+      "expect": ["r01-nandu", "r02-plain", "r03-join", "r04-istanbul", "r05-greek", "r06-strasse", "r07-percent", "r08-plus", "r09-spaces", "r10-both-identifiers", "r11-roof-join", "r12-havana", "r13-unknown", "r14-join-accept", "r15-captured", "r16-no-gateway", "r21-1ms-before-from", "r22-half-ms-before", "r23-at-from", "r24-half-ms-after", "r25-1ms-after", "r26-late-nandu", "r27-late-blocked", "r28-late-join", "r29-late-captured"],
+      "expectMalformed": 5
+    },
+    {
+      "name": "DevAddr fragment in lower case",
+      "filter": {"device": "0a1b", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=0a1b",
+      "expect": ["r02-plain", "r15-captured", "r16-no-gateway", "r27-late-blocked"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "DevAddr fragment in upper case",
+      "filter": {"device": "0A1B", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=0A1B",
+      "expect": ["r02-plain", "r15-captured", "r16-no-gateway", "r27-late-blocked"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "DevEUI fragment with colons",
+      "filter": {"device": "b3:d5", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=b3%3Ad5",
+      "expect": ["r03-join", "r28-late-join"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "label, capitals against accents",
+      "filter": {"device": "ÑANDÚ", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=%C3%91AND%C3%9A",
+      "expect": ["r01-nandu", "r26-late-nandu"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "label, lower-case partial",
+      "filter": {"device": "ñandú qu", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=%C3%B1and%C3%BA%20qu",
+      "expect": ["r01-nandu", "r26-late-nandu"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "label, dotted capital I folds to i and a combining dot",
+      "filter": {"device": "İSTANBUL", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=%C4%B0STANBUL",
+      "expect": ["r04-istanbul"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "label, plain i does not match a dotted capital I",
+      "filter": {"device": "istanbul", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=istanbul",
+      "expect": [],
+      "expectMalformed": 0
+    },
+    {
+      "name": "label, Greek with a final sigma",
+      "filter": {"device": "ΟΔΟΣ", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=%CE%9F%CE%94%CE%9F%CE%A3",
+      "expect": ["r05-greek"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "label, a lone capital sigma folds to a non-final sigma",
+      "filter": {"device": "Σ", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=%CE%A3",
+      "expect": [],
+      "expectMalformed": 0
+    },
+    {
+      "name": "label, sharp s",
+      "filter": {"device": "STRAẞE", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=STRA%E1%BA%9EE",
+      "expect": ["r06-strasse"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "label, ss does not match a sharp s",
+      "filter": {"device": "STRASSE", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=STRASSE",
+      "expect": [],
+      "expectMalformed": 0
+    },
+    {
+      "name": "label of a DevEUI",
+      "filter": {"device": "greenhouse", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=greenhouse",
+      "expect": ["r03-join", "r28-late-join"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "label of a DevEUI does not reach a record that also has a DevAddr",
+      "filter": {"device": "roof", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=roof",
+      "expect": ["r11-roof-join"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "percent and underscore are literal",
+      "filter": {"device": "50%_", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=50%25_",
+      "expect": ["r07-percent"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "a lone underscore is literal",
+      "filter": {"device": "_", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=_",
+      "expect": ["r07-percent"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "a space and a plus",
+      "filter": {"device": "a b+c", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=a%20b%2Bc",
+      "expect": ["r08-plus"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "a plus is not a space",
+      "filter": {"device": "a b c", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=a%20b%20c",
+      "expect": ["r09-spaces"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "an ampersand",
+      "filter": {"device": "t&h", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=t%26h",
+      "expect": ["r12-havana", "r29-late-captured"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "a leading space is kept",
+      "filter": {"device": " cold", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=%20cold",
+      "expect": [],
+      "expectMalformed": 0
+    },
+    {
+      "name": "a leading space still matches inside a label",
+      "filter": {"device": " room", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=%20room",
+      "expect": ["r08-plus", "r09-spaces"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "no leading space",
+      "filter": {"device": "cold", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=cold",
+      "expect": ["r08-plus", "r09-spaces"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "no match",
+      "filter": {"device": "zzzz", "mtypes": [], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "device=zzzz",
+      "expect": [],
+      "expectMalformed": 0
+    },
+    {
+      "name": "one type",
+      "filter": {"device": "", "mtypes": ["JoinRequest"], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "mtype=JoinRequest",
+      "expect": ["r03-join", "r11-roof-join", "r28-late-join"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "two types",
+      "filter": {"device": "", "mtypes": ["ConfirmedDataUp", "UnconfirmedDataDown"], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "mtype=ConfirmedDataUp,UnconfirmedDataDown",
+      "expect": ["r04-istanbul", "r05-greek", "r07-percent", "r19-bad-length", "r27-late-blocked"],
+      "expectMalformed": 1
+    },
+    {
+      "name": "a type leaves out an Unknown record",
+      "filter": {"device": "", "mtypes": ["UnconfirmedDataUp"], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "mtype=UnconfirmedDataUp",
+      "expect": ["r01-nandu", "r02-plain", "r06-strasse", "r08-plus", "r09-spaces", "r10-both-identifiers", "r12-havana", "r15-captured", "r16-no-gateway", "r17-bad-crc", "r18-bad-header", "r21-1ms-before-from", "r22-half-ms-before", "r23-at-from", "r24-half-ms-after", "r25-1ms-after", "r26-late-nandu", "r29-late-captured", "r30-late-bad-crc"],
+      "expectMalformed": 3
+    },
+    {
+      "name": "a type with malformed frames hidden",
+      "filter": {"device": "", "mtypes": ["ConfirmedDataUp"], "status": "all", "gateway": "", "from": null, "hideMalformed": true},
+      "query": "mtype=ConfirmedDataUp&malformed=exclude",
+      "expect": ["r04-istanbul", "r07-percent", "r27-late-blocked"],
+      "expectMalformed": 1
+    },
+    {
+      "name": "a type with malformed frames shown",
+      "filter": {"device": "", "mtypes": ["ConfirmedDataUp"], "status": "all", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "mtype=ConfirmedDataUp",
+      "expect": ["r04-istanbul", "r07-percent", "r19-bad-length", "r27-late-blocked"],
+      "expectMalformed": 1
+    },
+    {
+      "name": "status Forwarded",
+      "filter": {"device": "", "mtypes": [], "status": "Forwarded", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "status=Forwarded",
+      "expect": ["r01-nandu", "r02-plain", "r03-join", "r04-istanbul", "r05-greek", "r07-percent", "r08-plus", "r09-spaces", "r10-both-identifiers", "r11-roof-join", "r12-havana", "r13-unknown", "r14-join-accept", "r16-no-gateway", "r17-bad-crc", "r18-bad-header", "r19-bad-length", "r20-unknown-bad-crc", "r21-1ms-before-from", "r22-half-ms-before", "r23-at-from", "r24-half-ms-after", "r25-1ms-after", "r26-late-nandu", "r28-late-join", "r30-late-bad-crc"],
+      "expectMalformed": 5
+    },
+    {
+      "name": "status Blocked",
+      "filter": {"device": "", "mtypes": [], "status": "Blocked", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "status=Blocked",
+      "expect": ["r06-strasse", "r27-late-blocked"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "status Captured",
+      "filter": {"device": "", "mtypes": [], "status": "Captured", "gateway": "", "from": null, "hideMalformed": false},
+      "query": "status=Captured",
+      "expect": ["r15-captured", "r29-late-captured"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "gateway, exact",
+      "filter": {"device": "", "mtypes": [], "status": "all", "gateway": "AA:BB:CC:DD:00:11:22:34", "from": null, "hideMalformed": false},
+      "query": "gateway=AA%3ABB%3ACC%3ADD%3A00%3A11%3A22%3A34",
+      "expect": ["r03-join", "r09-spaces", "r12-havana", "r18-bad-header", "r27-late-blocked", "r28-late-join"],
+      "expectMalformed": 1
+    },
+    {
+      "name": "gateway in lower case matches nothing",
+      "filter": {"device": "", "mtypes": [], "status": "all", "gateway": "aa:bb:cc:dd:00:11:22:34", "from": null, "hideMalformed": false},
+      "query": "gateway=aa%3Abb%3Acc%3Add%3A00%3A11%3A22%3A34",
+      "expect": [],
+      "expectMalformed": 0
+    },
+    {
+      "name": "time bound alone",
+      "filter": {"device": "", "mtypes": [], "status": "all", "gateway": "", "from": "2026-10-30T12:00:00.000Z", "hideMalformed": false},
+      "query": "from=2026-10-30T12%3A00%3A00.000Z",
+      "expect": ["r23-at-from", "r24-half-ms-after", "r25-1ms-after", "r26-late-nandu", "r27-late-blocked", "r28-late-join", "r29-late-captured", "r30-late-bad-crc"],
+      "expectMalformed": 1
+    },
+    {
+      "name": "time bound, in the middle of the data",
+      "filter": {"device": "", "mtypes": [], "status": "all", "gateway": "", "from": "2026-10-30T10:10:00.000Z", "hideMalformed": false},
+      "query": "from=2026-10-30T10%3A10%3A00.000Z",
+      "expect": ["r11-roof-join", "r12-havana", "r13-unknown", "r14-join-accept", "r15-captured", "r16-no-gateway", "r17-bad-crc", "r18-bad-header", "r19-bad-length", "r20-unknown-bad-crc", "r21-1ms-before-from", "r22-half-ms-before", "r23-at-from", "r24-half-ms-after", "r25-1ms-after", "r26-late-nandu", "r27-late-blocked", "r28-late-join", "r29-late-captured", "r30-late-bad-crc"],
+      "expectMalformed": 5
+    },
+    {
+      "name": "time bound, exactly at from is in",
+      "filter": {"device": "ab000003", "mtypes": [], "status": "all", "gateway": "", "from": "2026-10-30T12:00:00.000Z", "hideMalformed": false},
+      "query": "from=2026-10-30T12%3A00%3A00.000Z&device=ab000003",
+      "expect": ["r23-at-from"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "time bound, 1 ms before from is out",
+      "filter": {"device": "ab000001", "mtypes": [], "status": "all", "gateway": "", "from": "2026-10-30T12:00:00.000Z", "hideMalformed": false},
+      "query": "from=2026-10-30T12%3A00%3A00.000Z&device=ab000001",
+      "expect": [],
+      "expectMalformed": 0
+    },
+    {
+      "name": "time bound, half a millisecond after from is in",
+      "filter": {"device": "ab000004", "mtypes": [], "status": "all", "gateway": "", "from": "2026-10-30T12:00:00.000Z", "hideMalformed": false},
+      "query": "from=2026-10-30T12%3A00%3A00.000Z&device=ab000004",
+      "expect": ["r24-half-ms-after"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "time bound, half a millisecond before from is out",
+      "filter": {"device": "ab000002", "mtypes": [], "status": "all", "gateway": "", "from": "2026-10-30T12:00:00.000Z", "hideMalformed": false},
+      "query": "from=2026-10-30T12%3A00%3A00.000Z&device=ab000002",
+      "expect": [],
+      "expectMalformed": 0
+    },
+    {
+      "name": "time bound, 1 ms after from is in",
+      "filter": {"device": "ab000005", "mtypes": [], "status": "all", "gateway": "", "from": "2026-10-30T12:00:00.000Z", "hideMalformed": false},
+      "query": "from=2026-10-30T12%3A00%3A00.000Z&device=ab000005",
+      "expect": ["r25-1ms-after"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "every filter at once, one record",
+      "filter": {"device": "0a1b", "mtypes": ["UnconfirmedDataUp", "ConfirmedDataUp"], "status": "Forwarded", "gateway": "AA:BB:CC:DD:00:11:22:33", "from": "2026-10-30T10:00:00.000Z", "hideMalformed": true},
+      "query": "from=2026-10-30T10%3A00%3A00.000Z&device=0a1b&mtype=UnconfirmedDataUp,ConfirmedDataUp&status=Forwarded&gateway=AA%3ABB%3ACC%3ADD%3A00%3A11%3A22%3A33&malformed=exclude",
+      "expect": ["r02-plain"],
+      "expectMalformed": 0
+    },
+    {
+      "name": "every filter at once, a label",
+      "filter": {"device": "ñandú", "mtypes": ["UnconfirmedDataUp"], "status": "Forwarded", "gateway": "AA:BB:CC:DD:00:11:22:33", "from": "2026-10-30T09:00:00.000Z", "hideMalformed": true},
+      "query": "from=2026-10-30T09%3A00%3A00.000Z&device=%C3%B1and%C3%BA&mtype=UnconfirmedDataUp&status=Forwarded&gateway=AA%3ABB%3ACC%3ADD%3A00%3A11%3A22%3A33&malformed=exclude",
+      "expect": ["r01-nandu", "r26-late-nandu"],
+      "expectMalformed": 0
+    }
+  ]
+}

@@ -18,6 +18,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Time-range history from the database.** The WebUI's time selector (5
+  min, 15 min, 1 h, 24 h, all time) now loads the newest 5,000 records of the
+  range from the database, instead of filtering the 500 records fetched when
+  the page opened. Live records are merged in without duplicates, and rows
+  leave the table as they age out of the range, even when nothing arrives.
+  - When more records match than were loaded, a strip under the table says
+    so: "Showing the newest 5,000 of 12,345 matching messages in the last
+    24 h". There is no "Load older"; a narrower range or a filter shows the
+    rest.
+  - The same strip says when a load failed (the rows are kept), how many
+    records the database could not store since the sniffer started, and when
+    the database is behind.
+- **Filters that search the database.** The device or label, type, status,
+  gateway and "Show malformed" filters are applied by the server, so a quiet
+  device is found even when its records lie beyond the newest 5,000 of the
+  range. The device filter matches labels with Unicode case folding (`ÑANDÚ`
+  finds `ñandú`). Typing loads after a pause of about 0.4 s, and a label
+  change reloads the table while the device box is not empty. The sniffer and
+  the browser apply the same rules, checked by one set of test vectors.
+- **`/api/messages` parameters and headers.** `from` (at or after a time),
+  `newest` (keep the newest `limit` records of the range), `count`, `settle`,
+  `device`, `mtype`, `status`, `gateway` and `malformed`. The answer can carry
+  `X-Total-Count`, `X-Malformed-Count`, `X-History-Settled` and
+  `X-Storage-Write-Failures`, and a `503` says why in a `code` (`no_wal`,
+  `busy`). `limit` and `since` return what they always did. The README
+  documents all of it, with curl examples.
+- **A full reload after every reconnect, with no hole.** Whenever `/ws`
+  opens, the WebUI loads the selected range again and merges the live
+  records it received since. The load waits up to 5 s (`settle=true`) until
+  the storage writer has processed everything queued before it, so a record
+  that was broadcast but not yet saved is not missed. This holds whatever the
+  timing: the sniffer queues a record for storage before it broadcasts it,
+  and a `/ws` client is subscribed before the handshake is answered. If the
+  writer is still behind after 5 s, the WebUI retries after about 5 s, 10,
+  20, 40 and every 60 s until an answer is complete. The README explains the
+  guarantee and its exceptions.
+- **WebUI tests.** `cd webui && npm test` runs the history logic (request
+  rules, merging, counts, back-off) with Node, and checks the filter vectors
+  that a Rust test also sends through the real API. `make test` and the
+  release workflow run it.
+
 - **Malformed-frame detection.** A frame that cannot be valid LoRaWAN 1.0 or
   1.1 is marked with the first reason that applies, in this order: `crc` (the
   gateway reported a failed CRC), `mhdr` (the RFU or Major bits of the first
@@ -113,6 +154,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The footer shows Matching and Shown instead of Total.** Matching is the
+  rows shown plus the older matches the last load counted; Shown is the rows
+  in the table. It can be high, never low. Blocked counts the blocked rows
+  among those shown, and Malformed hidden / shown counts the malformed
+  records in the database that match the other filters, as of the last load.
+- **The gateway list keeps every gateway seen in the session,** in loads and
+  in live records, so a filter on a gateway does not empty it.
+- **History reads use a separate read-only database connection,** so a long
+  search never holds up the writer that saves records. This needs the
+  database in WAL mode, the default. Without it the sniffer warns at startup,
+  only the time range works, and the WebUI loads the range with malformed
+  records included and hides them itself, so it may show fewer than 5,000
+  rows.
+- **The write-ahead log file no longer keeps the largest size it reached:**
+  SQLite shortens it to 8 MiB when it restarts the log. After sustained
+  history queries the file could otherwise stay at hundreds of megabytes.
+- **A `/ws` client that falls behind, or stops reading for 10 s, is now
+  disconnected** (close code 1013, "try again later") instead of silently
+  missing records. The record frames are unchanged. A client that reconnects
+  should reload from `/api/messages` with `settle=true` and back off between
+  attempts.
+- **The WebUI reconnects with growing, randomised pauses,** from about 3 s up
+  to 60 s, instead of a fixed 3 s, and starts again at 3 s after a connection
+  that lasted a minute.
+- **Storage insert failures are logged and counted,** including inserts that
+  panicked and those at shutdown, which used to be discarded. Every
+  `/api/messages` response carries the count since the sniffer started, and
+  the WebUI shows it.
+
 - **A malformed record has `null` in the twelve fields decoded from the frame
   body:** `dev_addr`, `dev_eui`, `join_eui`, `dev_nonce`, `fcnt`, `fport`,
   `adr`, `adr_ack_req`, `ack`, `class_b`, `f_pending` and `f_opts_len`. They
@@ -173,6 +243,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `webui/package.json`, and a test fails if it differs from the crate's.
 
 ### Fixed
+
+- **The time selector showed less history than it named.** "Last 24h" and
+  "All time" only filtered the 500 records fetched when the page opened, so
+  a database with 1,625 records showed 528, and the footer's Total read as if
+  it were nearly empty. They now load from the database. Records stored while
+  the live connection was down were also never fetched; the reload after a
+  reconnect fetches them.
 
 - **Noise got identifiers and header fields.** A JoinRequest was decoded
   from 19 bytes up, although it is 23 bytes long, and a data frame from 8

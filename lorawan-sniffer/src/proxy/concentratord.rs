@@ -837,9 +837,10 @@ fn chmod_ipc_socket(zmq_url: &str) {
 mod tests {
     use super::*;
 
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::broadcast;
 
     use crate::core::metadata::{assert_body_cleared, MType, Malformed, Status};
+    use crate::core::writer::{record_channel, RecordReceiver};
 
     /// Gateway IDs as Concentratord writes them: 16 lowercase hex digits.
     const GW_ID: &str = "0016c001ff10d3f6";
@@ -847,8 +848,8 @@ mod tests {
     const OTHER_ID: &str = "58a0cbfffe801234";
     const OTHER_DISPLAY: &str = "58:A0:CB:FF:FE:80:12:34";
 
-    fn outputs() -> (Outputs, mpsc::Receiver<MessageRecord>) {
-        let (storage_tx, storage_rx) = mpsc::channel(16);
+    fn outputs() -> (Outputs, RecordReceiver) {
+        let (storage_tx, storage_rx) = record_channel(16);
         let (live_tx, _live_rx) = broadcast::channel(16);
         (Outputs::new(storage_tx, live_tx), storage_rx)
     }

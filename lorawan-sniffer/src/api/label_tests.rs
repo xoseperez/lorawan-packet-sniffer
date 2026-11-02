@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use axum::Router;
+use chrono::Utc;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -1252,7 +1253,7 @@ async fn a_device_seen_only_in_malformed_frames_cannot_be_labelled() {
 // /ws/labels over a real socket
 // ---------------------------------------------------------------------------
 
-async fn serve(app: Router) -> SocketAddr {
+pub(super) async fn serve(app: Router) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1263,14 +1264,20 @@ async fn serve(app: Router) -> SocketAddr {
 
 /// A bare-bones WebSocket client: enough to open a connection, read the text
 /// frames the server sends, and close.  Server frames are never masked.
-struct WsClient {
+pub(super) struct WsClient {
     stream: TcpStream,
     buf: Vec<u8>,
+    /// The code and reason of the close frame the server sent, once it has.
+    pub(super) closed_with: Option<(u16, String)>,
 }
 
 impl WsClient {
     /// Open `path`; on a refused handshake return the response's status line.
-    async fn connect(addr: SocketAddr, path: &str, origin: Option<&str>) -> Result<Self, String> {
+    pub(super) async fn connect(
+        addr: SocketAddr,
+        path: &str,
+        origin: Option<&str>,
+    ) -> Result<Self, String> {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         let origin = origin
             .map(|o| format!("Origin: {o}\r\n"))
@@ -1285,6 +1292,7 @@ impl WsClient {
         let mut client = WsClient {
             stream,
             buf: Vec::new(),
+            closed_with: None,
         };
         let end = loop {
             if let Some(i) = client.buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -1326,7 +1334,7 @@ impl WsClient {
     }
 
     /// The next text frame, or `None` once the server closed the socket.
-    async fn text(&mut self) -> Option<String> {
+    pub(super) async fn text(&mut self) -> Option<String> {
         loop {
             if !self.need(2).await {
                 return None;
@@ -1354,13 +1362,21 @@ impl WsClient {
             self.buf.drain(..offset + len);
             match opcode {
                 0x1 => return Some(String::from_utf8(payload).unwrap()),
-                0x8 => return None,
+                0x8 => {
+                    if payload.len() >= 2 {
+                        self.closed_with = Some((
+                            u16::from_be_bytes([payload[0], payload[1]]),
+                            String::from_utf8_lossy(&payload[2..]).into_owned(),
+                        ));
+                    }
+                    return None;
+                }
                 _ => {} // ping, pong
             }
         }
     }
 
-    async fn json(&mut self) -> Value {
+    pub(super) async fn json(&mut self) -> Value {
         let text = self.text().await.expect("the server closed the socket");
         serde_json::from_str(&text).unwrap()
     }

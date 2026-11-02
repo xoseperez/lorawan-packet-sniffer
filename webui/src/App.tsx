@@ -1,14 +1,19 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { MessageRecord, WsMessage, deviceId } from './types/messages';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useLabels } from './hooks/useLabels';
+import { useHistory } from './hooks/useHistory';
+import { compareTimestamps, matchesFilter, matchingCount, toHistoryFilter } from './lib/history';
 import { MessageTable } from './components/MessageTable';
 import { LabelDialog } from './components/LabelDialog';
 import { FilterBar, FilterState, DEFAULT_FILTERS } from './components/FilterBar';
 import { ColumnPicker, ColumnConfig, DEFAULT_COLUMNS } from './components/ColumnPicker';
 import { StatusBar } from './components/StatusBar';
+import { HistoryNotice } from './components/HistoryNotice';
 
-const MAX_MESSAGES = 10_000;
+// How often the view re-checks which rows are still inside the time range, so
+// rows leave on their own when no record arrives.
+const AGING_TICK_MS = 5_000;
 
 // ---------------------------------------------------------------------------
 // localStorage hook
@@ -52,169 +57,89 @@ function useLocalStorage<T>(key: string, initial: T): [T, (v: T) => void] {
 }
 
 // ---------------------------------------------------------------------------
-// Time preset → milliseconds
-// ---------------------------------------------------------------------------
-
-const TIME_PRESET_MS: Record<string, number> = {
-  '5m':  5  * 60 * 1000,
-  '15m': 15 * 60 * 1000,
-  '1h':  60 * 60 * 1000,
-  '24h': 24 * 60 * 60 * 1000,
-};
-
-// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
 export function App() {
-  const [messages, setMessages] = useState<MessageRecord[]>([]);
   const [isLive, setIsLive] = useState(true);
-  const pauseBuffer = useRef<MessageRecord[]>([]);
-  const isLiveRef = useRef(true);
 
   const [filters, setFilters] = useLocalStorage<FilterState>('sniffer-filters', DEFAULT_FILTERS);
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
   const [columns, setColumns] = useLocalStorage<ColumnConfig>('sniffer-columns', DEFAULT_COLUMNS);
 
   // Labels come from their own WebSocket; the dialog edits one identifier at a time.
-  const { labels, saveLabel, removeLabel } = useLabels();
+  const { labels, synced: labelsSynced, saveLabel, removeLabel } = useLabels();
   const [editing, setEditing] = useState<{ device: string } | null>(null);
   const handleEditLabel = useCallback((device: string) => setEditing({ device }), []);
 
-  // Keep isLiveRef in sync without triggering re-renders
-  isLiveRef.current = isLive;
-
-  // ------------------------------------------------------------------
-  // WebSocket message handler (stable — reads from refs)
-  // ------------------------------------------------------------------
-  const handleMessage = useCallback((record: MessageRecord) => {
-    if (!isLiveRef.current) {
-      pauseBuffer.current.push(record);
-    } else {
-      setMessages(prev => {
-        const next = [...prev, record];
-        return next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next;
-      });
-    }
-  }, []);
+  // The rows come from the server: it decides what the time range and the
+  // filters contain, and the live feed adds to them.
+  const history = useHistory({ filters, labels, labelsSynced });
+  const { messages, onRecord, onSocketOpen, pause, resume } = history;
 
   // The message feed carries only 'message' events; anything else is ignored.
   const handleFrame = useCallback(
     (frame: WsMessage | null) => {
-      if (frame?.type === 'message') handleMessage(frame.data);
+      if (frame?.type === 'message') onRecord(frame.data);
     },
-    [handleMessage],
+    [onRecord],
   );
 
-  const { status: wsStatus } = useWebSocket<WsMessage | null>('/ws', handleFrame);
+  const { status: wsStatus } = useWebSocket<WsMessage | null>('/ws', handleFrame, onSocketOpen);
 
-  // ------------------------------------------------------------------
-  // Initial history load from REST API
-  // ------------------------------------------------------------------
+  // A tick for the aging of rows, see AGING_TICK_MS.
+  const [tick, setTick] = useState(0);
   useEffect(() => {
-    fetch('/api/messages?limit=500')
-      .then(r => {
-        if (r.ok) return r.json() as Promise<MessageRecord[]>;
-        throw new Error(`HTTP ${r.status}`);
-      })
-      .then(data => setMessages(data))
-      .catch(() => {/* server may not be available yet */});
+    const id = setInterval(() => setTick(t => t + 1), AGING_TICK_MS);
+    return () => clearInterval(id);
   }, []);
 
   // ------------------------------------------------------------------
   // Toggle live / paused
   // ------------------------------------------------------------------
   const handleToggleLive = useCallback(() => {
-    setIsLive(prev => {
-      if (!prev) {
-        // Resuming: flush pause buffer
-        const buffered = pauseBuffer.current.splice(0);
-        if (buffered.length > 0) {
-          setMessages(prev2 => {
-            const next = [...prev2, ...buffered];
-            return next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next;
-          });
-        }
-      }
-      return !prev;
-    });
-  }, []);
+    if (isLive) {
+      pause();
+      setIsLive(false);
+    } else {
+      resume();
+      setIsLive(true);
+    }
+  }, [isLive, pause, resume]);
 
   // ------------------------------------------------------------------
-  // Client-side filtering
+  // What is shown: the held rows that pass the filters now
   // ------------------------------------------------------------------
-  const { rows: filteredMessages, malformedCount } = useMemo(() => {
-    let result = messages;
+  const { rows: filteredMessages, fromMs, blockedCount } = useMemo(() => {
+    const f = toHistoryFilter(filters, Date.now());
 
-    if (filters.device) {
-      const q = filters.device.toLowerCase();
-      // Matches the DevAddr, the DevEUI or the label of the device.
-      result = result.filter(m => {
-        if (m.dev_addr && m.dev_addr.toLowerCase().includes(q)) return true;
-        if (m.dev_eui && m.dev_eui.toLowerCase().includes(q)) return true;
-        const id = deviceId(m);
-        const label = id !== null ? labels[id] : undefined;
-        return label !== undefined && label.toLowerCase().includes(q);
-      });
-    }
+    // Until the first label snapshot the browser cannot see the labels the
+    // server matched on. Rows loaded for this very device text were matched
+    // there, so they are not hidden for want of a label.
+    const serverMatchedDevice =
+      !labelsSynced && history.loadedDevice !== null && history.loadedDevice === filters.device;
 
-    if (filters.mtype.length > 0) {
-      result = result.filter(m => filters.mtype.includes(m.mtype));
-    }
-
-    if (filters.status !== 'all') {
-      result = result.filter(m => m.status === filters.status);
-    }
-
-    if (filters.gateway) {
-      result = result.filter(m => m.gateway_eui === filters.gateway);
-    }
-
-    if (filters.timePreset !== 'all') {
-      const ms = TIME_PRESET_MS[filters.timePreset];
-      if (ms !== undefined) {
-        const cutoff = Date.now() - ms;
-        result = result.filter(m => new Date(m.timestamp).getTime() >= cutoff);
-      }
-    }
-
-    // Last of the filters, so the count is of the malformed rows the other
-    // filters let through: the number the box hides or shows, which the user
-    // can check against the table.
-    let malformedCount = 0;
-    for (const m of result) {
-      if (m.malformed != null) malformedCount++;
-    }
-    if (!filters.showMalformed && malformedCount > 0) {
-      result = result.filter(m => m.malformed == null);
-    }
+    let result = messages.filter(m => matchesFilter(m, f, labels, { serverMatchedDevice }));
 
     if (sortDir === 'asc') {
-      // Compare as times, not text: the sniffer writes as many fractional
-      // digits as a timestamp needs, so ".5Z" would sort after ".500001Z".
-      result = [...result].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+      // The held rows are already in time order; sorting by the full
+      // timestamp, not its text (".5Z" would sort after ".500001Z") and not
+      // just to the millisecond, keeps that order whatever feeds them.
+      result = [...result].sort((a, b) => compareTimestamps(a.timestamp, b.timestamp));
     } else {
-      // desc — messages arrive in ascending order; reverse in place is fast
-      result = sortDir === 'desc' ? [...result].reverse() : result;
+      result = [...result].reverse();
     }
 
-    return { rows: result, malformedCount };
-  }, [messages, filters, sortDir, labels]);
+    let blockedCount = 0;
+    for (const m of result) if (m.status === 'Blocked') blockedCount++;
 
-  // Every gateway seen in the loaded messages (not just the filtered ones), so
-  // the gateway filter can always be switched to another gateway.
-  const gateways = useMemo(() => {
-    const seen = new Set<string>();
-    for (const m of messages) {
-      if (m.gateway_eui) seen.add(m.gateway_eui);
-    }
-    return [...seen].sort();
-  }, [messages]);
+    return { rows: result, fromMs: f.fromMs, blockedCount };
+    // `tick` is a dependency on purpose: the range is counted back from now.
+  }, [messages, filters, labels, labelsSynced, history.loadedDevice, sortDir, tick]);
 
-  const blockedCount = useMemo(
-    () => messages.filter(m => m.status === 'Blocked').length,
-    [messages],
-  );
+  const matching = history.loaded
+    ? matchingCount(filteredMessages.length, history.older, messages[0], fromMs)
+    : null;
 
   // ------------------------------------------------------------------
   // CSV export — serialises the current filtered view
@@ -282,7 +207,7 @@ export function App() {
           <span className="app-title-primary">LoRaWAN</span>
           <span className="app-title-secondary"> Sniffer</span>
         </span>
-        <FilterBar filters={filters} onChange={setFilters} gateways={gateways} />
+        <FilterBar filters={filters} onChange={setFilters} gateways={history.knownGateways} />
         <ColumnPicker columns={columns} onChange={setColumns} />
         <button
           className="export-btn"
@@ -294,7 +219,7 @@ export function App() {
         </button>
       </header>
 
-      <main className="app-main">
+      <main className="app-main" aria-busy={history.busy}>
         <MessageTable
           messages={filteredMessages}
           columns={columns}
@@ -306,12 +231,25 @@ export function App() {
         />
       </main>
 
+      <HistoryNotice
+        error={history.error}
+        hasRows={filteredMessages.length > 0}
+        writeFailures={history.writeFailures}
+        behind={history.behind}
+        cap={
+          matching !== null && matching > filteredMessages.length
+            ? { shown: filteredMessages.length, matching, timePreset: filters.timePreset }
+            : null
+        }
+      />
+
       <footer className="app-footer">
         <StatusBar
-          total={messages.length}
+          matching={matching}
+          busy={history.busy}
           shown={filteredMessages.length}
           blocked={blockedCount}
-          malformedCount={malformedCount}
+          malformed={history.malformed}
           showMalformed={filters.showMalformed}
           wsStatus={wsStatus}
           isLive={isLive}

@@ -37,6 +37,7 @@ use crate::core::metadata::{
     assert_body_cleared, CrcStatus, Direction, MType, Malformed, MessageRecord, Protocol, Status,
 };
 use crate::core::ratelimit::DEFAULT_INTERVAL;
+use crate::core::writer::{record_channel, RecordReceiver};
 use crate::proxy::{Outputs, Verdict};
 
 /// Upper bound for anything that is supposed to happen.
@@ -376,7 +377,7 @@ enum Upstream {
 /// A proxy running on a loopback socket, with its records readable.
 struct Sniffer {
     addr: SocketAddr,
-    records: mpsc::Receiver<MessageRecord>,
+    records: RecordReceiver,
     cancel: CancellationToken,
     task: JoinHandle<Result<()>>,
 }
@@ -391,7 +392,7 @@ impl Sniffer {
             Upstream::Itself => Some(addr),
         };
 
-        let (storage_tx, records) = mpsc::channel(1024);
+        let (storage_tx, records) = record_channel(1024);
         let (live_tx, _) = broadcast::channel(16);
         let outputs = Outputs::new(storage_tx, live_tx);
         let cancel = CancellationToken::new();

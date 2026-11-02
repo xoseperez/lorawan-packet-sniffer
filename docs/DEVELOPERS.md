@@ -67,7 +67,9 @@ lorawan-packet-sniffer-v2/
 │       │   ├── metadata.rs     # Core data types (MessageRecord, MType, etc.)
 │       │   ├── decoder.rs      # LoRaWAN PHY payload decoder
 │       │   ├── filter.rs       # Filter rule evaluation engine
-│       │   ├── storage.rs      # SQLite persistence layer
+│       │   ├── history.rs      # What a history request asks for; label case folding
+│       │   ├── storage.rs      # SQLite persistence layer (writer + read-only connection)
+│       │   ├── writer.rs       # WriterItem: what the storage queue carries
 │       │   └── toa.rs          # Time-on-Air calculator
 │       ├── config/
 │       │   └── mod.rs          # Configuration structs and TOML loader
@@ -76,7 +78,8 @@ lorawan-packet-sniffer-v2/
 │       │   ├── root.rs         # Main run loop: spawns all async tasks
 │       │   └── configfile.rs   # `configfile` subcommand (prints template)
 │       ├── api/
-│       │   └── mod.rs          # HTTP/WebSocket server (axum)
+│       │   ├── mod.rs          # HTTP/WebSocket server (axum)
+│       │   └── messages.rs     # GET /api/messages: message history
 │       └── proxy/
 │           ├── mod.rs          # Shared proxy utilities
 │           ├── udp.rs          # Semtech UDP MITM proxy
@@ -91,13 +94,18 @@ lorawan-packet-sniffer-v2/
         ├── App.tsx             # Root component + WebSocket connection
         ├── types/
         │   └── messages.ts     # TypeScript types mirroring MessageRecord
+        ├── lib/
+        │   └── history.ts      # Pure logic: filter rules, merging, counts, request rules
         ├── components/
         │   ├── MessageTable.tsx # Packet table with virtual scrolling
-        │   ├── FilterBar.tsx   # Direction / MType / status filter controls
+        │   ├── FilterBar.tsx   # Time range / MType / status / gateway / device controls
         │   ├── ColumnPicker.tsx # Show/hide column selector
+        │   ├── HistoryNotice.tsx # The strip under the table: cap, errors, database behind
         │   └── StatusBar.tsx   # Connection and message count indicator
-        └── hooks/
-            └── useWebSocket.ts # WebSocket connection hook
+        ├── hooks/
+        │   ├── useWebSocket.ts # WebSocket connection hook
+        │   └── useHistory.ts   # Loads the table from /api/messages and merges live records
+        └── test/               # (next to src/) history.test.mjs and history-vectors.json: npm test
 ```
 
 ---
@@ -150,8 +158,8 @@ The binary runs four concurrent task groups:
 | **API server** | Serves HTTP REST + WebSocket + the embedded React SPA |
 | **Retention cleanup** | Periodically deletes rows older than the configured TTL |
 
-All tasks share three handles:
-- `mpsc::Sender<MessageRecord>` — the storage channel (one sender per proxy, one receiver in the writer task)
+All tasks share these handles:
+- `mpsc::Sender<WriterItem>` — the storage queue (one sender per proxy, one receiver in the writer task). An item (`WriterItem`, in `core/writer.rs`) is a record to insert, or a `Settle` marker that history requests use to wait for the writer.
 - `broadcast::Sender<Arc<String>>` — the WebSocket fan-out (one sender, N receivers — one per connected browser)
 - `CancellationToken` — a cooperative shutdown signal
 
@@ -182,19 +190,36 @@ Here is the journey of a single uplink packet from gateway to database:
          has no type for the rules, so rules listing MTypes skip it.
       c. A MessageRecord is assembled from all available fields.
       d. The record is logged at DEBUG level (log_message).
-      e. The record is serialized to JSON and sent on the broadcast channel
-         (Outputs::emit, which also queues it for storage and MQTT)
+      e. Outputs::emit queues the record for MQTT and for storage (on the
+         mpsc channel, as WriterItem::Record), and only then serialises it
+         to JSON and sends it on the broadcast channel
          → API server → all WebSocket clients.
-      f. The same call sends it on the mpsc channel → storage writer.
+         Storage comes before the broadcast on purpose: see "Reading history".
 
 6.  If any rxpk was blocked, the PUSH_DATA is NOT forwarded to the LNS.
     Instead, a synthetic PUSH_ACK is sent back to the gateway so it
     does not retry (unless suppress_ack = true, stealth mode).
 
-7.  The storage writer receives the record and calls
+7.  The storage writer takes one item at a time. For a record it calls
     tokio::task::spawn_blocking(|| storage.insert(&record))
-    to run the SQLite write on a thread-pool thread (not blocking the async event loop).
+    to run the SQLite write on a thread-pool thread (not blocking the async event loop),
+    and waits for it before taking the next item. An insert that fails, or panics,
+    is logged and counted. A Settle marker is answered at once: everything queued
+    before it has been processed.
 ```
+
+### Reading history
+
+The other direction is the WebUI asking the database what it holds. `GET /api/messages` accepts a lower bound (`from`), the filters of the WebUI and `count=true`, and answers with the newest N matching records, oldest first, and their exact count. `api/messages.rs` parses the request into a `HistoryQuery`, and `Storage::query_history` runs it on a **second, read-only SQLite connection** (WAL mode only), so a scan of a large range never holds the mutex the writer needs. The README documents the parameters and headers; `.sdd/architecture.md` has the bounds (one query at a time, three response bodies in memory).
+
+The WebUI reloads the selected range every time `/ws` opens, and that reload must not miss a record that was broadcast during the outage, whatever the timing. Four orderings in the code give that guarantee, and none of them is a delay:
+
+1. `Outputs::emit` queues a record for storage **before** it broadcasts it, and looks for listeners only after queueing, so a client that subscribes in between either gets the record live or has it ahead of its marker.
+2. `/ws` takes its broadcast subscription in the handler, **before** the `101` answer, so everything broadcast after the browser's `open` event reaches the socket.
+3. The browser sends the reload after `open`, with `settle=true`: the handler puts a `WriterItem::Settle` marker in the storage queue and waits (up to 5 s) for the answer.
+4. The writer handles the queue in order and answers a marker only after everything before it.
+
+A record saved in the range was therefore queued before the marker, and is in the reload, or was broadcast after the subscription, and reached the browser live. If you change `emit`, the `/ws` handler, the writer loop or the reload, keep all four. "Settled" means processed (saved, or its failure logged and counted in the shared `write_failures` counter), not saved; the counter is reported in `X-Storage-Write-Failures`.
 
 ---
 
@@ -353,10 +378,16 @@ The entry point is `core/mod.rs`, which simply declares the submodules:
 ```rust
 pub mod decoder;
 pub mod error;
+pub mod eui;
 pub mod filter;
+pub mod history;
+pub mod labels;
 pub mod metadata;
+pub mod ratelimit;
+pub mod seen;
 pub mod storage;
 pub mod toa;
+pub mod writer;
 ```
 
 In Rust, every file must be explicitly declared as a module before it can be used. Modules are referenced from other files in the same crate as `crate::core::filter`, `crate::core::metadata`, etc.
@@ -379,6 +410,8 @@ pub enum SnifferError {
     // ...
 }
 ```
+
+Three variants belong to history reads: `Cancelled` (the query stopped because whoever asked went away), `HistoryUnavailable` (a row filter was asked of a database that is not in WAL mode) and `Busy` (the reader's 1 s busy timeout ran out). The API turns the last two into `503` answers with a `code`.
 
 **Design note:** The `thiserror` crate (`#[derive(Error)]`) generates the `std::error::Error` trait implementation automatically. The `#[error("...")]` attribute defines the human-readable message. `{0}` refers to the first field of the variant.
 
@@ -524,17 +557,34 @@ The function returns `None` for FSK (non-LoRa) modulations because the formula d
 
 ---
 
+### `core/history.rs`
+
+What a history request asks for. It does no I/O and writes no SQL, so the rule for matching a record can be read and tested on its own.
+
+- `HistoryQuery` — an optional lower bound (`LowerBound::After` for the old `since`, exclusive; `LowerBound::From` for `from`, inclusive), a `HistoryFilter`, a `limit` of at most `MAX_HISTORY_ROWS` (5,000), `newest` (keep the newest `limit` rather than the oldest) and `count`.
+- `HistoryFilter` — device text, message types, status, gateway and `hide_malformed`. `has_row_filter()` says whether the request asks for anything beyond the time bound; that is what decides whether it may run when there is no read-only connection.
+- `HistoryPage` — the records oldest first, the number of matches, and the number of malformed matches (`None` when it was not computed).
+- `fold_case` and `devices_with_matching_label` — the label rule. A label is free text, so SQL cannot compare it; it is folded with `str::to_lowercase`, which maps characters the way JavaScript's `toLowerCase` does (`ÑANDÚ` to `ñandú`, the final sigma, `İ`), and matched in memory. The identifiers of the matching labels go to SQL as one JSON array. A label belongs to the record's identifier, the DevAddr if it has one, else the DevEUI.
+
+The browser applies the same rule to live records in `webui/src/lib/history.ts`. `webui/test/history-vectors.json` lists records, labels and cases, and both sides run it.
+
+---
+
 ### `core/storage.rs`
 
 The SQLite persistence layer.
 
-**The central design:** `Storage` wraps a `rusqlite::Connection` inside `Arc<Mutex<Connection>>`:
+**The central design:** `Storage` wraps `rusqlite::Connection`s inside `Arc<Mutex<Connection>>`: the writer, and in WAL mode a second, read-only one:
 
 ```rust
 pub struct Storage {
-    conn: Arc<Mutex<Connection>>,
+    reader: Option<Arc<Mutex<Connection>>>,   // history reads; declared first
+    conn: Arc<Mutex<Connection>>,             // the writer: inserts, labels, retention
+    filters_on_writer: bool,                  // true only for open_in_memory()
 }
 ```
+
+The reader is declared first because fields drop in declaration order and it must close first: the last connection to close checkpoints the log and deletes the `-wal` and `-shm` files, and a read-only connection cannot do that.
 
 Why this structure?
 
@@ -552,11 +602,21 @@ PRAGMA synchronous  = NORMAL; -- Good durability/performance balance
 PRAGMA foreign_keys = ON;     -- Enforce referential integrity
 ```
 
+`open` reads `journal_mode` back after setting it, and the writer sets `journal_size_limit` to 8 MiB so that the `-wal` file shrinks again after a long run of readers.
+
 **Schema:** A single `messages` table with one row per captured packet. Enum values are stored as text strings (e.g., `"up"`, `"down"`, `"JoinRequest"`) for readability. Timestamps are RFC 3339 text, which is lexicographically sortable and understood by SQLite's date functions.
 
 Three partial indexes are created for the most common query patterns: by timestamp, by DevAddr, and by DevEUI.
 
-**Blocking calls in async context:** All `Storage` methods (`insert`, `query_recent`, etc.) are synchronous — they block the calling thread. The callers in `cmd/root.rs` wrap every call in `tokio::task::spawn_blocking` to avoid blocking the async event loop.
+**History reads.** `query_history(&HistoryQuery, cancel)` answers a history request, on the reader when there is one:
+
+- The reader is opened only if `PRAGMA journal_mode` reads back `wal`, read-only and with a 1 s busy timeout. In WAL mode a reader sees a consistent snapshot and neither blocks the writer nor is blocked by it. Without WAL a reader would block every commit and a scan on the writer would block every insert, so there is no reader: a time-only query still runs on the writer, a query with a row filter returns `HistoryUnavailable`, and a WARN at startup says so. `open_in_memory()` (tests only) runs everything on its one connection.
+- One deferred read transaction covers the labels, the counts and the rows, so they come from one snapshot. A progress handler reads the `cancel` flag every 10,000 VM steps and interrupts the statement; a guard removes the handler on every exit path, so a cancelled query cannot affect the next one on the connection.
+- Every range query names `INDEXED BY idx_messages_timestamp`. A device text cannot use an index, but the scan follows the timestamp index and reads only `rowid` and the filter columns: it counts every match and keeps the first N rowids, then reads those N rows in full. Without the hint, the planner chose `idx_messages_mtype` plus a temporary B-tree sort for a type filter.
+- Timestamps are stored as `to_rfc3339()` text (`+00:00` and 0, 3, 6 or 9 fraction digits) and sort as text. Bounds are rendered with the same function. The module's doc comment explains why that orders correctly.
+- All `EXPLAIN QUERY PLAN` shapes are checked by tests in `core/storage/history_tests.rs`, which run each case on an in-memory and on a file database. `large_db_history_queries` (`#[ignore]`) builds a database of 1,000,000 records and measures the queries, the writer's lock wait and the log size.
+
+**Blocking calls in async context:** All `Storage` methods (`insert`, `query_history`, etc.) are synchronous — they block the calling thread. The callers in `cmd/root.rs` wrap every call in `tokio::task::spawn_blocking` to avoid blocking the async event loop.
 
 **`INSERT OR REPLACE`:** If a record with the same UUID is inserted twice (e.g., due to a retry), the second insert replaces the first without error. In practice UUIDs are unique, but the `OR REPLACE` makes the operation idempotent.
 
@@ -643,7 +703,7 @@ The application's main orchestration layer. Called by `main.rs` after logging is
 
 1. Build `Vec<FilterRule>` from `config.filters` (the `build_filters` helper).
 2. Open the SQLite database (`Storage::open`).
-3. Create the `mpsc` channel (storage queue) and `broadcast` channel (WebSocket fan-out).
+3. Create the `mpsc` channel (storage queue, carrying `WriterItem`s) and the `broadcast` channel (WebSocket fan-out).
 4. Create a `CancellationToken`.
 5. `tokio::spawn` the storage writer task (`run_writer`).
 6. `tokio::spawn` the API server task (`run_api`).
@@ -667,22 +727,39 @@ This waits for whichever completes first: the proxy exits normally, or the user 
 **Storage writer (`run_writer`):**
 
 ```rust
+// process_items, which run_writer calls with the real insert
 loop {
     tokio::select! {
-        Some(record) = rx.recv() => {
-            let s = storage.clone();
-            tokio::task::spawn_blocking(move || s.insert(&record)).await
-        }
+        biased;
         _ = cancel.cancelled() => {
-            // drain remaining records before exit
-            while let Ok(record) = rx.try_recv() { ... }
+            // drain remaining items before exit, the same way
+            while let Ok(item) = rx.try_recv() { process_item(item, ...).await; }
             break;
         }
+        Some(item) = rx.recv() => process_item(item, ...).await,
+    }
+}
+
+// process_item
+match item {
+    WriterItem::Record(record) => {
+        // on a blocking thread, awaited before the next item is taken
+        match spawn_blocking(move || insert(record)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => { /* ERROR "Storage write error: …", failures += 1 */ }
+            Err(e)     => { /* ERROR "Storage writer task panicked: …", failures += 1 */ }
+        }
+    }
+    WriterItem::Settle { done, permit } => {
+        let _ = done.send(());   // everything queued before this has been processed
+        drop(permit);
     }
 }
 ```
 
-On cancellation, the writer drains any records still in the channel before stopping. This ensures no records are lost on clean shutdown.
+The stop is looked at first (`biased`), so a queue that never empties cannot keep the writer from draining and exiting. On cancellation, the writer drains any items still in the channel before stopping, answering markers and counting failures as it goes. This ensures no records are lost on clean shutdown. `process_items` takes the insert as a parameter so that tests can make it fail, panic or wait.
+
+The order matters. Each insert is awaited before the next item, and `write_failures` is incremented before the next item is taken, so a `Settle` answer always follows the failures of the records queued before it. The API reads the counter only after the marker's answer; that handoff orders the two, so `Relaxed` atomics are enough.
 
 **Retention task (`run_retention`):**
 
@@ -694,42 +771,52 @@ Uses `tokio::time::interval` to tick every 5 minutes. `MissedTickBehavior::Skip`
 
 The HTTP/WebSocket server, built on the `axum` web framework.
 
-**Three routes:**
+**Routes:**
 
 | Route | Handler | Description |
 |-------|---------|-------------|
-| `GET /ws` | `ws_handler` | WebSocket upgrade for live feed |
-| `GET /api/messages` | `messages_handler` | REST query for historical messages |
+| `GET /ws` | `ws_handler` | WebSocket upgrade for the live feed |
+| `GET /ws/labels` | `labels_ws_handler` | WebSocket feed of the device labels (see the README) |
+| `GET /api/messages` | `messages::messages_handler` | REST message history |
+| `GET /api/labels`, `PUT`/`DELETE /api/labels/{device}` | label handlers | Device labels (see the README) |
 | `GET /*` | `frontend_handler` | Serve the embedded React SPA |
 
-**`AppState`:** axum passes shared state to every handler via the `State` extractor. `AppState` holds the broadcast sender (to subscribe new WebSocket clients) and the `Storage` handle (to query history).
+The Host check wraps all of them; the README's "Host check" section explains why.
 
-```rust
-#[derive(Clone)]
-pub struct AppState {
-    broadcast_tx: broadcast::Sender<Arc<String>>,
-    storage: Storage,
-}
-```
+**`AppState`:** axum passes shared state to every handler via the `State` extractor. Besides the broadcast sender (to subscribe new WebSocket clients) and the `Storage` handle (to query history), it holds what history requests need: a weak sender for the storage queue (weak, so the API never keeps the queue open after the proxy has stopped), three `Semaphore`s, and the failure counter the writer increments.
 
-Both fields are cheap to clone — `broadcast::Sender` is already internally reference-counted, and `Storage` is `Arc<Mutex<...>>`.
+| Field | What it limits or holds |
+|---|---|
+| `history` (1 permit) | One query at a time; the permit moves into the `spawn_blocking` closure, so it is released when SQLite has stopped, not when the handler is dropped |
+| `history_bodies` (3 permits) | Large responses being sent at once. The permit moves into the response body (`HeldBody`), which hands hyper the JSON in 64 KiB pieces copied out of its buffer; hyper asks for the next piece only when its write buffer has room, so the permit is held until the client has taken nearly all of it. Handed over in one piece, hyper would buffer it all and drop the body, and the permit, before a byte was sent |
+| `history_settle` (1 permit) | At most one `Settle` marker in the storage queue; the permit travels inside the marker and is released when the writer consumes it. A `RateLimitedLog` (`settle_log`) limits the warning for a writer that does not answer in time |
+| `write_failures` | `Arc<AtomicU64>` shared with the writer; read for `X-Storage-Write-Failures` |
+
+
 
 **WebSocket handler:**
 
-Each WebSocket connection gets its own `broadcast::Receiver` (via `broadcast_tx.subscribe()`). The handler loops in a `tokio::select!`, waiting for either a new message on the broadcast channel or a close frame from the client. If the client lags too far behind (> 512 messages buffered), `Lagged` is returned and a warning is logged — the client misses those messages but the connection continues.
+Each WebSocket connection gets its own `broadcast::Receiver`, taken in `ws_handler` **before** the handshake is answered (`ws.on_upgrade` comes after `subscribe()`), so every record broadcast after the browser's `open` event reaches the socket. The handler loops in a `tokio::select!`, waiting for either a new message on the broadcast channel or a close frame from the client.
+
+A client that falls behind is closed, not left to miss records: when the receiver reports `Lagged` (more than 512 records buffered; WARN `WebSocket client lagged <n> messages; closing it`), or when a frame send takes more than 10 s (a peer that stops reading; WARN `WebSocket client did not accept a message within 10s; closing it`), the handler tries to send a close frame with code 1013 ("try again later", reason `fell behind; reconnect and reload`) for at most 1 s and then drops the socket. A client that reconnects is expected to reload what it shows from `/api/messages`.
 
 The JSON format sent to clients:
 ```json
 { "type": "message", "data": { ...MessageRecord fields... } }
 ```
 
-**REST handler (`/api/messages`):**
+**REST handler (`/api/messages`, in `api/messages.rs`):**
 
-Accepts two optional query parameters:
-- `since`: ISO-8601 timestamp. If provided, returns messages after that time (ascending). Used for incremental polling.
-- `limit`: max rows (default 500, capped at 5000).
+The README lists every parameter, header and status. In outline, `messages_handler` does this:
 
-The handler calls `storage.query_*()` inside `spawn_blocking` (because `Storage` is synchronous) and returns the result as a JSON array.
+1. `parse` turns the query string into a `HistoryQuery`. `since` and `limit` keep their old meaning; a bad new parameter is a `400` with `{"error": ...}`. `newest` defaults to `true` unless a lower bound was parsed.
+2. For `settle=true` only: it takes `history_settle`, sends a `Settle` marker and waits for the answer, all under one 5 s timeout. A timeout is not an error: the query runs anyway and the answer says `X-History-Settled: false`, with a rate-limited WARN (`Storage writer is behind; history served without waiting for it`, or `Storage writer stopped; …` when the queue is closed). A request without `settle` skips this.
+3. It takes a `history_bodies` permit, then the `history` permit, and runs `Storage::query_history` in `spawn_blocking`, with a `CancelOnDrop` flag. If the client disconnects, axum drops the handler, the flag is set, and the scan stops at its next progress tick (DEBUG: `History query cancelled: the client went away`).
+4. It answers with the records and the count headers. `HistoryUnavailable` and `Busy` become `503` with `code` `no_wal` and `busy`; anything else is a `500` with no body.
+
+The marker wait comes before the two permits so that requests that settle wait for the writer together, within the same few seconds. If a request took a body place first, only three could wait for the writer at a time, and the fourth to tenth would wait for a place and then for their own marker, in waves of up to 5 s.
+
+A response layer on the route adds `X-Storage-Write-Failures` to every response, including axum's own `Query` rejections, which are produced before the handler runs.
 
 **Embedded frontend (`rust-embed`):**
 
@@ -743,7 +830,7 @@ The `RustEmbed` derive macro reads all files in `webui/dist/` at **compile time*
 
 The `frontend_handler` implements SPA routing: if the requested path is not found as a static file, it falls back to `index.html`. This allows the React router to handle client-side navigation.
 
-**CORS:** If `cors_origins` is empty, `CorsLayer::permissive()` allows all origins (useful during development). If origins are listed, only those are allowed.
+**CORS:** If `cors_origins` is empty the API sends no CORS headers, so only the sniffer's own pages can use it from a browser. Listed origins get CORS for `GET`, `PUT`, `DELETE` and `Content-Type`, and the four history headers are exposed to them (`expose_headers`), since a script cannot read a header that is not exposed.
 
 ---
 
@@ -753,11 +840,15 @@ Shared utilities used by both proxy backends. These are declared `pub(super)` �
 
 **`frame_fields`:** Converts an `Option<DecodedFrame>` and the CRC status into a flat `FrameFields`, filling fields with `None` / `MType::Unknown` if decoding failed. `FrameFields::rule_mtype()` is the type the filter sees: `None` for a malformed frame.
 
-**`decision_to_status`:** Converts a `FilterDecision` into `(Status, Option<String>)` for storing in `MessageRecord`.
+**`classify`:** Decides forward / block / capture for a message from the filters, the direction, the type (`None` for a malformed frame) and the gateway. The returned `Verdict` gives the `Status` and the name of the rule that blocked it, for `MessageRecord`.
 
-**`send_record`:** Tries to send a record to the storage channel using `try_send` (non-blocking). If the channel is full (which should never happen at LoRaWAN data rates), the record is dropped and a warning is logged. Using `try_send` instead of `.await send` means the proxy loop never stalls waiting for the storage writer.
+**`Outputs::emit`:** The one place a record leaves the proxy. It logs the record, then does only non-blocking hand-offs:
 
-**`broadcast_record`:** Skips serialisation entirely if there are no WebSocket subscribers (`receiver_count() == 0`). A common optimisation when no browser is connected.
+1. queues the record for MQTT with `try_send`, if MQTT is on;
+2. queues a `WriterItem::Record` for storage with `try_send`;
+3. serialises the `/ws` JSON, but only if a WebSocket client is subscribed (`receiver_count() > 0`), and broadcasts it. The check comes after the storage queue on purpose: a subscriber that arrives between the two would otherwise get neither the broadcast nor a place ahead of its marker.
+
+If a queue is full (which should never happen at LoRaWAN data rates) the record is dropped for that output and a rate-limited warning is logged. Using `try_send` instead of `.await send` means the proxy loop never stalls waiting for the storage writer. Storage is queued before the broadcast so that any record a browser could have seen live is already ahead of a later `Settle` marker; see "Reading history" in section 5.
 
 **`log_message`:** Formats a compact one-line log entry:
 ```
@@ -892,36 +983,58 @@ This is necessary because `JoinHandle::join()` is a blocking call (it waits for 
 ## 9. File-by-file reference — `webui`
 
 The WebUI is a standard React + TypeScript SPA built with Vite. It communicates with the backend via:
-- **WebSocket** at `/ws` — real-time live feed
-- **REST GET `/api/messages`** — historical data on initial load
+- **WebSocket** at `/ws` — real-time live feed, and `/ws/labels` for device labels
+- **REST GET `/api/messages`** — the table's history: on page load, on every change of the time range or a filter, and on every `/ws` open. The server decides what a range and a filter contain; the WebUI replaces its rows with the newest 5,000 matching records and merges live records into them.
 
 ### `webui/src/types/messages.ts`
 
-TypeScript interfaces that mirror the Rust `MessageRecord` struct and its enums. These are the types used throughout the frontend. Keeping them in one file makes it easy to update when the Rust types change.
+TypeScript interfaces that mirror the Rust `MessageRecord` struct and its enums. These are the types used throughout the frontend. Keeping them in one file makes it easy to update when the Rust types change. `deviceId()` now lives in `lib/history.ts` and is re-exported from here.
+
+### `webui/src/lib/history.ts`
+
+The history logic as plain functions: no React, no timers, no `fetch`. It may only use `import type`, because `npm test` transpiles this one file and loads it on its own.
+
+- **The filter rules.** `matchesFilter` says whether a record belongs in the table (device text against the DevAddr, the DevEUI and the label; type; status; gateway; time; malformed). `historyParams` builds the query string that asks the server for the same thing, with every value percent-encoded. `toHistoryFilter` turns the filter bar's state and a clock reading into a lower bound. These must agree with `core/history.rs` and `Storage::query_history`.
+- **Merging.** `mergeRecords` de-duplicates by `id`, keeps the newest 10,000 and lets the loaded copy win. `mergeAfterLoad` builds the table from a load's answer plus the live records it lacks, by membership in the answer and never by comparing timestamps.
+- **Counts.** `olderAfterLoad`, `matchingCount` and `malformedAfterLoad` give the footer's numbers from the response headers and the live records.
+- **The request state machine.** `nextRequests(state, event, now)` takes an event (filter change, typing, labels, socket open, response, failure, pause, resume) and returns the next state and the actions to run (send a load, abort, start or cancel a timer, apply, hold). One generation counter covers every load; an answer from an older generation is dropped.
+- **Back-off.** `nextReconnect` gives the reconnect delay and `nextRetryDelay` the retry delay, both jittered. Feed `nextReconnect` the previous *nominal* delay, not the jittered one, or the series drifts.
+
+### `webui/src/hooks/useHistory.ts`
+
+Runs what `nextRequests` decides: timers, one `AbortController` per request, a 30 s timeout, the retry timers, and `fetch` with the headers read back into counts. It keeps the loaded rows, a log of the live records received since each load was sent (the carry-over needs them), and the pause buffer. It returns the rows, the counts, `busy`, `behind`, `error` and `writeFailures`, and `pause()` / `resume()`.
 
 ### `webui/src/hooks/useWebSocket.ts`
 
-A React hook that manages the WebSocket connection lifecycle (connect, receive, auto-reconnect on disconnect). Returns the list of received messages and a connection status indicator.
+A React hook that manages one WebSocket connection (connect, receive, reconnect after a drop). It hands each parsed frame to a callback and calls `onOpen` every time the socket opens, which is how `/ws` triggers a reload of the range. Reconnect waits grow from about 3 s to 60 s and are randomised; a connection that lasted a minute resets them.
 
 ### `webui/src/App.tsx`
 
-The root component. Owns the message list state and connects the WebSocket hook to the display components.
+The root component. Connects the hooks to the display components: `useHistory` for the rows, `useLabels` for the labels, `useWebSocket` for the live feed. It filters the held rows with `matchesFilter` at render time, on a 5 s tick so that rows leave the range without new traffic, and works out Matching, Shown and Blocked.
 
 ### `webui/src/components/MessageTable.tsx`
 
-The main data grid. Displays one row per `MessageRecord`. Implements virtual scrolling (only renders visible rows) for performance with large message counts.
+The main data grid. Displays one row per `MessageRecord`. Implements virtual scrolling (only renders visible rows) for performance with large message counts. Each row has `data-id` with the record's `id`.
 
 ### `webui/src/components/FilterBar.tsx`
 
-Client-side filter controls (direction, MType, status). Filters apply in the browser — they do not affect what the sniffer captures or stores.
+Filter controls (time range, MType, status, gateway, device, and the "Show malformed" checkbox). They set what the WebUI asks `/api/messages` for, and they filter the live records; they do not affect what the sniffer captures or stores.
 
 ### `webui/src/components/ColumnPicker.tsx`
 
 A popover that lets the user show or hide individual columns.
 
+### `webui/src/components/HistoryNotice.tsx`
+
+The one-line strip between the table and the footer. It joins, in this order, the messages that apply: a failed load, the count of records the database failed to store, "the database is behind", and the cap ("Showing the newest 5,000 of N matching messages in …"). It renders nothing when there is nothing to say.
+
 ### `webui/src/components/StatusBar.tsx`
 
-Displays the WebSocket connection state (connected/disconnected) and the total message count.
+Displays Matching, Shown, Blocked and the malformed count, the WebSocket connection state, and the live/pause toggle. Matching reads "Loading…" while a load is waiting or in flight.
+
+### `webui/test/`
+
+`history.test.mjs` is the test behind `npm test`: a plain Node script that transpiles `lib/history.ts` with the `typescript` package the project already has. It covers the request state machine, merging, counts and back-off, and the cases of `history-vectors.json`, which the Rust side also reads (see "Modifying a history filter" below).
 
 ---
 
@@ -968,6 +1081,8 @@ Convenience targets. Key ones:
 | `make build-full` | Rebuild WebUI, then `cargo build` |
 | `make run` | `cargo run -- -c sniffer.toml` |
 | `make webui-dev` | Vite dev server with proxy to localhost:8888 |
+| `make webui-test` | `npm test` in `webui/`: the history logic and the shared filter vectors |
+| `make test` | `make webui-test`, then `cargo test` |
 | `make build-all` | Cross-compile for x86\_64 and aarch64 musl |
 | `make docker-build` | `docker build` for local testing |
 
@@ -1007,6 +1122,14 @@ When a thread panics while holding a `Mutex`, the mutex becomes "poisoned". The 
 
 Without WAL (Write-Ahead Logging), SQLite uses a global write lock that blocks all readers during a write. WAL allows concurrent reads while a write is in progress. Since the storage writer is constantly inserting records while the API server is reading them, WAL is essential for query latency.
 
+### A second, read-only connection for history
+
+A device text cannot use an index, so a filtered history query can scan every record in the range, which on a million records takes hundreds of milliseconds. On the writer's connection that scan would hold the mutex every insert needs. In WAL mode a second connection reads a snapshot without touching the writer, so history gets its own. On the development machine, with queries running back to back on the reader, the writer's longest wait for the lock was under 0.01 ms. When the database is not in WAL mode there is no reader, and the sniffer refuses filters rather than run the scan on the writer. `Storage::open` therefore checks the journal mode it ended up with instead of assuming it.
+
+### A marker in the storage queue, not a timestamp
+
+The WebUI must not miss a record after a reconnect. Replaying from the newest timestamp fails in three ways: a record can be broadcast and still be waiting in the 1,024-record queue when the query reads the database; two gateway tasks can broadcast in the opposite order to their timestamps; a lagging client has no reconnect to trigger the replay. The design uses orderings instead of timing: storage is queued before the broadcast, the `/ws` subscription exists before the handshake is answered, and a `Settle` marker travels through the same queue as the records, so the writer answers it only after everything before it. The marker's single permit means at most one is ever queued, even when a request gave up waiting. Every reconnect then reloads the whole range, up to 5,000 rows, rather than a gap whose edges would have to be guessed.
+
 ---
 
 ## 12. Common maintenance tasks
@@ -1041,6 +1164,10 @@ Without WAL (Write-Ahead Logging), SQLite uses a global write lock that blocks a
 5. Add a match arm in `cmd/root.rs`.
 6. Declare the module in `proxy/mod.rs`.
 
+### Modifying a history filter
+
+The rule that decides whether a record matches the device text, type, status, gateway, malformed flag or time range exists twice: in `core/history.rs` and `Storage::query_history` (stored records) and in `webui/src/lib/history.ts` (live records, and the query string). Change both, and add cases to `webui/test/history-vectors.json`. The Node test checks the query string the browser builds and the records its rule keeps; a Rust test sends each case's query through the real `/api/messages` router and compares the ids and `X-Total-Count`. Neither side may let a record through that the other would filter out.
+
 ### Running tests
 
 ```bash
@@ -1048,9 +1175,13 @@ cargo test                          # all tests
 cargo test core::                   # only core/ module tests
 cargo test decode_join_request      # tests matching this name
 cargo test -- --nocapture           # show println! output during tests
+cd webui && npm test                # the WebUI's history logic and the shared vectors
+make test                           # npm test, then cargo test
 ```
 
-All `core::storage` tests use in-memory SQLite (`Storage::open_in_memory()`) — no file system setup required.
+Most `core::storage` tests use in-memory SQLite (`Storage::open_in_memory()`) — no file system setup required. The history tests run each case on an in-memory database and on a file database (`TempDb`), since only the file one has the read-only connection.
+
+`large_db_history_queries` is ignored by default. It builds a database of 1,000,000 records and measures the history queries, the writer's lock wait and the size of the log file; run it in release mode on a real disk (`TMPDIR=/path/on/disk cargo test --release -- --ignored large_db_history --nocapture`). `HISTORY_ROWS` and `HISTORY_DAYS` change the size.
 
 ### Updating a dependency
 

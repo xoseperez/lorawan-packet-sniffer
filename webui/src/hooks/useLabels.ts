@@ -73,6 +73,12 @@ async function sendLabelRequest(device: string, init: RequestInit): Promise<void
 export interface UseLabels {
   /** Label text by device identifier (DevAddr or DevEUI, as in the records). */
   labels: Record<string, string>;
+  /**
+   * True once the first snapshot has arrived. Until then `labels` is empty
+   * because nothing has been heard, not because no device is labelled, so a
+   * match that depends on a label cannot be decided in the browser yet.
+   */
+  synced: boolean;
   /** Sets the label. Empty or whitespace-only text removes it. Throws Error(message) on failure. */
   saveLabel: (device: string, text: string) => Promise<void>;
   /** Removes the label; succeeds even when there is none. Throws Error(message) on failure. */
@@ -91,6 +97,7 @@ export interface UseLabels {
  */
 export function useLabels(): UseLabels {
   const [labels, setLabels] = useState<Record<string, string>>({});
+  const [synced, setSynced] = useState(false);
 
   const handleFrame = useCallback((frame: LabelsFrame | null) => {
     if (!isRecord(frame)) return;
@@ -105,6 +112,7 @@ export function useLabels(): UseLabels {
         }
       }
       setLabels(next);
+      setSynced(true);
       return;
     }
 
@@ -145,5 +153,5 @@ export function useLabels(): UseLabels {
     [removeLabel],
   );
 
-  return { labels, saveLabel, removeLabel };
+  return { labels, synced, saveLabel, removeLabel };
 }

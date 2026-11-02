@@ -72,15 +72,10 @@ export interface WsMessage {
   data: MessageRecord;
 }
 
-/**
- * The identifier a row can be labelled by: the DevAddr of a data frame, or the
- * DevEUI of a join request. A record never carries both. Join accepts, rejoin
- * requests, proprietary frames, truncated frames and malformed frames carry
- * neither, so they have no identifier and cannot be labelled.
- */
-export function deviceId(m: Pick<MessageRecord, 'dev_addr' | 'dev_eui'>): string | null {
-  return m.dev_addr ?? m.dev_eui ?? null;
-}
+// The identifier of a row (DevAddr, else DevEUI) is needed by the matching rule
+// in lib/history.ts, which must load on its own in the Node test, so it is
+// defined there and re-exported for the components.
+export { deviceId } from '../lib/history';
 
 // What a frame was expected to be, for the "wrong length" reason. A frame that
 // is not malformed never needs it; Proprietary and Unknown have no length

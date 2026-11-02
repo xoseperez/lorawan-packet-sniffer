@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use log::Level;
 
+use crate::core::linelog;
+
 /// Interval used by [`RateLimitedLog::new`].
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -84,10 +86,15 @@ impl RateLimitedLog {
     }
 
     fn log(&self, level: Level, msg: impl fmt::Display) {
+        let target = module_path!();
         match self.permit(Instant::now()) {
             None => {}
-            Some(0) => log::log!(level, "{}", msg),
-            Some(n) => log::log!(level, "{} ({} suppressed since the last message)", msg, n),
+            Some(0) => linelog::line(level, target, format_args!("{}", msg)),
+            Some(n) => linelog::line(
+                level,
+                target,
+                format_args!("{} ({} suppressed since the last message)", msg, n),
+            ),
         }
     }
 

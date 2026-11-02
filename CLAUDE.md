@@ -23,6 +23,7 @@ make webui-dev
 
 # Run tests
 cargo test
+cd webui && npm test        # the WebUI's history logic and the filter vectors (make webui-test); make test runs both
 
 # Run a single test
 cargo test <test_name>
@@ -46,8 +47,8 @@ DOCKER_IMAGE=ghcr.io/yourname/lorawan-sniffer DOCKER_TAG=latest make docker-buil
 This is a Cargo workspace with a single crate:
 
 - **`lorawan-sniffer/`** — the binary, organised internally into:
-  - **`src/core/`** — protocol-agnostic logic: LoRaWAN PHY decoder, filter engine, SQLite storage, metadata types, ToA calculator, device-label validation (`labels.rs`) and the live-identifier list (`seen.rs`).
-  - **`src/api/`** — HTTP/WebSocket server (axum): Host check, label endpoints and the `LabelWriter` task.
+  - **`src/core/`** — protocol-agnostic logic: LoRaWAN PHY decoder, filter engine, SQLite storage, metadata types, ToA calculator, device-label validation (`labels.rs`), the live-identifier list (`seen.rs`) and the history query types (`history.rs`: `HistoryQuery`, `HistoryFilter`, `HistoryPage`, label case folding) and the storage queue's item type (`writer.rs`).
+  - **`src/api/`** — HTTP/WebSocket server (axum): Host check, the `/api/messages` history handler (`messages.rs`), label endpoints and the `LabelWriter` task.
   - **`src/proxy/`** — UDP and Concentratord MITM backends.
   - **`src/cmd/`** — run loop and `configfile` subcommand.
   - **`src/config/`** — TOML configuration structs and loader.
@@ -74,9 +75,11 @@ Gateway ──UDP/ZMQ──▶  Sniffer proxy  ──UDP/ZMQ──▶  LNS / Gat
 2. Each packet is decoded by `core::decoder` into a `DecodedFrame` (MType, DevAddr/DevEUI, FCnt, FPort). The decoder also takes the gateway's CRC status and classifies the frame: CRC failed (`crc`), then reserved or Major MHDR bits (`mhdr`), then a length that does not fit the type (`length`). A malformed frame comes back with only its type, size and reason, so no fake identifier or header field exists downstream; the backends' record builders just copy the fields. Type rules see no type for a malformed frame (`filter::evaluate` gets `None`).
 3. `core::filter::evaluate()` checks compiled `FilterRule`s — first match wins; no match = forward.
 4. Results are assembled into a `MessageRecord` (the canonical cross-protocol representation defined in `core::metadata`).
-5. The record is sent to two async channels: `mpsc` → `Storage` (SQLite persistence) and `broadcast` → all connected WebSocket clients.
-6. The axum API server (`src/api/mod.rs`) handles `/ws` (live feed), `/ws/labels` (device labels: full set on connect, then one event per change), `/api/messages` (REST history), `/api/labels` (`GET`, `PUT`/`DELETE` on `/api/labels/{device}`), and `/*` (embedded React SPA). A Host check (`src/api/host.rs`, `[sniffer.api] allowed_hosts`) is the outermost layer for every request.
+5. `Outputs::emit` queues the record for storage (`mpsc` of `WriterItem`, drained by the writer task into `Storage`) and then sends it on the `broadcast` channel to all connected WebSocket clients. Storage comes first on purpose: a record anyone could have seen live must already be queued ahead of any later `Settle` marker (step 8). Neither send waits.
+6. The axum API server (`src/api/mod.rs`) handles `/ws` (live feed), `/ws/labels` (device labels: full set on connect, then one event per change), `/api/messages` (REST history: `from`, `newest`, `count`, `settle`, the filters, and the `X-*` headers, see step 8), `/api/labels` (`GET`, `PUT`/`DELETE` on `/api/labels/{device}`), and `/*` (embedded React SPA). A Host check (`src/api/host.rs`, `[sniffer.api] allowed_hosts`) is the outermost layer for every request. A `/ws` client that lags, or whose socket stops accepting data for 10 s, is closed with code 1013.
 7. A listener on the same `broadcast` channel notes which DevAddr/DevEUI values were seen live (`core/seen.rs`), so rows that never reached the database can still be labelled.
+8. History reads. `Storage` holds a writer connection and, when the database is in WAL mode, a second read-only connection that answers `query_history`, so a long scan never holds the mutex the writer needs. Without WAL there is no reader: a time-only query still runs on the writer, a query with a row filter fails with `HistoryUnavailable` (503 `no_wal`). The handler lets one query run at a time (the permit moves into the blocking task, so a dropped request cannot stack a second one behind it), holds at most three response bodies in memory, and cancels a running scan when the client goes away. `settle=true` puts a `WriterItem::Settle` marker in the storage queue and waits up to 5 s until the writer, which handles the queue in order, reaches it; `X-History-Settled` says whether it did. The writer counts failed inserts, and every `/api/messages` response reports the count in `X-Storage-Write-Failures`.
+9. The WebUI loads the newest 5,000 matching records (`/api/messages?...&newest=true&count=true&settle=true&limit=5000`) on page load, on a range or filter change and on every `/ws` open, replaces its rows with them and merges live records by `id`. The request rules are pure functions in `webui/src/lib/history.ts`; `hooks/useHistory.ts` only runs them. The same filter rules exist twice, in `core/history.rs` / `Storage::query_history` and in `lib/history.ts`, and `webui/test/history-vectors.json` is run against both.
 
 ### Proxy backends
 
@@ -88,7 +91,9 @@ Gateway ──UDP/ZMQ──▶  Sniffer proxy  ──UDP/ZMQ──▶  LNS / Gat
 - `MessageRecord` — the normalized struct stored, broadcast, and returned by the REST API. Its `malformed: Option<Malformed>` (`crc` | `mhdr` | `length`) is `None` for a valid frame; on a malformed one the twelve body-derived fields are `None`.
 - `MType` — LoRaWAN message type decoded from MHDR bits [7:5].
 - `FilterRule` / `FilterDecision` — compiled filter rule and its evaluation result.
-- `Storage` — thin `Clone`able wrapper around an `Arc<Mutex<rusqlite::Connection>>`.
+- `Storage` — `Clone`able wrapper around the writer connection and, in WAL mode, a read-only connection for history reads (each an `Arc<Mutex<rusqlite::Connection>>`).
+- `HistoryQuery` / `HistoryFilter` / `HistoryPage` (`core/history.rs`) — what a history request asks for and what comes back (records, the count of matches, the count of malformed matches). `Storage::query_history` answers it.
+- `WriterItem` (`core/writer.rs`) — what the storage queue carries: a `Record` to insert, or a `Settle` marker that the writer answers once everything queued before it has been processed.
 - Device labels live outside `MessageRecord`: the `device_labels` table is keyed by identifier (`dev_addr`, else `dev_eui`, in the record's text form), and the WebUI joins labels to rows by that key. A malformed record has no identifier, so it never enters the live list and can never be labelled. Labels never touch the forwarding path. Every label change goes through the `LabelWriter` task in `api/labels.rs`, which commits and then publishes on `/ws/labels`.
 
 ## WebUI Development
@@ -109,16 +114,20 @@ After any frontend change that needs to be embedded in the binary, run `make bui
 
 | File | Role |
 |---|---|
-| `src/App.tsx` | Layout shell; localStorage hooks; filtering/sorting logic (the device filter also matches labels; malformed rows are hidden unless `showMalformed`, and counted after the other filters); label dialog state; CSV export (ending `…, malformed, label`) |
-| `src/components/MessageTable.tsx` | `TableVirtuoso` table; signal-quality coloring; MType badges; Label column (`LabelCell`, clickable only on rows that have an identifier); malformed rows (`row-malformed`, dashed badge, short reason in the Device cell) |
+| `src/App.tsx` | Layout shell; localStorage hooks; runs `useHistory`; at render time keeps the held rows that pass `matchesFilter` (the device filter also matches labels; malformed rows are hidden unless `showMalformed`) and sorts them, on a 5 s tick so rows age out of the range without traffic; Matching, Shown and Blocked (over the rows shown); label dialog state; CSV export of the rows shown (ending `…, malformed, label`) |
+| `src/components/MessageTable.tsx` | `TableVirtuoso` table; signal-quality coloring; MType badges; Label column (`LabelCell`, clickable only on rows that have an identifier); malformed rows (`row-malformed`, dashed badge, short reason in the Device cell); `data-id` on every row, which scripts read to compare the table with the database |
 | `src/components/LabelDialog.tsx` | Modal to set, change or remove the label of one identifier (DevAddr or DevEUI): text field limited to 64 characters, Save / Delete (only when a label exists) / Cancel, Enter saves, Escape or a click outside cancels, shows the server's error |
 | `src/components/FilterBar.tsx` | Device input (also matches labels), MType multi-select with the "Show malformed" checkbox at the end of its menu (the header has no room for it at 800 px), status/gateway/time selects |
 | `src/components/ColumnPicker.tsx` | Column visibility toggle (persisted to `localStorage`); the Label column is hidden by default |
-| `src/components/StatusBar.tsx` | Row counts (including "Malformed hidden / shown: N"), WS status indicator, version and copyright notice (version from `package.json` via Vite `define`), live/pause toggle |
-| `src/hooks/useWebSocket.ts` | WebSocket connection with auto-reconnect, generic over the path and the event handler (`/ws` for messages, `/ws/labels` for labels) |
-| `src/hooks/useLabels.ts` | Label state (`Record<identifier, label>`), fed only by `/ws/labels` (a snapshot replaces it, an event updates one entry); `saveLabel` / `removeLabel` call `PUT` / `DELETE /api/labels/{device}` and return success or the API's error message, never writing state themselves, so a late HTTP response cannot overwrite a newer event |
-| `src/styles/index.css` | **All styling** — pure CSS, no framework |
-| `src/types/messages.ts` | TypeScript types (`MessageRecord`, `WsMessage`, label snapshot and event types, etc.), `deviceId()`, the identifier of a row (`dev_addr` ?? `dev_eui` ?? none), and `malformedReason()` / `malformedShort()`, the full and the short reason of a malformed row |
+| `src/components/StatusBar.tsx` | Matching ("Loading…" while a load is busy, "–" before the first), Shown, Blocked, "Malformed hidden / shown: N" ("–" when unknown), each with `data-stat` and `data-value` for scripts; WS status indicator; version and copyright notice (version from `package.json` via Vite `define`); live/pause toggle |
+| `src/components/HistoryNotice.tsx` | The strip between table and footer (`#history-notice`, `role="status"`, one line, full text in the title): a failed load (error style), the count of records the database failed to store, "the database is behind", and the cap ("Showing the newest 5,000 of N matching messages in …"). Absent when it has nothing to say |
+| `src/hooks/useWebSocket.ts` | WebSocket connection, generic over the path and the event handler (`/ws` for messages, `/ws/labels` for labels); an `onOpen` callback on every open, which `/ws` uses to reload the range; reconnects wait about 3 s, doubling to 60 s, each randomised between half and all of it (`nextReconnect`, which wants the previous *nominal* delay back) |
+| `src/hooks/useHistory.ts` | Runs the request state machine (`nextRequests`) with timers, `fetch` (one `AbortController` per request, 30 s timeout) and the retry series; holds the rows, the live-record log and the pause buffer; exposes the rows, `older`, `malformed`, `writeFailures`, `busy`, `behind`, `error`, `knownGateways`, `pause()` / `resume()` |
+| `src/lib/history.ts` | The history logic as pure functions with only `import type` imports (the Node test transpiles this one file alone): `matchesFilter` and `historyParams` (the filter rules and the query string that asks the server for the same thing), `mergeRecords` / `mergeAfterLoad`, the count arithmetic, `nextRequests` and the retry / reconnect back-off. Change a rule here and in `core/history.rs` together |
+| `src/hooks/useLabels.ts` | Label state (`Record<identifier, label>`; `synced` is true after the first snapshot), fed only by `/ws/labels` (a snapshot replaces it, an event updates one entry); `saveLabel` / `removeLabel` call `PUT` / `DELETE /api/labels/{device}` and return success or the API's error message, never writing state themselves, so a late HTTP response cannot overwrite a newer event |
+| `src/styles/index.css` | **All styling** — pure CSS, no framework (`.history-notice` and its `--notice-*` variables included) |
+| `test/history.test.mjs`, `test/history-vectors.json` | `npm test`: the Node test runs `lib/history.ts` (request rules, merging, counts, back-off), and checks the shared vectors (records, labels and filter cases) that a Rust test also sends through the `/api/messages` router. No test framework |
+| `src/types/messages.ts` | TypeScript types (`MessageRecord`, `WsMessage`, label snapshot and event types, etc.), `deviceId()` (re-exported from `lib/history.ts`), the identifier of a row (`dev_addr` ?? `dev_eui` ?? none), and `malformedReason()` / `malformedShort()`, the full and the short reason of a malformed row |
 
 ### CSS Design System
 

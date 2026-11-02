@@ -31,6 +31,7 @@
   zmq = { workspace = true }
   axum = { workspace = true }
   tower-http = { workspace = true }
+  http-body = { workspace = true }
   rust-embed = { workspace = true }
   mime_guess = { workspace = true }
   rumqttc = { workspace = true }
@@ -39,6 +40,8 @@
   webpki-roots = { workspace = true }
 
 [dev-dependencies]
+  # `test-util` for the paused clock of the tests that wait out a timeout.
+  tokio = { workspace = true, features = ["test-util"] }
   bytes = { workspace = true }
   tower = { workspace = true }
   http-body-util = { workspace = true }

@@ -138,7 +138,15 @@ const COMPONENTS: TableComponents<MessageRecord, TableContext> = {
     const classes: string[] = [];
     if (item.status === 'Blocked') classes.push('row-blocked');
     if (item.malformed != null) classes.push('row-malformed');
-    return <tr {...props} className={classes.length > 0 ? classes.join(' ') : undefined} />;
+    // The record id lets a script read which records the table holds: rows
+    // are in the DOM only while near the viewport, and the CSV export has no id.
+    return (
+      <tr
+        {...props}
+        data-id={item.id}
+        className={classes.length > 0 ? classes.join(' ') : undefined}
+      />
+    );
   },
   Table: ({ style, context: _context, ...props }) => (
     <table {...props} style={{ ...style, tableLayout: 'fixed', width: '100%' }} />

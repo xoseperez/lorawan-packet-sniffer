@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node test/history.test.mjs"
   },
   "dependencies": {
     "react": "^19.0.0",

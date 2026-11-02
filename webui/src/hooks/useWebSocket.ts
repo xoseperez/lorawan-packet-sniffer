@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { nextReconnect } from '../lib/history';
 
 export type WsStatus = 'connecting' | 'connected' | 'disconnected';
 
@@ -6,22 +7,41 @@ export type WsStatus = 'connecting' | 'connected' | 'disconnected';
  * Keeps a WebSocket to `path` (e.g. '/ws') open, reconnecting after a drop, and
  * hands every parsed JSON frame to `onEvent`. The handler decides which frame
  * types it cares about; frames that are not valid JSON are ignored.
+ *
+ * `onOpen` runs every time the socket opens, the first time included. The
+ * history hook reloads the selected range on each one, so a record broadcast
+ * while the socket was down is not missed.
+ *
+ * Reconnects wait about 3 s, doubling after each further drop up to 60 s, and
+ * start again at 3 s after a connection that lasted a minute. Each wait is
+ * picked at random between half and all of that, so the pages of a restarted
+ * sniffer do not all come back at one instant. A link that keeps dropping, or a
+ * server that closes a client for falling behind (close code 1013), therefore
+ * costs one reconnect a minute at most, not one every 3 s.
  */
 export function useWebSocket<T>(
   path: string,
   onEvent: (event: T) => void,
+  onOpen?: () => void,
 ): { status: WsStatus } {
   const [status, setStatus] = useState<WsStatus>('connecting');
 
-  // Stable ref so connect() closure always calls the latest onEvent
+  // Stable refs so connect() closure always calls the latest handlers
   // without needing to be re-created on every render.
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
+  const onOpenRef = useRef(onOpen);
+  onOpenRef.current = onOpen;
 
   useEffect(() => {
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let cancelled = false;
+    // The nominal wait before the last attempt, not the randomised one:
+    // doubling a randomised wait would drift. Null before the first drop.
+    let nominalMs: number | null = null;
+    // When the current connection opened, or null if it never did.
+    let openedAt: number | null = null;
 
     function connect() {
       if (cancelled) return;
@@ -32,7 +52,10 @@ export function useWebSocket<T>(
       setStatus('connecting');
 
       ws.onopen = () => {
-        if (!cancelled) setStatus('connected');
+        if (cancelled) return;
+        openedAt = Date.now();
+        setStatus('connected');
+        onOpenRef.current?.();
       };
 
       ws.onmessage = (event: MessageEvent<string>) => {
@@ -46,10 +69,13 @@ export function useWebSocket<T>(
       };
 
       ws.onclose = () => {
-        if (!cancelled) {
-          setStatus('disconnected');
-          reconnectTimer = setTimeout(connect, 3000);
-        }
+        if (cancelled) return;
+        setStatus('disconnected');
+        const lastConnectionMs = openedAt === null ? 0 : Date.now() - openedAt;
+        openedAt = null;
+        const next = nextReconnect(nominalMs, lastConnectionMs, Math.random());
+        nominalMs = next.nominalMs;
+        reconnectTimer = setTimeout(connect, next.delayMs);
       };
 
       ws.onerror = () => ws?.close();
@@ -62,7 +88,7 @@ export function useWebSocket<T>(
       if (reconnectTimer !== null) clearTimeout(reconnectTimer);
       ws?.close();
     };
-  }, [path]); // reconnect only if the path changes; onEvent changes are handled via ref
+  }, [path]); // reconnect only if the path changes; handler changes are handled via refs
 
   return { status };
 }
