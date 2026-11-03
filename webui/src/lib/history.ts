@@ -11,6 +11,9 @@
  * - the matching rule, shared by the server (stored records) and the browser
  *   (live records): `matchesFilter`, with the query string that asks the
  *   server for the same thing, `historyParams`;
+ * - the time range of the filter bar, a span counted back from now or one
+ *   local day: `toHistoryFilter`, `dayBounds`, `todayKey`, `pickDay`,
+ *   `normaliseFilters`, `rangeWords`;
  * - merging: `mergeRecords`, `mergeAfterLoad`, and the count arithmetic;
  * - the request state machine, `nextRequests`, and `classifyFailedLoad`, which
  *   says what the status of a load that did not return 200 means;
@@ -45,6 +48,34 @@ export const TIME_PRESET_MS: Record<string, number> = {
   '1h':  60 * 60 * 1000,
   '24h': 24 * 60 * 60 * 1000,
 };
+
+/** What the time selector can hold: a span counted back from now, or one local day. */
+export type TimePreset = FilterState['timePreset'];
+
+/** The presets that are a span counted back from now. */
+type SpanPreset = Exclude<TimePreset, 'day'>;
+
+/**
+ * The span a range falls back to when its preset is not one of the above (an
+ * older saved value) or its day is not a day. The same as the filter bar's
+ * default.
+ */
+const DEFAULT_TIME_PRESET: SpanPreset = '5m';
+
+/** How a range reads after "matching messages", one entry per span preset. */
+const SPAN_WORDS: Record<SpanPreset, string> = {
+  '5m':  'the last 5 min',
+  '15m': 'the last 15 min',
+  '1h':  'the last hour',
+  '24h': 'the last 24 h',
+};
+
+/** `preset` if it is a span preset, otherwise the default one. */
+function spanPreset(preset: unknown): SpanPreset {
+  return typeof preset === 'string' && Object.prototype.hasOwnProperty.call(SPAN_WORDS, preset)
+    ? (preset as SpanPreset)
+    : DEFAULT_TIME_PRESET;
+}
 
 // ---------------------------------------------------------------------------
 // Records and the matching rule
@@ -84,6 +115,8 @@ export interface HistoryFilter {
   gateway: string;
   /** Inclusive lower bound of the time range, in epoch milliseconds; null = no bound. */
   fromMs: number | null;
+  /** Exclusive upper bound of the time range, in epoch milliseconds; null = no bound. */
+  untilMs: number | null;
   /** Leave out malformed frames. */
   hideMalformed: boolean;
 }
@@ -93,15 +126,27 @@ export interface HistoryFilter {
  * per load and used both for the request and for the check of the live records
  * that load carries over, so the two cannot disagree about where the range
  * starts.
+ *
+ * A span preset counts back from `nowMs` and has no end. A day is fixed
+ * whatever `nowMs` is: its local midnight to the next one (`dayBounds`). A
+ * preset or day that cannot be used loads like the default preset, so a bad
+ * saved value can never turn into a load of the whole database.
  */
 export function toHistoryFilter(f: FilterState, nowMs: number): HistoryFilter {
-  const span = TIME_PRESET_MS[f.timePreset];
+  let fromMs: number;
+  let untilMs: number | null = null;
+  if (f.timePreset === 'day' && isValidDay(f.day)) {
+    ({ fromMs, untilMs } = dayBounds(f.day));
+  } else {
+    fromMs = nowMs - TIME_PRESET_MS[spanPreset(f.timePreset)];
+  }
   return {
     device: f.device,
     mtypes: [...f.mtype],
     status: f.status,
     gateway: f.gateway,
-    fromMs: span === undefined ? null : nowMs - span,
+    fromMs,
+    untilMs,
     hideMalformed: !f.showMalformed,
   };
 }
@@ -116,9 +161,12 @@ export function toHistoryFilter(f: FilterState, nowMs: number): HistoryFilter {
  * - Type: one of the selected types. An `Unknown` record is therefore left out
  *   whenever any type is selected, since no type filter can select it.
  * - Time: the record's time, truncated to the millisecond, is not before the
- *   bound. Truncating is what a browser's `Date` does with the sniffer's
- *   nanosecond timestamps, and the server's inclusive bound gives the same
- *   answer only for a bound on a whole millisecond.
+ *   lower bound and is before the upper bound, which is exclusive (a record
+ *   exactly at it is outside). Truncating is what a browser's `Date` does with
+ *   the sniffer's nanosecond timestamps. The server compares the full
+ *   timestamp, so the two agree only for bounds on a whole millisecond: then a
+ *   time is at or after the lower bound exactly when its truncation is, and
+ *   before the upper bound exactly when its truncation is.
  *
  * `serverMatchedDevice`: the row came from a load made for this device text
  * and the browser has no label snapshot yet, so the server already applied the
@@ -147,6 +195,7 @@ export function matchesFilter(
   if (f.status !== 'all' && m.status !== f.status) return false;
   if (f.gateway !== '' && m.gateway_eui !== f.gateway) return false;
   if (f.fromMs !== null && !(parseTimestampMs(m.timestamp) >= f.fromMs)) return false;
+  if (f.untilMs !== null && !(parseTimestampMs(m.timestamp) < f.untilMs)) return false;
   if (f.hideMalformed && m.malformed != null) return false;
   return true;
 }
@@ -177,20 +226,120 @@ export function onlyMalformedFilter(f: HistoryFilter): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// The time selector: spans and days
+// ---------------------------------------------------------------------------
+
+const DAY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/**
+ * The earliest year a day can have. Nothing was stored before 1970, and the
+ * `Date` constructor reads a year below 100 as 19xx: a date input hands over a
+ * partly typed year ("0002-11-02" on the way to 2026) as a value, and that
+ * would load a day in 1902.
+ */
+const FIRST_YEAR = 1970;
+
+const pad = (n: number, width: number): string => String(n).padStart(width, '0');
+
+function parseDay(day: unknown): { year: number; month: number; date: number } | null {
+  if (typeof day !== 'string') return null;
+  const match = DAY_PATTERN.exec(day);
+  if (match === null) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const date = Number(match[3]);
+  if (year < FIRST_YEAR) return null;
+  // `Date.UTC` carries an impossible date over (2026-02-30 is 2 March), so a
+  // real date is one that comes back unchanged.
+  const check = new Date(Date.UTC(year, month - 1, date));
+  if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== date) {
+    return null;
+  }
+  return { year, month, date };
+}
+
+/** Whether `day` is a 'YYYY-MM-DD' that names a real calendar date. */
+export function isValidDay(day: unknown): day is string {
+  return parseDay(day) !== null;
+}
+
+/**
+ * The bounds of a local day: its midnight (inclusive) and the next one
+ * (exclusive), in epoch milliseconds, in the time zone of the browser. A day
+ * where the clocks change is 23 or 25 hours long. Throws a `RangeError` if
+ * `day` is not a valid 'YYYY-MM-DD'.
+ */
+export function dayBounds(day: string): { fromMs: number; untilMs: number } {
+  const p = parseDay(day);
+  if (p === null) throw new RangeError(`Not a day: ${day}`);
+  return {
+    fromMs: new Date(p.year, p.month - 1, p.date).getTime(),
+    untilMs: new Date(p.year, p.month - 1, p.date + 1).getTime(),
+  };
+}
+
+/** The local date of `nowMs` as 'YYYY-MM-DD'. */
+export function todayKey(nowMs: number): string {
+  const d = new Date(nowMs);
+  return `${pad(d.getFullYear(), 4)}-${pad(d.getMonth() + 1, 2)}-${pad(d.getDate(), 2)}`;
+}
+
+/**
+ * The day a date input's value stands for: a valid 'YYYY-MM-DD' that is not
+ * after `today` (a day to come has nothing to show), else null. The input's
+ * own `max` greys out later days, but that only guides the person: a value
+ * can still be typed or set by a script.
+ */
+export function pickDay(value: string, today: string): string | null {
+  return isValidDay(value) && isValidDay(today) && value <= today ? value : null;
+}
+
+/**
+ * The saved filters made safe to use. A saved range that the selector no
+ * longer offers (an older "all time"), or a day that is missing or not a day,
+ * becomes the default span; a span carries no day. Returns `stored` itself
+ * when nothing needs to change.
+ */
+export function normaliseFilters(stored: FilterState): FilterState {
+  let timePreset: TimePreset;
+  let day: string | null = null;
+  if (stored.timePreset === 'day' && isValidDay(stored.day)) {
+    timePreset = 'day';
+    day = stored.day;
+  } else {
+    timePreset = spanPreset(stored.timePreset);
+  }
+  return stored.timePreset === timePreset && stored.day === day ? stored : { ...stored, timePreset, day };
+}
+
+/**
+ * The range as it reads after "matching messages": "the last 5 min", "the
+ * last 15 min", "the last hour", "the last 24 h", or "on 2026-11-01" for a
+ * day. It names the range `toHistoryFilter` loads, so a preset or day that
+ * cannot be used reads as the default span.
+ */
+export function rangeWords(f: FilterState): string {
+  if (f.timePreset === 'day' && isValidDay(f.day)) return `on ${f.day}`;
+  return SPAN_WORDS[spanPreset(f.timePreset)];
+}
+
+// ---------------------------------------------------------------------------
 // Query string
 // ---------------------------------------------------------------------------
 
 /**
- * The filter part of the `/api/messages` query, in a fixed order: from,
+ * The filter part of the `/api/messages` query, in a fixed order: from, before,
  * device, mtype, status, gateway, malformed. Filters that select everything
  * are left out, and `malformed` is sent only to exclude. Every value is
  * percent-encoded, so a `+` in the device text can never arrive as a space,
- * and `from` is `toISOString()` (milliseconds and `Z`), which the server
- * parses exactly.
+ * and `from` and `before` are `toISOString()` (milliseconds and `Z`), which
+ * the server parses exactly. `from` is inclusive and `before` exclusive, like
+ * the two bounds of `matchesFilter`.
  */
 export function historyParams(f: HistoryFilter): string {
   const parts: string[] = [];
   if (f.fromMs !== null) parts.push(`from=${encodeURIComponent(new Date(f.fromMs).toISOString())}`);
+  if (f.untilMs !== null) parts.push(`before=${encodeURIComponent(new Date(f.untilMs).toISOString())}`);
   if (f.device !== '') parts.push(`device=${encodeURIComponent(f.device)}`);
   if (f.mtypes.length > 0) parts.push(`mtype=${f.mtypes.map(encodeURIComponent).join(',')}`);
   if (f.status !== 'all') parts.push(`status=${encodeURIComponent(f.status)}`);
@@ -687,6 +836,7 @@ export function filterChangeEvent(prev: FilterState, next: FilterState): History
     prev.status !== next.status ||
     prev.gateway !== next.gateway ||
     prev.timePreset !== next.timePreset ||
+    prev.day !== next.day ||
     prev.showMalformed !== next.showMalformed;
   if (otherChanged) return { kind: 'filter', filter: next };
   if (prev.device !== next.device) return { kind: 'typed', filter: next };

@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - WebUI login: optional shared token (`[sniffer.api] login`, `token`), login page, signed session cookies, Bearer tokens for scripts, lockout after 10 wrong tokens a minute.
 - Time-range history: the time selector loads the newest 5,000 matching records of the range from the database, with a notice when more match.
+- Day selector in the WebUI: pick one local day from the browser's date picker.
 - Server-side filters: device or label, type, status, gateway and malformed are applied by the database.
-- `/api/messages` parameters `from`, `newest`, `count`, `settle`, `device`, `mtype`, `status`, `gateway` and `malformed`, and headers `X-Total-Count`, `X-Malformed-Count`, `X-History-Settled` and `X-Storage-Write-Failures`.
+- `/api/messages` parameters `from`, `before`, `newest`, `count`, `settle`, `device`, `mtype`, `status`, `gateway` and `malformed`, and headers `X-Total-Count`, `X-Malformed-Count`, `X-History-Settled` and `X-Storage-Write-Failures`.
 - Full reload of the WebUI after every WebSocket reconnect, with no missing records.
 - WebUI unit tests (`cd webui && npm test`).
 - Malformed-frame detection (`crc`, `mhdr`, `length`), with a `malformed` field on every record and a "Show malformed" option in the WebUI.
@@ -43,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Storage insert failures are logged and counted.
 - Per-packet log lines only at DEBUG.
 - Direction filter removed from the WebUI.
+- "All time" removed from the time selector.
 - Gateway filter keeps every gateway seen in the session.
 - `tools/gwsim.py` "malformed" datagram counter renamed to "invalid datagrams".
 - Docker images based on Alpine 3.23.

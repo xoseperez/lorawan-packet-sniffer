@@ -344,6 +344,167 @@ async fn newest_keeps_the_newest_records_after_a_bound() {
 }
 
 #[tokio::test]
+async fn before_is_exclusive_and_alone_returns_the_newest_records_before_it() {
+    let rig = Setup::new().build();
+    rig.storage.insert_many(series(20)).unwrap();
+    let app = rig.app();
+
+    let reply = get(
+        &app,
+        &format!("/api/messages?before={}&limit=3&count=true", stamp(10)),
+    )
+    .await;
+
+    // The record stamped exactly on the bound is out, and with no lower bound
+    // the newest records before it are the ones kept.
+    assert_eq!(ids(&reply), names(&["r0007", "r0008", "r0009"]));
+    assert_eq!(reply.header("x-total-count"), Some("10"));
+    let reply = get(&app, &format!("/api/messages?before={}", stamp(0))).await;
+    assert!(ids(&reply).is_empty());
+}
+
+#[tokio::test]
+async fn before_closes_the_window_that_from_or_since_opens() {
+    let rig = Setup::new().build();
+    rig.storage.insert_many(series(20)).unwrap();
+    let app = rig.app();
+
+    let from = get(
+        &app,
+        &format!("/api/messages?from={}&before={}", stamp(5), stamp(9)),
+    )
+    .await;
+    let since = get(
+        &app,
+        &format!("/api/messages?since={}&before={}", stamp(5), stamp(9)),
+    )
+    .await;
+    assert_eq!(
+        ids(&from),
+        names(&["r0005", "r0006", "r0007", "r0008"]),
+        "from is in, before is out"
+    );
+    assert_eq!(ids(&since), names(&["r0006", "r0007", "r0008"]));
+
+    // A window of ten rows with room for three: the lower bound alone would
+    // keep the oldest, `newest` keeps the newest of the window, not of the
+    // database.
+    let window = format!("from={}&before={}&limit=3&count=true", stamp(5), stamp(15));
+    let oldest = get(&app, &format!("/api/messages?{window}")).await;
+    let newest = get(&app, &format!("/api/messages?{window}&newest=true")).await;
+    assert_eq!(ids(&oldest), names(&["r0005", "r0006", "r0007"]));
+    assert_eq!(ids(&newest), names(&["r0012", "r0013", "r0014"]));
+    assert_eq!(oldest.header("x-total-count"), Some("10"));
+    assert_eq!(newest.header("x-total-count"), Some("10"));
+}
+
+#[tokio::test]
+async fn two_windows_that_meet_share_no_record() {
+    let rig = Setup::new().build();
+    rig.storage.insert_many(series(30)).unwrap();
+    let app = rig.app();
+
+    let first = ids(&get(
+        &app,
+        &format!("/api/messages?from={}&before={}", stamp(0), stamp(12)),
+    )
+    .await);
+    let second = ids(&get(
+        &app,
+        &format!("/api/messages?from={}&before={}", stamp(12), stamp(30)),
+    )
+    .await);
+
+    assert_eq!(first.len() + second.len(), 30);
+    assert_eq!(first.last().map(String::as_str), Some("r0011"));
+    assert_eq!(second.first().map(String::as_str), Some("r0012"));
+}
+
+#[tokio::test]
+async fn the_headers_of_a_window_count_only_the_window() {
+    // The same on both read paths: the history connection of a file, and the
+    // one connection of an in-memory database.
+    for on_file in [false, true] {
+        let tmp = TempDb::new("api-window-count");
+        let storage = if on_file {
+            Storage::open(&tmp.path()).unwrap()
+        } else {
+            Storage::open_in_memory().unwrap()
+        };
+        let records = assorted(48);
+        storage.insert_many(records.clone()).unwrap();
+        let rig = Setup::new().storage(storage).build();
+        let app = rig.app();
+
+        let in_window = |r: &MessageRecord| r.timestamp >= at(8) && r.timestamp < at(40);
+        type Keep = Box<dyn Fn(&MessageRecord) -> bool>;
+        let cases: Vec<(&str, Keep)> = vec![
+            ("", Box::new(|_| true)),
+            ("&status=blocked", Box::new(|r| r.status == Status::Blocked)),
+            (
+                "&gateway=AA%3ABB%3ACC%3ADD%3A00%3A11%3A22%3A33",
+                Box::new(|r| r.gateway_eui.as_deref() == Some("AA:BB:CC:DD:00:11:22:33")),
+            ),
+            (
+                "&device=0a1b2c",
+                Box::new(|r| r.dev_addr.as_deref() == Some("0A1B2C3D")),
+            ),
+            (
+                "&mtype=ConfirmedDataUp",
+                Box::new(|r| r.mtype == MType::ConfirmedDataUp && r.malformed.is_none()),
+            ),
+            (
+                "&device=0a1b2c&status=forwarded&mtype=UnconfirmedDataUp",
+                Box::new(|r| {
+                    r.dev_addr.as_deref() == Some("0A1B2C3D")
+                        && r.status == Status::Forwarded
+                        && r.mtype == MType::UnconfirmedDataUp
+                }),
+            ),
+        ];
+        let window = format!("from={}&before={}", stamp(8), stamp(40));
+        for (extra, keep) in &cases {
+            let label = format!("{extra:?}, on_file={on_file}");
+            let matching: Vec<&MessageRecord> =
+                records.iter().filter(|r| in_window(r) && keep(r)).collect();
+            let malformed = matching.iter().filter(|r| r.malformed.is_some()).count();
+            let wider = records.iter().filter(|r| keep(r)).count();
+            assert!(
+                matching.len() < wider,
+                "the window cuts the fixture: {label}"
+            );
+
+            for hide in [false, true] {
+                let mode = if hide { "exclude" } else { "include" };
+                let reply = get(
+                    &app,
+                    &format!(
+                        "/api/messages?{window}&count=true&malformed={mode}&newest=true&limit=5000{extra}"
+                    ),
+                )
+                .await;
+                let shown: Vec<String> = matching
+                    .iter()
+                    .filter(|r| !hide || r.malformed.is_none())
+                    .map(|r| r.id.clone())
+                    .collect();
+                assert_eq!(ids(&reply), shown, "{label}, malformed={mode}");
+                assert_eq!(
+                    reply.header("x-total-count"),
+                    Some(shown.len().to_string().as_str()),
+                    "{label}, malformed={mode}"
+                );
+                assert_eq!(
+                    reply.header("x-malformed-count"),
+                    Some(malformed.to_string().as_str()),
+                    "{label}, malformed={mode}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn count_true_gives_the_number_that_match_not_the_number_returned() {
     let rig = Setup::new().build();
     rig.storage.insert_many(series(40)).unwrap();
@@ -600,6 +761,70 @@ async fn from_together_with_since_is_a_400() {
     .await;
 
     assert_error(&reply, StatusCode::BAD_REQUEST, "from or since");
+}
+
+/// An error answer whose message is exactly `message`.
+fn assert_error_message(reply: &Reply, message: &str) {
+    assert_error(reply, StatusCode::BAD_REQUEST, message);
+    assert_eq!(reply.json()["error"].as_str(), Some(message));
+}
+
+#[tokio::test]
+async fn a_bad_before_is_a_400_with_a_json_error() {
+    let rig = Setup::new().build();
+    let app = rig.app();
+
+    for bad in [
+        "yesterday",
+        "2026-13-40T00%3A00%3A00Z",
+        "",
+        "1730000000",
+        "2026-10-30",
+    ] {
+        let reply = get(&app, &format!("/api/messages?before={bad}")).await;
+        assert_error_message(
+            &reply,
+            "before must be an RFC 3339 timestamp, such as 2026-10-30T12:00:00.000Z",
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_before_not_later_than_from_or_since_is_a_400() {
+    let rig = Setup::new().build();
+    rig.storage.insert_many(series(20)).unwrap();
+    let app = rig.app();
+
+    // The same instant is an empty window, and an earlier one an inverted one.
+    for before in [stamp(10), stamp(3)] {
+        let reply = get(
+            &app,
+            &format!("/api/messages?from={}&before={before}", stamp(10)),
+        )
+        .await;
+        assert_error_message(&reply, "before must be later than from");
+        let reply = get(
+            &app,
+            &format!("/api/messages?since={}&before={before}", stamp(10)),
+        )
+        .await;
+        assert_error_message(&reply, "before must be later than since");
+    }
+
+    // One second later is a window; an unparsable `since` is ignored, so it
+    // leaves `before` nothing to be later than.
+    let reply = get(
+        &app,
+        &format!("/api/messages?from={}&before={}", stamp(10), stamp(11)),
+    )
+    .await;
+    assert_eq!(ids(&reply), names(&["r0010"]));
+    let reply = get(
+        &app,
+        &format!("/api/messages?since=garbage&before={}&limit=2", stamp(3)),
+    )
+    .await;
+    assert_eq!(ids(&reply), names(&["r0001", "r0002"]));
 }
 
 #[tokio::test]

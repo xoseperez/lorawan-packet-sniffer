@@ -316,6 +316,7 @@ fn query(lower: Option<LowerBound>, change: impl FnOnce(&mut HistoryFilter)) -> 
     change(&mut filter);
     HistoryQuery {
         lower,
+        upper: None,
         filter,
         limit: MAX_HISTORY_ROWS,
         newest: true,

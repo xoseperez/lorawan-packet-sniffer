@@ -3,7 +3,9 @@ import { MessageRecord, WsMessage, deviceId } from './types/messages';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useLabels } from './hooks/useLabels';
 import { useHistory } from './hooks/useHistory';
-import { compareTimestamps, matchesFilter, matchingCount, toHistoryFilter } from './lib/history';
+import {
+  compareTimestamps, matchesFilter, matchingCount, normaliseFilters, rangeWords, toHistoryFilter,
+} from './lib/history';
 import { MessageTable } from './components/MessageTable';
 import { LabelDialog } from './components/LabelDialog';
 import { FilterBar, FilterState, DEFAULT_FILTERS } from './components/FilterBar';
@@ -70,7 +72,10 @@ function useLocalStorage<T>(key: string, initial: T): [T, (v: T) => void] {
 function SnifferApp({ loginEnabled }: { loginEnabled: boolean }) {
   const [isLive, setIsLive] = useState(true);
 
-  const [filters, setFilters] = useLocalStorage<FilterState>('sniffer-filters', DEFAULT_FILTERS);
+  const [storedFilters, setFilters] = useLocalStorage<FilterState>('sniffer-filters', DEFAULT_FILTERS);
+  // A range that an earlier version saved and the selector no longer offers
+  // ("All time") starts as the default span.
+  const filters = useMemo(() => normaliseFilters(storedFilters), [storedFilters]);
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
   const [columns, setColumns] = useLocalStorage<ColumnConfig>('sniffer-columns', DEFAULT_COLUMNS);
 
@@ -259,7 +264,7 @@ function SnifferApp({ loginEnabled }: { loginEnabled: boolean }) {
         behind={history.behind}
         cap={
           matching !== null && matching > filteredMessages.length
-            ? { shown: filteredMessages.length, matching, timePreset: filters.timePreset }
+            ? { shown: filteredMessages.length, matching, range: rangeWords(filters) }
             : null
         }
       />

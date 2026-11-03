@@ -736,6 +736,7 @@ fn rollback_fixture_check() {
         .query_history(
             &HistoryQuery {
                 lower: None,
+                upper: None,
                 filter: Default::default(),
                 limit: MAX_HISTORY_ROWS,
                 newest: true,

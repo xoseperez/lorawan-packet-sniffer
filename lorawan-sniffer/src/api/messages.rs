@@ -70,6 +70,7 @@ pub(super) struct MessagesParams {
     since: Option<String>,
     limit: Option<i64>,
     from: Option<String>,
+    before: Option<String>,
     newest: Option<String>,
     count: Option<String>,
     device: Option<String>,
@@ -97,23 +98,26 @@ fn parse(params: &MessagesParams) -> Result<Request, String> {
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
-    let from = match params.from.as_deref() {
-        None => None,
-        Some(text) => Some(
-            DateTime::parse_from_rfc3339(text)
-                .map(|dt| dt.with_timezone(&Utc))
-                .map_err(|_| {
-                    "from must be an RFC 3339 timestamp, such as 2026-10-30T12:00:00.000Z"
-                        .to_string()
-                })?,
-        ),
-    };
+    let from = timestamp_param(params.from.as_deref(), "from")?;
+    let before = timestamp_param(params.before.as_deref(), "before")?;
     let lower = match (since, from) {
         (Some(_), Some(_)) => return Err("use either from or since, not both".to_string()),
         (Some(since), None) => Some(LowerBound::After(since)),
         (None, Some(from)) => Some(LowerBound::From(from)),
         (None, None) => None,
     };
+
+    // A window that holds no instant is a mistake in the script that asked for
+    // it, and an empty answer would hide that.
+    if let (Some(before), Some(lower)) = (before, lower) {
+        let (start, name) = match lower {
+            LowerBound::After(at) => (at, "since"),
+            LowerBound::From(at) => (at, "from"),
+        };
+        if before <= start {
+            return Err(format!("before must be later than {name}"));
+        }
+    }
 
     // Without a bound the newest records are the useful ones; with one, the
     // oldest after it are, which is how `since` has always worked.  The
@@ -140,6 +144,7 @@ fn parse(params: &MessagesParams) -> Result<Request, String> {
     Ok(Request {
         query: HistoryQuery {
             lower,
+            upper: before,
             filter,
             limit: params
                 .limit
@@ -150,6 +155,21 @@ fn parse(params: &MessagesParams) -> Result<Request, String> {
         },
         settle,
     })
+}
+
+/// An RFC 3339 timestamp in UTC; `None` when the parameter is absent.
+fn timestamp_param(value: Option<&str>, name: &str) -> Result<Option<DateTime<Utc>>, String> {
+    value
+        .map(|text| {
+            DateTime::parse_from_rfc3339(text)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|_| {
+                    format!(
+                        "{name} must be an RFC 3339 timestamp, such as 2026-10-30T12:00:00.000Z"
+                    )
+                })
+        })
+        .transpose()
 }
 
 /// `"true"` or `"false"`; `None` when the parameter is absent.
@@ -469,4 +489,209 @@ pub(super) async fn add_failure_header(
         HeaderValue::from(failures.load(Ordering::Relaxed)),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BAD_BEFORE: &str =
+        "before must be an RFC 3339 timestamp, such as 2026-10-30T12:00:00.000Z";
+
+    fn utc(text: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(text)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// The parameters of a query string, as the extractor would give them.
+    fn params(pairs: &[(&str, &str)]) -> MessagesParams {
+        let object: serde_json::Map<String, serde_json::Value> = pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), (*value).into()))
+            .collect();
+        serde_json::from_value(object.into()).expect("every parameter is text")
+    }
+
+    fn query(pairs: &[(&str, &str)]) -> Result<HistoryQuery, String> {
+        parse(&params(pairs)).map(|request| request.query)
+    }
+
+    #[test]
+    fn a_request_without_before_has_no_upper_bound() {
+        let q = query(&[("from", "2026-10-30T12:00:00Z")]).unwrap();
+        assert_eq!(q.upper, None);
+        assert_eq!(query(&[]).unwrap().upper, None);
+    }
+
+    #[test]
+    fn before_is_read_like_from() {
+        let q = query(&[("before", "2026-10-30T12:00:00.000Z")]).unwrap();
+        assert_eq!(q.upper, Some(utc("2026-10-30T12:00:00Z")));
+        // Any offset, the same instant.
+        let q = query(&[("before", "2026-10-30T14:00:00+02:00")]).unwrap();
+        assert_eq!(q.upper, Some(utc("2026-10-30T12:00:00Z")));
+        // Sub-millisecond digits are kept.
+        let q = query(&[("before", "2026-10-30T12:00:00.123456789Z")]).unwrap();
+        assert_eq!(q.upper, Some(utc("2026-10-30T12:00:00.123456789Z")));
+    }
+
+    #[test]
+    fn before_alone_asks_for_the_newest_records_before_it() {
+        let q = query(&[("before", "2026-10-30T12:00:00Z")]).unwrap();
+        assert!(q.lower.is_none());
+        assert!(q.newest);
+        let q = query(&[("before", "2026-10-30T12:00:00Z"), ("newest", "false")]).unwrap();
+        assert!(!q.newest);
+    }
+
+    #[test]
+    fn before_with_from_is_a_window_that_keeps_the_default_of_a_lower_bound() {
+        let q = query(&[
+            ("from", "2026-10-30T00:00:00Z"),
+            ("before", "2026-10-31T00:00:00Z"),
+        ])
+        .unwrap();
+        assert_eq!(q.lower, Some(LowerBound::From(utc("2026-10-30T00:00:00Z"))));
+        assert_eq!(q.upper, Some(utc("2026-10-31T00:00:00Z")));
+        // The oldest of the window, as for any lower bound.
+        assert!(!q.newest);
+        let q = query(&[
+            ("from", "2026-10-30T00:00:00Z"),
+            ("before", "2026-10-31T00:00:00Z"),
+            ("newest", "true"),
+        ])
+        .unwrap();
+        assert!(q.newest);
+    }
+
+    #[test]
+    fn before_with_since_is_a_window_open_at_the_start() {
+        let q = query(&[
+            ("since", "2026-10-30T00:00:00Z"),
+            ("before", "2026-10-31T00:00:00Z"),
+        ])
+        .unwrap();
+        assert_eq!(
+            q.lower,
+            Some(LowerBound::After(utc("2026-10-30T00:00:00Z")))
+        );
+        assert_eq!(q.upper, Some(utc("2026-10-31T00:00:00Z")));
+        assert!(!q.newest);
+    }
+
+    #[test]
+    fn a_window_of_one_millisecond_is_accepted() {
+        let q = query(&[
+            ("from", "2026-10-30T12:00:00.000Z"),
+            ("before", "2026-10-30T12:00:00.001Z"),
+        ])
+        .unwrap();
+        assert_eq!(q.lower, Some(LowerBound::From(utc("2026-10-30T12:00:00Z"))));
+        assert_eq!(q.upper, Some(utc("2026-10-30T12:00:00.001Z")));
+    }
+
+    #[test]
+    fn an_unparsable_before_is_refused() {
+        for bad in [
+            "yesterday",
+            "",
+            "1730000000",
+            "2026-13-40T00:00:00Z",
+            "2026-10-30",
+            "2026-10-30T12:00:00",
+        ] {
+            assert_eq!(
+                query(&[("before", bad)]).unwrap_err(),
+                BAD_BEFORE,
+                "{bad:?}"
+            );
+        }
+        // Whatever else is asked.
+        let err = query(&[("from", "2026-10-30T12:00:00Z"), ("before", "soon")]).unwrap_err();
+        assert_eq!(err, BAD_BEFORE);
+    }
+
+    #[test]
+    fn a_bad_from_keeps_its_own_message() {
+        assert_eq!(
+            query(&[("from", "yesterday")]).unwrap_err(),
+            "from must be an RFC 3339 timestamp, such as 2026-10-30T12:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn before_not_later_than_from_is_refused() {
+        let from = "2026-10-30T12:00:00Z";
+        for before in [
+            // The same instant, spelled twice.
+            "2026-10-30T12:00:00Z",
+            "2026-10-30T14:00:00+02:00",
+            "2026-10-30T12:00:00.000Z",
+            // Earlier, by a day, by a millisecond.
+            "2026-10-29T12:00:00Z",
+            "2026-10-30T11:59:59.999Z",
+        ] {
+            assert_eq!(
+                query(&[("from", from), ("before", before)]).unwrap_err(),
+                "before must be later than from",
+                "{before}"
+            );
+        }
+    }
+
+    #[test]
+    fn before_not_later_than_since_is_refused() {
+        let since = "2026-10-30T12:00:00Z";
+        for before in ["2026-10-30T12:00:00Z", "2026-10-30T11:00:00Z"] {
+            assert_eq!(
+                query(&[("since", since), ("before", before)]).unwrap_err(),
+                "before must be later than since",
+                "{before}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ignored_since_leaves_before_nothing_to_be_later_than() {
+        // An unparsable `since` is ignored, as it always was, so there is no
+        // lower bound to compare with.
+        let q = query(&[("since", "garbage"), ("before", "2026-10-30T12:00:00Z")]).unwrap();
+        assert!(q.lower.is_none());
+        assert_eq!(q.upper, Some(utc("2026-10-30T12:00:00Z")));
+        assert!(q.newest);
+    }
+
+    #[test]
+    fn from_and_since_together_are_still_refused() {
+        let err = query(&[
+            ("from", "2026-10-30T12:00:00Z"),
+            ("since", "2026-10-30T12:00:00Z"),
+            ("before", "2026-10-31T12:00:00Z"),
+        ])
+        .unwrap_err();
+        assert_eq!(err, "use either from or since, not both");
+    }
+
+    #[test]
+    fn before_leaves_the_other_parameters_alone() {
+        let q = query(&[
+            ("before", "2026-10-30T12:00:00Z"),
+            ("device", "0a1b"),
+            ("mtype", "JoinRequest"),
+            ("status", "blocked"),
+            ("gateway", "AA:BB"),
+            ("malformed", "exclude"),
+            ("count", "true"),
+        ])
+        .unwrap();
+        assert_eq!(q.upper, Some(utc("2026-10-30T12:00:00Z")));
+        assert_eq!(q.filter.device.as_deref(), Some("0a1b"));
+        assert_eq!(q.filter.mtypes, [MType::JoinRequest]);
+        assert_eq!(q.filter.status, Some(Status::Blocked));
+        assert_eq!(q.filter.gateway.as_deref(), Some("AA:BB"));
+        assert!(q.filter.hide_malformed);
+        assert!(q.count);
+        assert_eq!(q.limit, 500);
+    }
 }

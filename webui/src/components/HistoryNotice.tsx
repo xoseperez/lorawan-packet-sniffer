@@ -1,14 +1,4 @@
 import { Fragment } from 'react';
-import type { FilterState } from './FilterBar';
-
-/** The span the time selector names, as it reads after "matching messages in". */
-const RANGE_WORDS: Record<FilterState['timePreset'], string> = {
-  '5m':  'the last 5 min',
-  '15m': 'the last 15 min',
-  '1h':  'the last hour',
-  '24h': 'the last 24 h',
-  'all': 'the database',
-};
 
 export type NoticeKind = 'error' | 'write-failures' | 'behind' | 'cap';
 
@@ -27,7 +17,7 @@ export interface NoticeInput {
   /** Loads come back unsettled and are being retried. */
   behind: boolean;
   /** Set when more records match than the table holds. */
-  cap: { shown: number; matching: number; timePreset: FilterState['timePreset'] } | null;
+  cap: { shown: number; matching: number; range: string } | null;
 }
 
 /**
@@ -63,12 +53,13 @@ export function noticeParts({ error, hasRows, writeFailures, behind, cap }: Noti
   }
 
   if (cap !== null) {
-    const range = RANGE_WORDS[cap.timePreset] ?? RANGE_WORDS.all;
+    // `range` is "the last 24 h" or "on 2026-11-01"; only the span needs "in".
+    const where = cap.range.startsWith('on ') ? cap.range : `in ${cap.range}`;
     parts.push({
       kind: 'cap',
       text:
         `Showing the newest ${cap.shown.toLocaleString()} of ` +
-        `${cap.matching.toLocaleString()} matching messages in ${range}`,
+        `${cap.matching.toLocaleString()} matching messages ${where}`,
     });
   }
 

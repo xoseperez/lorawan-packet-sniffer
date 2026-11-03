@@ -38,7 +38,7 @@ pub enum LowerBound {
     From(DateTime<Utc>),
 }
 
-/// The conditions a record must meet besides the time bound.
+/// The conditions a record must meet besides the time bounds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HistoryFilter {
     /// Text to find in the DevAddr, the DevEUI or the label, as typed (not
@@ -56,9 +56,9 @@ pub struct HistoryFilter {
 }
 
 impl HistoryFilter {
-    /// Does this filter ask for anything beyond the time bound?
+    /// Does this filter ask for anything beyond the time bounds?
     ///
-    /// Only a request that does not needs no scan: a time bound alone is an
+    /// Only a request that does not needs no scan: time bounds alone are an
     /// index range, and counting it reads the index alone.
     pub fn has_row_filter(&self) -> bool {
         self.device_text().is_some()
@@ -82,8 +82,12 @@ impl HistoryFilter {
 /// One history request.
 #[derive(Debug, Clone)]
 pub struct HistoryQuery {
-    /// The time bound, or `None` for the whole database.
+    /// The earliest time to include, or `None` for no start.
     pub lower: Option<LowerBound>,
+    /// The earliest time *not* to include: a record stamped exactly on it is
+    /// left out, so that two windows that share an edge never share a record.
+    /// `None` means no end.
+    pub upper: Option<DateTime<Utc>>,
     pub filter: HistoryFilter,
     /// Most records to return, at most [`MAX_HISTORY_ROWS`].
     pub limit: usize,

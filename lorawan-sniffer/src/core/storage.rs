@@ -388,6 +388,9 @@ const RANGE_FROM: &str = "FROM messages INDEXED BY idx_messages_timestamp";
 
 const AFTER_SQL: &str = "timestamp > :bound";
 const FROM_SQL: &str = "timestamp >= :bound";
+/// The upper bound is exclusive: a record stamped on it belongs to the next
+/// window.
+const BEFORE_SQL: &str = "timestamp < :before";
 
 /// Device text: a substring of the DevAddr or the DevEUI, or a label match.
 ///
@@ -778,7 +781,7 @@ impl Storage {
     /// Two shapes, both in one read transaction, so the labels, the counts and
     /// the rows come from one snapshot:
     ///
-    /// - **Time bound only.**  The count is an index count, the rows are the
+    /// - **Time bounds only.**  The count is an index count, the rows are the
     ///   first `limit` of the index range.  The malformed count is a range
     ///   scan that reads the table, so it is computed only where a scan may
     ///   run, and is `None` otherwise.
@@ -1397,6 +1400,9 @@ impl Conditions {
             Some(LowerBound::From(at)) => c.add(FROM_SQL, [(":bound", at.to_rfc3339().into())]),
             None => {}
         }
+        if let Some(at) = q.upper {
+            c.add(BEFORE_SQL, [(":before", at.to_rfc3339().into())]);
+        }
         if let (Some(text), Some(ids)) = (q.filter.device_text(), label_ids) {
             c.add(
                 DEVICE_SQL,
@@ -1903,6 +1909,7 @@ mod tests {
     fn recent(s: &Storage, n: usize) -> Vec<MessageRecord> {
         let q = HistoryQuery {
             lower: None,
+            upper: None,
             filter: Default::default(),
             limit: n,
             newest: true,
@@ -1918,6 +1925,7 @@ mod tests {
     fn since(s: &Storage, at: DateTime<Utc>, n: usize) -> Vec<MessageRecord> {
         let q = HistoryQuery {
             lower: Some(LowerBound::After(at)),
+            upper: None,
             filter: Default::default(),
             limit: n,
             newest: false,

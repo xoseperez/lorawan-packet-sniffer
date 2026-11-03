@@ -216,6 +216,28 @@ details summary:focus-visible {
 /* Holds the 8-digit short EUI; a full EUI (shown only when two gateways
    collide) is clipped here but visible in the opened list and the title. */
 .filter-gateway { width: 100px; }
+/* Wide enough for a chosen day in full ("2026-11-01") with room for a wider
+   system font; the header has about 35 px to spare at 800 px. */
+.filter-time    { width: 110px; }
+
+/* The calendar is the browser's own date picker. Its input lies exactly over
+   the time select, invisible and out of the pointer's way, so the popup opens
+   where the select is. If the browser will not open it, the input is shown in
+   the select's place (same box) to be typed into. */
+.filter-time-wrap { position: relative; display: inline-block; }
+.filter-time-wrap > select { display: block; }
+.filter-bar input.day-picker {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  opacity: 0;
+  pointer-events: none;
+}
+.filter-time-wrap.picking > select { visibility: hidden; }
+.filter-bar .filter-time-wrap.picking input.day-picker {
+  opacity: 1;
+  pointer-events: auto;
+}
 
 .filter-clear { color: var(--text-muted); }
 .filter-clear:hover { background: var(--bg-hover); }

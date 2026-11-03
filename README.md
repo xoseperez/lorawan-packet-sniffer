@@ -21,7 +21,7 @@ Version 2 is a rewrite in Rust. The original version 1 (v0.x releases) lives on 
 - **Self-forwarding protection** — refuses to start with an upstream that is its own port, and cuts any packet loop that still happens at runtime
 - **Persistent storage** — SQLite database with configurable retention; databases from earlier versions are upgraded in place
 - **Real-time WebUI** — React 19 SPA with WebSocket feed, live/pause toggle, filters that search the database (device or label, gateway, MType, status, time range), sortable table, column visibility, color-coded signal quality (SNR thresholds are spreading-factor-aware), dark/light theme, CSV export
-- **History from the database** — a time range loads the newest 5,000 matching records from the database, with the exact count of what matches; live records are merged in, and every reconnect reloads the range so the table has no hole (see [WebUI history](#webui-history))
+- **History from the database** — a time range, or one selected day, loads the newest 5,000 matching records from the database, with the exact count of what matches; live records are merged in, and every reconnect reloads the range so the table has no hole (see [WebUI history](#webui-history))
 - **Device labels** — give a device a name from the WebUI ("Qingping T&H Havana" instead of `00E8A80B`); the label is stored in the database, shown on every row of that device, found by the device filter, included in the CSV export, and updated in every open WebUI at once
 - **Optional login** — one shared token in `sniffer.toml` puts a login page in front of the WebUI and the whole API; a browser stays logged in until it is closed, scripts send the token as a Bearer header, and a limit on wrong tokens keeps guessing out (see [WebUI login](#webui-login)). Off by default
 - **Single binary** — React frontend is embedded at compile time; no separate web server needed
@@ -591,22 +591,23 @@ Anyone who can open the WebUI can add, change and remove labels, just as they ca
 
 ## WebUI history
 
-The time selector (Last 5m, 15m, 1h, 24h, All time) and the filters ask the sniffer's database, not just the rows the page already holds.
+The time selector (Last 5m, 15m, 1h, 24h, Select day) and the filters ask the sniffer's database, not just the rows the page already holds.
 
 ### What the table loads
 
-- **A load** happens when the page opens, when the time range changes and when any filter changes. The WebUI asks for the newest records that fall in the range and match every filter, up to **5,000**, and replaces the table's rows with them. "All time" loads the newest 5,000 in the database.
+- **A load** happens when the page opens, when the time range changes and when any filter changes. The WebUI asks for the newest records that fall in the range and match every filter, up to **5,000**, and replaces the table's rows with them.
+- **Select day** opens the browser's own date picker to choose one day; days after today cannot be picked. A day runs from local midnight to the next local midnight in the browser's time zone, the same clock the Time column uses, so a daylight-saving day is 23 or 25 hours. The chosen day shows as its full date (`2026-11-01`) in the selector, and "Select day" stays in the list to pick another; closing the picker without a date changes nothing. The other filters apply to the day as they do to any range. A day with more than 5,000 matching records loads the newest 5,000 of that day (see [The strip and the footer](#the-strip-and-the-footer)). The chosen day is kept across reloads, like the filters. "All time" is gone; a browser that had it saved opens at "Last 5m". If the browser cannot open its picker, a date field appears in the selector's place to be typed into.
 - **Filters search the database.** A device that has been quiet for a day is found by its DevAddr, DevEUI or label even when its records lie beyond the newest 5,000 of the range. The server and the browser apply the same rules to a record, and one set of test vectors checks both.
 - **Label matching** folds case the way JavaScript's `toLowerCase` does, so `ÑANDÚ` finds `ñandú`. A DevAddr or DevEUI is matched as text, in any case, colons included. A label change reloads the table when the device box is not empty: rows that now match appear and rows that no longer match leave.
 - **Typing** in the device box loads after a pause of about 0.4 s, not on every key. A change to anything else loads at once.
 - **While a load runs,** the table keeps its rows and Matching reads "Loading…". A newer load cancels the older one and ignores its answer. A failed load keeps the rows and says why in the strip below the table.
-- **Live records** that match the filters are added to the loaded rows without duplicates, by `id`. A record that is in both is kept as the database holds it. Rows leave as they age out of the range, checked every 5 s even when nothing arrives. The table holds at most **10,000** rows, the oldest dropped first. A row that retention deletes from the database stays until it leaves the range or the next load.
+- **Live records** that match the filters are added to the loaded rows without duplicates, by `id`. A record that is in both is kept as the database holds it. Rows leave as they age out of the range, checked every 5 s even when nothing arrives. A past day receives no live records, because they all fall after it; today receives them until midnight, and after midnight the view stays on that day. The table holds at most **10,000** rows, the oldest dropped first. A row that retention deletes from the database stays until it leaves the range or the next load.
 - **Pause.** While paused, live records wait in a buffer. Changing the range or a filter still loads and replaces the rows. A reload the WebUI starts by itself (after a reconnect, or a retry, see below) is held until you resume, then applied together with the live records received after it was sent. A buffer that overflowed (10,000 records) is replaced by a full load on resume.
 - **The CSV export** (⚙ Settings → Export CSV) covers the rows shown.
 
 ### The strip and the footer
 
-When more records match than were loaded, a strip between the table and the footer says so, for example **Showing the newest 5,000 of 12,345 matching messages in the last 24 h**. The range reads "the last 5 min", "the last 15 min", "the last hour", "the last 24 h" or "the database". There is no "Load older": a narrower range or a more specific filter shows the rest.
+When more records match than were loaded, a strip between the table and the footer says so, for example **Showing the newest 5,000 of 12,345 matching messages in the last 24 h**. The range reads "the last 5 min", "the last 15 min", "the last hour" or "the last 24 h", and for a selected day "on 2026-11-01" (**Showing the newest 5,000 of 6,120 matching messages on 2026-11-01**). There is no "Load older": a narrower range or a more specific filter shows the rest.
 
 The strip also carries these messages when they apply. It shows them in this order, joined on one line, and the full text is in its tooltip:
 
@@ -657,7 +658,7 @@ History reads use a second, read-only connection, so a long scan never holds up 
 
 ### How long a load takes
 
-On a development machine, with 1,000,000 records over 7 days, the newest 5,000 of a range with their count took about 150 ms, and a filtered "Last 7 days" load 0.3 to 0.6 s. With 4,300,000 records over 30 days (the default retention), a device search over all time took about 1.5 to 1.7 s, because text cannot use an index and the whole range is read. The record writer was not delayed: its longest wait for the database lock while history queries ran was under 0.01 ms.
+On a development machine, with 1,000,000 records over 7 days, the newest 5,000 of a range with their count took about 150 ms, and a filtered "Last 7 days" load 0.3 to 0.6 s. With 4,300,000 records over 30 days (the default retention), a device search over all 30 days took about 1.5 to 1.7 s, because text cannot use an index and the whole range is read. The record writer was not delayed: its longest wait for the database lock while history queries ran was under 0.01 ms.
 
 On a RAK7391 (Compute Module 4, eMMC), with the same 1,000,000 records over 7 days: the last 24 h load in about 0.3 s; "Last 7 days" with malformed rows hidden in about 1.7 s; a device search over 7 days in about 2.5 s; every filter combined in about 4 s. A single gateway's database is usually several times smaller, and the times shrink with it. The writer still never waits for the lock, but while a long query reads the eMMC a single write can take a second or two; at one gateway's traffic that only delays saving by that much.
 
@@ -891,7 +892,8 @@ Every request, including the WebSockets, must pass the [Host check](#host-check)
 | `limit` | `500` | Most records to return, brought into the range 1 to 5,000. A value that is not a number gets axum's own plain-text `400` (`Failed to deserialize query string: …`) |
 | `since` | none | Return records strictly after this RFC 3339 time. A value that cannot be read is ignored |
 | `from` | none | Return records at or after this RFC 3339 time. A value that cannot be read gets `400`, and so does `from` together with a `since` that can be read (an unreadable `since` is still ignored) |
-| `newest` | `true` without a time bound, `false` with one | `true` keeps the newest `limit` records of the range, `false` the oldest `limit`. The answer is oldest first either way. The default follows the bound that was read, so `since=garbage` still returns the newest records. Any other value gets `400` |
+| `before` | none | Return records strictly before this RFC 3339 time: a record stamped exactly on it is left out. With `from` it closes a window, so `from=T1&before=T2` followed by `from=T2&before=T3` never returns a record twice. It also works with `since`, or alone, which returns the newest records before it. The counts (`X-Total-Count`, `X-Malformed-Count`) cover only the window. A value that cannot be read gets `400`, and so does a `before` that is not later than `from`, or than a `since` that can be read |
+| `newest` | `true` without `since` or `from`, `false` with one | `true` keeps the newest `limit` records of the range, `false` the oldest `limit`. The answer is oldest first either way. The default follows the bound that was read, so `since=garbage` still returns the newest records. Any other value gets `400` |
 | `count` | `false` | `true` adds `X-Total-Count` and `X-Malformed-Count`. Any other value gets `400` |
 | `settle` | `false` | `true` waits for the storage writer first and adds `X-History-Settled`. Any other value gets `400` |
 | `device` | any | Text to find in the DevAddr, the DevEUI or the label of the record's identifier, in any case (labels use Unicode case folding). Used as given, not trimmed. Empty means any |
@@ -906,7 +908,7 @@ Every filter must match (they are combined with AND), by the same rules the WebU
 
 | Header | Sent | Value |
 |---|---|---|
-| `X-Total-Count` | with `count=true` | How many records match the time bound and every filter, not only the ones returned. With `malformed=exclude`, malformed records are not counted |
+| `X-Total-Count` | with `count=true` | How many records match the time range and every filter, not only the ones returned. With `malformed=exclude`, malformed records are not counted |
 | `X-Malformed-Count` | with `count=true` | How many malformed records match every filter except `malformed`, whether they were returned or left out. Left out when the sniffer cannot count them (the database is not in WAL mode) |
 | `X-History-Settled` | with `settle=true` | `true` when the storage writer had processed everything queued before the request, `false` when the 5 s wait ran out, or the storage writer had stopped, and the answer comes from what is saved |
 | `X-Storage-Write-Failures` | on every response of this route | How many records the database has failed to store since the sniffer started. It is 0 again after a restart |
@@ -918,7 +920,7 @@ Every filter must match (they are combined with AND), by the same rules the WebU
 | Status | Meaning |
 |---|---|
 | `200` | The array, with the headers above |
-| `400` | `{"error": "<message>"}`, for example `{"error": "use either from or since, not both"}`, for a bad `from`, `from` together with `since`, or a bad `newest`, `count`, `settle`, `mtype`, `status` or `malformed` |
+| `400` | `{"error": "<message>"}`, for example `{"error": "use either from or since, not both"}`, for a bad `from` or `before`, `from` together with `since`, a `before` that is not later than the lower bound, or a bad `newest`, `count`, `settle`, `mtype`, `status` or `malformed`. The two messages of `before` are `before must be an RFC 3339 timestamp, such as 2026-10-30T12:00:00.000Z` and `before must be later than from` (`… than since` when `since` sets the lower bound) |
 | `503` | `{"error": "<message>", "code": "no_wal"}`: the database is not in WAL mode and the request has a filter other than the time range, `malformed=exclude` included (`history filters need the database in WAL mode; see the log`). Or `{"error": "<message>", "code": "busy"}`: the database stayed locked for more than 1 s (`the database is busy; try again`). Retrying helps with `busy`, not with `no_wal` |
 | `500` | The database failed, with no body, as before |
 
@@ -947,7 +949,15 @@ curl -s -D - -o /dev/null -G http://localhost:8888/api/messages \
 curl -s -D - -o /dev/null -G http://localhost:8888/api/messages \
      --data-urlencode "from=$FROM" --data-urlencode newest=true --data-urlencode limit=1 \
      --data-urlencode count=true --data-urlencode settle=true
+
+# one local day, here 25 October 2026 in Madrid (25 hours, the day the clocks go back):
+# from is its local midnight (inclusive), before the next one (exclusive)
+curl -s -D - -o day.json -G http://localhost:8888/api/messages \
+     --data-urlencode from=2026-10-24T22:00:00.000Z --data-urlencode before=2026-10-25T23:00:00.000Z \
+     --data-urlencode newest=true --data-urlencode limit=5000 --data-urlencode count=true
 ```
+
+The WebUI computes a day's two bounds from local midnight in the browser's time zone; the sniffer only sees the two instants.
 
 **`/ws` closes clients that fall behind.** A `/ws` client that falls behind (more than 512 records queued for it), or whose connection stops accepting data for 10 s, is closed with code 1013 ("try again later", reason `fell behind; reconnect and reload`) instead of silently missing records. The record frames are unchanged. A client that reconnects should reload what it shows from `/api/messages` with `settle=true`, sent after its new socket has opened, and should wait longer between attempts after each drop, as the WebUI does.
 
@@ -1120,6 +1130,7 @@ These two `location` blocks replace the ones in set-up A's `server` block. **Set
 - **Some noise stays visible.** The checks only catch frames that cannot be valid LoRaWAN. Non-LoRaWAN LoRa traffic with a good CRC, a first byte that reads as a valid header and a length that happens to fit looks like real traffic. The sniffer cannot check the MIC, which needs the session keys.
 - **Old rows have no `mhdr` reason.** The first byte is not stored, so when the stored rows are checked after the upgrade only `crc` and `length` can be applied.
 - **History loads at most 5,000 records.** A range or filter with more matches shows the newest 5,000 and a notice that counts the rest; there is no paging, and the CSV export covers the rows shown. Narrow the range or add a filter to see the rest.
+- **The calendar is the browser's.** "Select day" opens the browser's own date picker, so its look and language follow the browser and its locale, not the WebUI.
 - **History filters need the database in WAL mode.** Without it only the time range works, and the default view may show fewer than 5,000 rows (see [Databases without WAL](#databases-without-wal)).
 - **A reload has no hole only once the live connection has opened,** and not for a record the sniffer never stored: the storage queue was full, or the database failed to write it. Such a record is shown live until the next load that replaces the rows (see [After a reconnect](#after-a-reconnect-no-hole)).
 - **Many WebUI pages at once.** The sniffer is meant for one or two people watching at a time. History queries run one at a time, every reconnect reloads up to 5,000 records, and at most three large responses are sent at once. As a stress test, 10 pages reloading "Last 24h" together after a restart, on 1,000,000 records, were all answered within 0.15 s, with the sniffer peaking at about 52 MB; most of that was the label list each page receives, at the 10,000-label maximum (about 28 MB with 100 labels). Pages on slow links hold their place until they have downloaded their answer, so with several of those open, other pages' loads wait; past 30 s the WebUI shows an error and the next load tries again.

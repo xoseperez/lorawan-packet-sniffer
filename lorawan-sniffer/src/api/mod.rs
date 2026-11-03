@@ -117,7 +117,8 @@
 //! |------------|---------|
 //! | `since`    | Only records strictly after this RFC 3339 time; the oldest `limit` of them.  Unparsable: ignored. |
 //! | `from`     | Only records at or after this RFC 3339 time.  Unparsable, or together with a valid `since`: 400. |
-//! | `newest`   | `true` keeps the newest `limit` matches, `false` the oldest.  Default: `false` when a bound was understood, `true` otherwise. |
+//! | `before`   | Only records strictly before this RFC 3339 time: a record stamped exactly on it is left out.  With `from` or `since` it closes a window, and `from=T1&before=T2` followed by `from=T2&before=T3` never returns a record twice.  Unparsable, or not later than `from` (or than a valid `since`): 400. |
+//! | `newest`   | `true` keeps the newest `limit` matches, `false` the oldest.  Default: `false` when a lower bound (`since` or `from`) was understood, `true` otherwise, so `before` alone returns the newest records before it. |
 //! | `limit`    | Most records, 1 to 5,000, default 500; clamped.  Not a number: axum's own 400. |
 //! | `device`   | Text found in the DevAddr, the DevEUI or the label of the record's identifier, case-insensitively. |
 //! | `mtype`    | Comma-separated type names (`UnconfirmedDataUp,JoinRequest`).  Unknown name: 400. |

@@ -128,6 +128,7 @@ pub(super) fn flag() -> Arc<AtomicBool> {
 fn all() -> HistoryQuery {
     HistoryQuery {
         lower: None,
+        upper: None,
         filter: HistoryFilter::default(),
         limit: MAX_HISTORY_ROWS,
         newest: true,
@@ -298,6 +299,410 @@ fn bounds_compare_correctly_with_every_stored_fraction_length() {
             );
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// The upper bound
+// ---------------------------------------------------------------------------
+
+/// The records from `first` seconds after [`t0`] up to, not including, `end`
+/// seconds after it.
+fn window(first: i64, end: i64) -> HistoryQuery {
+    HistoryQuery {
+        lower: Some(LowerBound::From(seconds(first))),
+        upper: Some(seconds(end)),
+        ..all()
+    }
+}
+
+#[test]
+fn the_upper_bound_leaves_out_the_records_stamped_on_it_and_after_it() {
+    on_both_backends(|s| {
+        ten_records(s);
+
+        let before_6 = HistoryQuery {
+            upper: Some(seconds(6)),
+            ..all()
+        };
+        let page = run(s, &before_6);
+        assert_eq!(ids(&page), ["r0", "r1", "r2", "r3", "r4", "r5"]);
+        assert_eq!(page.total, Some(6));
+        assert_eq!(page.malformed, Some(0));
+
+        // With a lower bound it closes a window, either kind of lower bound.
+        assert_eq!(ids(&run(s, &window(2, 6))), ["r2", "r3", "r4", "r5"]);
+        let after = HistoryQuery {
+            lower: Some(LowerBound::After(seconds(2))),
+            ..before_6
+        };
+        let page = run(s, &after);
+        assert_eq!(ids(&page), ["r3", "r4", "r5"]);
+        assert_eq!(page.total, Some(3));
+
+        // A bound before everything, on the first record, and after everything.
+        for (end, total) in [(-1, 0), (0, 0), (1, 1), (10, 10), (11, 10), (1_000, 10)] {
+            let q = HistoryQuery {
+                upper: Some(seconds(end)),
+                ..all()
+            };
+            let page = run(s, &q);
+            assert_eq!(page.total, Some(total), "before {end}");
+            assert_eq!(page.records.len() as u64, total, "before {end}");
+        }
+    });
+}
+
+#[test]
+fn an_empty_window_has_no_rows_and_counts_zero() {
+    on_both_backends(|s| {
+        ten_records(s);
+        for filter in [
+            HistoryFilter::default(),
+            HistoryFilter {
+                hide_malformed: true,
+                ..Default::default()
+            },
+        ] {
+            // Between two records, and where the bounds meet.
+            for (first, end) in [(3, 3), (20, 30)] {
+                let q = HistoryQuery {
+                    filter: filter.clone(),
+                    ..window(first, end)
+                };
+                let page = run(s, &q);
+                assert!(page.records.is_empty(), "{first}..{end}");
+                assert_eq!(page.total, Some(0), "{first}..{end}");
+                assert_eq!(page.malformed, Some(0), "{first}..{end}");
+            }
+        }
+    });
+}
+
+#[test]
+fn the_upper_bound_applies_to_the_total_and_to_the_malformed_count() {
+    on_both_backends(|s| {
+        // v1@1 m1@2 m2@3 m3@4 v2@5; m1 and m2 carry gateway 1, m3 gateway 2.
+        records_with_malformed(s);
+
+        // Time bounds only: the counts come from the index and a range scan.
+        let shown = run(s, &window(0, 4));
+        assert_eq!(ids(&shown), ["v1", "m1", "m2"]);
+        assert_eq!(shown.total, Some(3));
+        assert_eq!(shown.malformed, Some(2));
+
+        // Row filters: one scan counts both.  The malformed number is the
+        // same whether the box hides them or not.
+        for hide in [false, true] {
+            let q = HistoryQuery {
+                filter: HistoryFilter {
+                    hide_malformed: hide,
+                    status: Some(Status::Forwarded),
+                    ..Default::default()
+                },
+                ..window(0, 4)
+            };
+            let page = run(s, &q);
+            assert_eq!(
+                ids(&page),
+                if hide {
+                    vec!["v1"]
+                } else {
+                    vec!["v1", "m1", "m2"]
+                },
+                "hide={hide}"
+            );
+            assert_eq!(page.total, Some(if hide { 1 } else { 3 }), "hide={hide}");
+            assert_eq!(page.malformed, Some(2), "hide={hide}");
+        }
+
+        // m3 is the only record of gateway 2 below 5, and it sits at 4.
+        for (end, total) in [(4, 0), (5, 1)] {
+            let q = HistoryQuery {
+                filter: HistoryFilter {
+                    gateway: Some(G2.to_string()),
+                    ..Default::default()
+                },
+                ..window(0, end)
+            };
+            let page = run(s, &q);
+            assert_eq!(page.total, Some(total), "before {end}");
+            assert_eq!(page.malformed, Some(total), "before {end}");
+        }
+    });
+}
+
+#[test]
+fn the_upper_bound_applies_to_the_device_text_and_to_labels() {
+    on_both_backends(|s| {
+        mixed_records(s);
+        label(s, "0A000001", "kitchen");
+        // 0A000001 has r1 and r4; the window keeps only r1.
+        let q = HistoryQuery {
+            filter: HistoryFilter {
+                device: Some("KITCHEN".to_string()),
+                ..Default::default()
+            },
+            ..window(0, 4)
+        };
+        let page = run(s, &q);
+        assert_eq!(ids(&page), ["r1"]);
+        assert_eq!(page.total, Some(1));
+        let q = HistoryQuery {
+            filter: HistoryFilter {
+                device: Some("a00000".to_string()),
+                mtypes: vec![MType::UnconfirmedDataUp],
+                ..Default::default()
+            },
+            ..window(2, 6)
+        };
+        assert_eq!(ids(&run(s, &q)), ["r4"]);
+    });
+}
+
+#[test]
+fn the_newest_rows_of_a_window_are_the_newest_of_the_window() {
+    on_both_backends(|s| {
+        store(s, (0..30).map(|n| rec(&format!("r{n:02}"), n)));
+        // The window holds 15 rows, r05 to r19, more than the limit, and 10
+        // newer rows lie outside it.
+        for filter in [
+            HistoryFilter::default(),
+            HistoryFilter {
+                status: Some(Status::Forwarded),
+                ..Default::default()
+            },
+        ] {
+            let newest = HistoryQuery {
+                filter: filter.clone(),
+                limit: 4,
+                ..window(5, 20)
+            };
+            let page = run(s, &newest);
+            assert_eq!(ids(&page), ["r16", "r17", "r18", "r19"], "{filter:?}");
+            assert_eq!(page.total, Some(15), "{filter:?}");
+
+            let oldest = HistoryQuery {
+                newest: false,
+                ..newest
+            };
+            let page = run(s, &oldest);
+            assert_eq!(ids(&page), ["r05", "r06", "r07", "r08"], "{filter:?}");
+            assert_eq!(page.total, Some(15), "{filter:?}");
+        }
+
+        // With only the upper bound, the newest rows before it.
+        let q = HistoryQuery {
+            upper: Some(seconds(20)),
+            limit: 3,
+            ..all()
+        };
+        let page = run(s, &q);
+        assert_eq!(ids(&page), ["r17", "r18", "r19"]);
+        assert_eq!(page.total, Some(20));
+    });
+}
+
+#[test]
+fn the_counts_of_a_window_equal_direct_counts() {
+    on_both_backends(|s| {
+        records_with_malformed(s);
+        bulk(s, 100, 500);
+        store(
+            s,
+            (0..40).map(|n| malformed_rec(&format!("late{n}"), 700 + n, Malformed::Length)),
+        );
+        let (first, end) = (seconds(3), seconds(650));
+        let q = HistoryQuery {
+            limit: 10,
+            ..window(3, 650)
+        };
+        let page = run(s, &q);
+
+        let conn = s.conn.lock().unwrap();
+        let direct = |extra: &str| -> u64 {
+            conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM messages WHERE timestamp >= ?1 AND timestamp < ?2{extra}"
+                ),
+                params![first.to_rfc3339(), end.to_rfc3339()],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap() as u64
+        };
+        assert_eq!(page.total, Some(direct("")));
+        assert_eq!(page.total, Some(503));
+        assert_eq!(page.malformed, Some(direct(" AND malformed IS NOT NULL")));
+        assert_eq!(page.malformed, Some(2));
+        assert_eq!(page.records.len(), 10);
+        assert_eq!(page.records.last().unwrap().id, "bulk-599");
+    });
+}
+
+/// The same instant spelled with 0, 3, 6 and 9 fraction digits: the forms
+/// `to_rfc3339` writes.  `base` is whole seconds after [`t0`].
+fn spellings(base: i64, prefix: &str, nanos: [u32; 4]) -> Vec<(String, DateTime<Utc>)> {
+    ["whole", "milli", "micro", "nano"]
+        .iter()
+        .zip(nanos)
+        .map(|(form, nanos)| (format!("{prefix}-{form}"), moment(base, nanos)))
+        .collect()
+}
+
+#[test]
+fn a_whole_second_bound_splits_the_stored_fraction_lengths_at_the_second() {
+    on_both_backends(|s| {
+        // A bound on 10:00:00 against records of the second before it and of
+        // the second that starts at it, each spelled with 0, 3, 6 and 9
+        // fraction digits.  The first second is wholly before the bound, the
+        // second wholly at or after it.
+        let before_the_second = spellings(-1, "prev", [0, 999_000_000, 999_999_000, 999_999_999]);
+        let in_the_second = spellings(0, "at", [0, 500_000_000, 500_001_000, 500_000_001]);
+        let after_the_second = spellings(1, "next", [0, 1_000_000, 1_000, 1]);
+        let stamps: Vec<_> = before_the_second
+            .iter()
+            .chain(&in_the_second)
+            .chain(&after_the_second)
+            .cloned()
+            .collect();
+        store(
+            s,
+            stamps
+                .iter()
+                .map(|(id, at)| edit(rec(id, 0), |r| r.timestamp = *at)),
+        );
+        let stored: Vec<(String, String)> = s
+            .conn
+            .lock()
+            .unwrap()
+            .prepare("SELECT id, timestamp FROM messages ORDER BY timestamp")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let text = |id: &str| {
+            stored
+                .iter()
+                .find(|(i, _)| i == id)
+                .map(|(_, t)| t.as_str())
+                .unwrap()
+        };
+        assert_eq!(text("prev-whole"), "2026-03-01T09:59:59+00:00");
+        assert_eq!(text("prev-milli"), "2026-03-01T09:59:59.999+00:00");
+        assert_eq!(text("prev-micro"), "2026-03-01T09:59:59.999999+00:00");
+        assert_eq!(text("prev-nano"), "2026-03-01T09:59:59.999999999+00:00");
+        assert_eq!(text("at-whole"), "2026-03-01T10:00:00+00:00");
+        assert_eq!(text("at-milli"), "2026-03-01T10:00:00.500+00:00");
+        assert_eq!(text("at-micro"), "2026-03-01T10:00:00.500001+00:00");
+        assert_eq!(text("at-nano"), "2026-03-01T10:00:00.500000001+00:00");
+
+        let names = |list: &[(String, DateTime<Utc>)]| -> Vec<String> {
+            list.iter().map(|(id, _)| id.clone()).collect()
+        };
+        let sorted_ids = |q: &HistoryQuery| -> Vec<String> {
+            let mut got: Vec<String> = run(s, q).records.into_iter().map(|r| r.id).collect();
+            got.sort();
+            got
+        };
+        let sorted = |mut list: Vec<String>| {
+            list.sort();
+            list
+        };
+
+        // Everything before the bound: the second before it, every spelling,
+        // and nothing from the second that starts at it.
+        let before = HistoryQuery {
+            upper: Some(moment(0, 0)),
+            ..all()
+        };
+        let page = run(s, &before);
+        assert_eq!(sorted_ids(&before), sorted(names(&before_the_second)));
+        assert_eq!(page.total, Some(4));
+
+        // The two windows that meet at the bound share no record and lose none.
+        let earlier = HistoryQuery {
+            lower: Some(LowerBound::From(moment(-1, 0))),
+            upper: Some(moment(0, 0)),
+            ..all()
+        };
+        let later = HistoryQuery {
+            lower: Some(LowerBound::From(moment(0, 0))),
+            upper: Some(moment(1, 0)),
+            ..all()
+        };
+        assert_eq!(sorted_ids(&earlier), sorted(names(&before_the_second)));
+        assert_eq!(sorted_ids(&later), sorted(names(&in_the_second)));
+        for (what, q) in [("earlier", &earlier), ("later", &later)] {
+            assert_eq!(run(s, q).total, Some(4), "{what}");
+            let filtered = HistoryQuery {
+                filter: HistoryFilter {
+                    status: Some(Status::Forwarded),
+                    ..Default::default()
+                },
+                ..q.clone()
+            };
+            assert_eq!(
+                sorted_ids(&filtered),
+                sorted_ids(q),
+                "{what}, with a filter"
+            );
+            assert_eq!(run(s, &filtered).total, Some(4), "{what}, with a filter");
+        }
+    });
+}
+
+#[test]
+fn an_upper_bound_splits_the_list_at_its_own_position_for_every_fraction_length() {
+    on_both_backends(|s| {
+        // The same five instants as the lower bound test: whole second,
+        // milliseconds, microseconds and nanoseconds, in time order.
+        let stamps = [
+            ("whole", moment(0, 0)),
+            ("milli", moment(0, 500_000_000)),
+            ("micro", moment(0, 500_001_000)),
+            ("nano", moment(0, 500_000_001)),
+            ("next", moment(1, 0)),
+        ];
+        store(
+            s,
+            stamps
+                .iter()
+                .map(|(id, at)| edit(rec(id, 0), |r| r.timestamp = *at)),
+        );
+        let before = |bound: DateTime<Utc>| {
+            let q = HistoryQuery {
+                upper: Some(bound),
+                newest: false,
+                ..all()
+            };
+            run(s, &q)
+                .records
+                .into_iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>()
+        };
+        let order = ["whole", "milli", "nano", "micro", "next"];
+        for (k, id) in order.iter().enumerate() {
+            let at = stamps.iter().find(|(i, _)| i == id).unwrap().1;
+            assert_eq!(before(at), &order[..k], "before {id}");
+        }
+    });
+}
+
+#[test]
+fn without_wal_a_window_is_answered_like_any_time_bound() {
+    let tmp = TempDb::new("history-nowal-window");
+    let s = Storage::open_without_wal(&tmp.path()).unwrap();
+    records_with_malformed(&s);
+
+    let q = HistoryQuery {
+        newest: false,
+        ..window(2, 5)
+    };
+    let page = run(&s, &q);
+    assert_eq!(ids(&page), ["m1", "m2", "m3"]);
+    assert_eq!(page.total, Some(3));
+    assert_eq!(page.malformed, None);
 }
 
 #[test]
@@ -1254,6 +1659,30 @@ fn every_shape() -> Vec<(&'static str, HistoryQuery)> {
             },
         ),
         (
+            "time window",
+            HistoryQuery {
+                lower: bound,
+                upper: Some(seconds(10)),
+                ..all()
+            },
+        ),
+        (
+            "time window, after",
+            HistoryQuery {
+                lower: Some(LowerBound::After(seconds(0))),
+                upper: Some(seconds(10)),
+                newest: false,
+                ..all()
+            },
+        ),
+        (
+            "before only",
+            HistoryQuery {
+                upper: Some(seconds(10)),
+                ..all()
+            },
+        ),
+        (
             "time only, after",
             HistoryQuery {
                 lower: Some(LowerBound::After(seconds(0))),
@@ -1279,6 +1708,15 @@ fn every_shape() -> Vec<(&'static str, HistoryQuery)> {
         "everything in a range",
         HistoryQuery {
             lower: bound,
+            filter: all_filters.clone(),
+            ..all()
+        },
+    ));
+    shapes.push((
+        "everything in a window",
+        HistoryQuery {
+            lower: bound,
+            upper: Some(seconds(10)),
             filter: all_filters,
             ..all()
         },
@@ -1308,7 +1746,7 @@ fn the_time_only_count_reads_an_index_alone() {
         let text = plan_text(&plan(&conn, &c.count_sql(), &c.bindings()));
         assert!(text.contains("COVERING INDEX"), "{name}: {text}");
         assert!(!text.contains("TEMP B-TREE"), "{name}: {text}");
-        if q.lower.is_some() {
+        if q.lower.is_some() || q.upper.is_some() {
             assert!(
                 text.contains("COVERING INDEX idx_messages_timestamp"),
                 "{name}: {text}"
@@ -1336,6 +1774,38 @@ fn the_time_only_malformed_count_is_a_range_search_that_reads_the_table() {
     );
     assert!(!text.contains("COVERING"), "{text}");
     assert!(!text.contains("TEMP B-TREE"), "{text}");
+}
+
+#[test]
+fn a_window_is_one_range_search_on_the_timestamp_index() {
+    let (_tmp, s) = planning_database();
+    let conn = s.reader.as_ref().unwrap().lock().unwrap();
+    for (name, q, searched) in [
+        ("window", window(0, 10), "(timestamp>? AND timestamp<?)"),
+        (
+            "before only",
+            HistoryQuery {
+                upper: Some(seconds(10)),
+                ..all()
+            },
+            "(timestamp<?)",
+        ),
+    ] {
+        let c = Conditions::new(&q, None);
+        let text = plan_text(&plan(&conn, &c.malformed_count_sql(), &c.bindings()));
+        assert!(
+            text.contains(&format!(
+                "SEARCH messages USING INDEX idx_messages_timestamp {searched}"
+            )),
+            "{name}: {text}"
+        );
+        assert!(!text.contains("TEMP B-TREE"), "{name}: {text}");
+        let text = plan_text(&plan(&conn, &c.count_sql(), &c.bindings()));
+        assert!(
+            text.contains(&format!("COVERING INDEX idx_messages_timestamp {searched}")),
+            "{name}: {text}"
+        );
+    }
 }
 
 #[test]

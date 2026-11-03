@@ -72,7 +72,7 @@ const NOW = Date.parse('2026-10-30T14:00:00.000Z');
 const BASE = Date.parse('2026-10-30T13:00:00.000Z');
 
 const DEFAULT_FILTERS = {
-  device: '', mtype: [], status: 'all', gateway: '', timePreset: 'all', showMalformed: false,
+  device: '', mtype: [], status: 'all', gateway: '', timePreset: '24h', day: null, showMalformed: false,
 };
 const fstate = (o = {}) => ({ ...DEFAULT_FILTERS, ...o });
 
@@ -96,7 +96,7 @@ function rec(id, sec, o = {}) {
 
 /** A filter that selects everything. */
 const ANY = {
-  device: '', mtypes: [], status: 'all', gateway: '', fromMs: null, hideMalformed: false,
+  device: '', mtypes: [], status: 'all', gateway: '', fromMs: null, untilMs: null, hideMalformed: false,
 };
 
 // ===========================================================================
@@ -128,6 +128,9 @@ test('vectors: the file is well formed', () => {
   assert.ok(records.some(r => r.mtype === 'Unknown' && !r.malformed), 'an Unknown record');
   assert.ok(records.some(r => r.status === 'Captured'), 'a Captured record');
   assert.ok(['crc', 'mhdr', 'length'].every(k => records.some(r => r.malformed === k)), 'every malformed kind');
+  assert.ok(cases.some(c => c.filter.before !== null && c.filter.from === null), 'a case with only an upper bound');
+  assert.ok(cases.some(c => c.filter.before !== null && c.filter.from !== null), 'a case with a window');
+  assert.ok(cases.some(c => c.filter.before !== null && c.expect.length === 0), 'a case with an upper bound and no match');
 });
 
 function vectorFilter(c) {
@@ -137,13 +140,20 @@ function vectorFilter(c) {
     status: c.filter.status,
     gateway: c.filter.gateway,
     fromMs: c.filter.from === null ? null : Date.parse(c.filter.from),
+    untilMs: c.filter.before === null ? null : Date.parse(c.filter.before),
     hideMalformed: c.filter.hideMalformed,
   };
 }
 
 for (const c of vectors.cases) {
   test(`vector: ${c.name}`, () => {
+    // Every case states both bounds, null when it has none.
+    assert.ok(c.filter.from === null || typeof c.filter.from === 'string', 'from is null or text');
+    assert.ok(c.filter.before === null || typeof c.filter.before === 'string', 'before is null or text');
     const f = vectorFilter(c);
+    if (f.fromMs !== null && f.untilMs !== null) {
+      assert.ok(f.untilMs > f.fromMs, 'a window ends after it starts (the server refuses the reverse)');
+    }
 
     // The query string the browser builds is the one in the file.
     assert.equal(H.historyParams(f), c.query);
@@ -159,8 +169,10 @@ for (const c of vectors.cases) {
     assert.equal(p.get('status') ?? 'all', f.status);
     assert.equal(p.get('gateway') ?? '', f.gateway);
     assert.equal(p.get('from'), c.filter.from);
+    assert.equal(p.get('before'), c.filter.before);
     assert.equal(p.get('malformed'), f.hideMalformed ? 'exclude' : null);
     if (f.fromMs !== null) assert.equal(new Date(f.fromMs).toISOString(), c.filter.from);
+    if (f.untilMs !== null) assert.equal(new Date(f.untilMs).toISOString(), c.filter.before);
 
     // The browser keeps exactly these records.
     const kept = vectors.records.filter(r => H.matchesFilter(r, f, vectors.labels));
@@ -237,10 +249,21 @@ for (const [preset, span] of Object.entries(PRESETS)) {
   });
 }
 
-test('presets: "all" has no lower bound and no from', () => {
-  const f = H.toHistoryFilter(fstate({ timePreset: 'all' }), NOW);
-  assert.equal(f.fromMs, null);
-  assert.equal(H.historyParams(f), 'malformed=exclude');
+test('presets: a saved range the selector no longer offers loads like the default span', () => {
+  // An older "all time", an unknown word, nothing, and a day that is not a day.
+  const unusable = [
+    { timePreset: 'all' },
+    { timePreset: 'week' },
+    { timePreset: undefined },
+    { timePreset: 'day', day: null },
+    { timePreset: 'day', day: 'tomorrow' },
+    { timePreset: 'day', day: '2026-02-30' },
+  ];
+  for (const state of unusable) {
+    const f = H.toHistoryFilter(fstate(state), NOW);
+    assert.equal(f.fromMs, NOW - PRESETS['5m'], JSON.stringify(state));
+    assert.equal(f.untilMs, null, JSON.stringify(state));
+  }
 });
 
 test('toHistoryFilter: carries every field of the filter bar', () => {
@@ -249,9 +272,348 @@ test('toHistoryFilter: carries every field of the filter bar', () => {
     NOW,
   );
   assert.deepEqual(f, {
-    device: 'Ab', mtypes: ['JoinRequest'], status: 'Blocked', gateway: 'GW', fromMs: null, hideMalformed: false,
+    device: 'Ab', mtypes: ['JoinRequest'], status: 'Blocked', gateway: 'GW',
+    fromMs: NOW - PRESETS['24h'], untilMs: null, hideMalformed: false,
   });
   assert.equal(H.toHistoryFilter(fstate({ showMalformed: false }), NOW).hideMalformed, true);
+});
+
+// ===========================================================================
+// Days
+// ===========================================================================
+
+/** Runs `fn` with the process time zone set to `tz`, then puts the old one back. */
+function withTimeZone(tz, fn) {
+  const saved = process.env.TZ;
+  process.env.TZ = tz;
+  try {
+    return fn();
+  } finally {
+    if (saved === undefined) delete process.env.TZ;
+    else process.env.TZ = saved;
+  }
+}
+
+const HOUR = 3600e3;
+const iso = ms => new Date(ms).toISOString();
+
+test('withTimeZone: the zone really changes and is restored', () => {
+  const before = new Date(2026, 6, 1).getTimezoneOffset();
+  assert.equal(withTimeZone('Europe/Madrid', () => new Date(2026, 6, 1).getTimezoneOffset()), -120);
+  assert.equal(withTimeZone('Europe/Madrid', () => new Date(2026, 0, 1).getTimezoneOffset()), -60);
+  assert.equal(withTimeZone('UTC', () => new Date(2026, 6, 1).getTimezoneOffset()), 0);
+  assert.equal(withTimeZone('Pacific/Auckland', () => new Date(2026, 6, 1).getTimezoneOffset()), -720);
+  assert.equal(new Date(2026, 6, 1).getTimezoneOffset(), before);
+});
+
+test('dayBounds: Europe/Madrid, a 23-hour day, a 25-hour day and an ordinary one', () => {
+  withTimeZone('Europe/Madrid', () => {
+    // Clocks go forward on 2026-03-29: the day is 23 hours long.
+    const spring = H.dayBounds('2026-03-29');
+    assert.equal(iso(spring.fromMs), '2026-03-28T23:00:00.000Z');
+    assert.equal(iso(spring.untilMs), '2026-03-29T22:00:00.000Z');
+    assert.equal(spring.untilMs - spring.fromMs, 23 * HOUR);
+
+    // Clocks go back on 2026-10-25: the day is 25 hours long.
+    const autumn = H.dayBounds('2026-10-25');
+    assert.equal(iso(autumn.fromMs), '2026-10-24T22:00:00.000Z');
+    assert.equal(iso(autumn.untilMs), '2026-10-25T23:00:00.000Z');
+    assert.equal(autumn.untilMs - autumn.fromMs, 25 * HOUR);
+
+    // The days around them are ordinary, and each starts where the last ended.
+    const before = H.dayBounds('2026-10-24');
+    const after = H.dayBounds('2026-10-26');
+    assert.equal(iso(before.fromMs), '2026-10-23T22:00:00.000Z');
+    assert.equal(before.untilMs, autumn.fromMs);
+    assert.equal(autumn.untilMs, after.fromMs);
+    assert.equal(after.untilMs - after.fromMs, 24 * HOUR);
+
+    const winter = H.dayBounds('2026-11-01');
+    assert.equal(iso(winter.fromMs), '2026-10-31T23:00:00.000Z');
+    assert.equal(iso(winter.untilMs), '2026-11-01T23:00:00.000Z');
+    const summer = H.dayBounds('2026-07-15');
+    assert.equal(iso(summer.fromMs), '2026-07-14T22:00:00.000Z');
+    assert.equal(summer.untilMs - summer.fromMs, 24 * HOUR);
+  });
+});
+
+test('dayBounds: UTC is midnight to midnight UTC, across month, year and leap day', () => {
+  withTimeZone('UTC', () => {
+    const day = H.dayBounds('2026-11-01');
+    assert.equal(iso(day.fromMs), '2026-11-01T00:00:00.000Z');
+    assert.equal(iso(day.untilMs), '2026-11-02T00:00:00.000Z');
+    assert.equal(iso(H.dayBounds('2026-12-31').untilMs), '2027-01-01T00:00:00.000Z');
+    assert.equal(iso(H.dayBounds('2026-01-31').untilMs), '2026-02-01T00:00:00.000Z');
+    assert.equal(iso(H.dayBounds('2028-02-29').untilMs), '2028-03-01T00:00:00.000Z');
+    assert.equal(iso(H.dayBounds('2028-02-29').fromMs), '2028-02-29T00:00:00.000Z');
+  });
+});
+
+test('dayBounds: a zone west of Greenwich, where the offset is negative', () => {
+  withTimeZone('America/Los_Angeles', () => {
+    // Clocks go back on 2026-11-01 at 02:00 local: 25 hours, from PDT to PST.
+    const day = H.dayBounds('2026-11-01');
+    assert.equal(iso(day.fromMs), '2026-11-01T07:00:00.000Z');
+    assert.equal(iso(day.untilMs), '2026-11-02T08:00:00.000Z');
+  });
+});
+
+test('dayBounds: refuses what is not a day', () => {
+  for (const bad of ['', 'tomorrow', '2026-02-30', '2026-13-01', '2026-1-5', '0002-11-02']) {
+    assert.throws(() => H.dayBounds(bad), RangeError, bad);
+  }
+});
+
+test('todayKey: the local date, just before and just after local midnight', () => {
+  withTimeZone('Europe/Madrid', () => {
+    // Winter: local midnight of 2 November is 23:00 UTC on the 1st.
+    assert.equal(H.todayKey(Date.parse('2026-11-01T22:59:59.999Z')), '2026-11-01');
+    assert.equal(H.todayKey(Date.parse('2026-11-01T23:00:00.000Z')), '2026-11-02');
+    // Summer: local midnight of 25 October is 22:00 UTC on the 24th.
+    assert.equal(H.todayKey(Date.parse('2026-10-24T21:59:59.999Z')), '2026-10-24');
+    assert.equal(H.todayKey(Date.parse('2026-10-24T22:00:00.000Z')), '2026-10-25');
+    // Late evening UTC is already the next day in Madrid, never the other way round at noon.
+    assert.equal(H.todayKey(Date.parse('2026-06-30T23:30:00.000Z')), '2026-07-01');
+    assert.equal(H.todayKey(Date.parse('2026-07-01T12:00:00.000Z')), '2026-07-01');
+  });
+  withTimeZone('UTC', () => {
+    assert.equal(H.todayKey(Date.parse('2026-11-01T23:59:59.999Z')), '2026-11-01');
+    assert.equal(H.todayKey(Date.parse('2026-11-02T00:00:00.000Z')), '2026-11-02');
+    assert.equal(H.todayKey(Date.parse('2026-01-05T09:00:00.000Z')), '2026-01-05', 'month and day are zero-padded');
+  });
+  withTimeZone('America/Los_Angeles', () => {
+    assert.equal(H.todayKey(Date.parse('2026-11-02T07:59:59.999Z')), '2026-11-01');
+    assert.equal(H.todayKey(Date.parse('2026-11-02T08:00:00.000Z')), '2026-11-02');
+  });
+});
+
+test('todayKey and dayBounds agree: now lies inside today', () => {
+  for (const tz of ['Europe/Madrid', 'UTC', 'America/Los_Angeles', 'Pacific/Auckland']) {
+    withTimeZone(tz, () => {
+      for (const now of ['2026-03-29T00:30:00Z', '2026-03-29T01:30:00Z', '2026-10-25T00:30:00Z', '2026-10-25T01:30:00Z',
+                         '2026-11-01T09:00:00Z', '2026-12-31T23:59:59Z']) {
+        const ms = Date.parse(now);
+        const { fromMs, untilMs } = H.dayBounds(H.todayKey(ms));
+        assert.ok(fromMs <= ms && ms < untilMs, `${tz} ${now}`);
+      }
+    });
+  }
+});
+
+test('pickDay: a day up to today is taken, a day to come and anything else is not', () => {
+  const today = '2026-11-02';
+  assert.equal(H.pickDay('2026-11-02', today), '2026-11-02', 'today');
+  assert.equal(H.pickDay('2026-11-01', today), '2026-11-01', 'yesterday');
+  assert.equal(H.pickDay('2026-10-25', today), '2026-10-25');
+  assert.equal(H.pickDay('2025-12-31', today), '2025-12-31', 'across a year end');
+  assert.equal(H.pickDay('2026-11-03', today), null, 'tomorrow');
+  assert.equal(H.pickDay('2027-01-01', today), null, 'next year');
+  assert.equal(H.pickDay('2026-12-01', '2026-11-30'), null, 'a later month');
+
+  for (const bad of ['', 'abc', '2026-1-5', '2026-11-1', '26-11-01', '2026/11/01', '2026-11-01T00:00',
+                     ' 2026-11-01', '2026-11-01 ', '20261101', '2026-11-01\n']) {
+    assert.equal(H.pickDay(bad, today), null, JSON.stringify(bad));
+  }
+  // A date that does not exist is not rolled over into the next month.
+  for (const impossible of ['2026-02-30', '2026-02-29', '2026-04-31', '2026-13-01', '2026-00-10', '2026-11-00', '2026-11-32']) {
+    assert.equal(H.pickDay(impossible, today), null, impossible);
+  }
+  assert.equal(H.pickDay('2028-02-29', '2028-03-01'), '2028-02-29', 'a leap day');
+  assert.equal(H.pickDay('2026-02-28', today), '2026-02-28');
+  // The year a date input has while it is still being typed.
+  assert.equal(H.pickDay('0002-11-02', today), null);
+  assert.equal(H.pickDay('0202-11-02', today), null);
+  assert.equal(H.pickDay('1969-12-31', today), null);
+  assert.equal(H.pickDay('1970-01-01', today), '1970-01-01');
+});
+
+test('pickDay: needs a real "today" too', () => {
+  assert.equal(H.pickDay('2026-11-01', ''), null);
+  assert.equal(H.pickDay('2026-11-01', 'today'), null);
+});
+
+test('normaliseFilters: a range the selector no longer offers becomes the default span', () => {
+  const kept = { device: 'ab', mtype: ['JoinRequest'], status: 'Blocked', gateway: 'GW', showMalformed: true };
+  for (const [name, state] of [
+    ['an older "all"', { timePreset: 'all', day: null }],
+    ['an older "all" without a day at all', { timePreset: 'all', day: undefined }],
+    ['an unknown word', { timePreset: 'week', day: null }],
+    ['no range', { timePreset: undefined, day: null }],
+    ['"all" with a day left over', { timePreset: 'all', day: '2026-11-01' }],
+  ]) {
+    const n = H.normaliseFilters(fstate({ ...kept, ...state }));
+    assert.deepEqual(n, fstate({ ...kept, timePreset: '5m', day: null }), name);
+  }
+});
+
+test('normaliseFilters: "day" needs a valid day, else it is the default span', () => {
+  for (const day of [null, undefined, '', 'junk', '2026-02-30', '2026-11-1', '0002-11-02']) {
+    const n = H.normaliseFilters(fstate({ timePreset: 'day', day }));
+    assert.equal(n.timePreset, '5m', String(day));
+    assert.equal(n.day, null, String(day));
+  }
+});
+
+test('normaliseFilters: a valid day is kept, a span carries no day', () => {
+  const day = fstate({ timePreset: 'day', day: '2026-10-25', device: 'ab' });
+  assert.equal(H.normaliseFilters(day), day, 'the same object when nothing changes');
+
+  for (const preset of ['5m', '15m', '1h', '24h']) {
+    const n = H.normaliseFilters(fstate({ timePreset: preset, day: '2026-10-25' }));
+    assert.equal(n.timePreset, preset);
+    assert.equal(n.day, null, `${preset} keeps no day`);
+  }
+
+  const plain = fstate({ timePreset: '1h' });
+  assert.equal(H.normaliseFilters(plain), plain, 'an ordinary state is returned as it is');
+  // A state saved before days existed has no `day` at all.
+  const old = { ...plain };
+  delete old.day;
+  assert.deepEqual(H.normaliseFilters(old), { ...plain, day: null });
+});
+
+test('normaliseFilters: the other fields are untouched', () => {
+  const stored = fstate({
+    device: 'Ab', mtype: ['JoinRequest'], status: 'Blocked', gateway: 'GW', showMalformed: true, timePreset: 'all',
+  });
+  const n = H.normaliseFilters(stored);
+  assert.equal(n.device, 'Ab');
+  assert.deepEqual(n.mtype, ['JoinRequest']);
+  assert.equal(n.status, 'Blocked');
+  assert.equal(n.gateway, 'GW');
+  assert.equal(n.showMalformed, true);
+  assert.equal(stored.timePreset, 'all', 'the stored object is not changed');
+});
+
+test('toHistoryFilter: a day is its two local midnights, whatever the time is now', () => {
+  withTimeZone('Europe/Madrid', () => {
+    const state = fstate({ timePreset: 'day', day: '2026-10-25', device: 'ab', showMalformed: true });
+    const f = H.toHistoryFilter(state, NOW);
+    assert.equal(iso(f.fromMs), '2026-10-24T22:00:00.000Z');
+    assert.equal(iso(f.untilMs), '2026-10-25T23:00:00.000Z');
+    assert.equal(f.device, 'ab');
+    assert.equal(f.hideMalformed, false);
+    // The bounds do not move with the clock, so a day loaded now and checked
+    // against later live records agree.
+    assert.deepEqual(H.toHistoryFilter(state, NOW + 7 * 24 * HOUR), f);
+    assert.deepEqual(H.toHistoryFilter(state, 0), f);
+  });
+});
+
+test('toHistoryFilter: a span has no end', () => {
+  for (const preset of Object.keys(PRESETS)) {
+    assert.equal(H.toHistoryFilter(fstate({ timePreset: preset, day: '2026-10-25' }), NOW).untilMs, null);
+  }
+});
+
+test('historyParams: from, before, device, mtype, status, gateway, malformed, in that order', () => {
+  const f = {
+    device: 'a+b c', mtypes: ['JoinRequest', 'ConfirmedDataUp'], status: 'Blocked', gateway: 'AA:BB',
+    fromMs: Date.parse('2026-10-24T22:00:00.000Z'), untilMs: Date.parse('2026-10-25T23:00:00.000Z'),
+    hideMalformed: true,
+  };
+  assert.equal(
+    H.historyParams(f),
+    'from=2026-10-24T22%3A00%3A00.000Z&before=2026-10-25T23%3A00%3A00.000Z' +
+    '&device=a%2Bb%20c&mtype=JoinRequest,ConfirmedDataUp&status=Blocked&gateway=AA%3ABB&malformed=exclude',
+  );
+  // It decodes back to the bounds, exactly.
+  const p = new URLSearchParams(H.historyParams(f));
+  assert.equal(p.get('from'), '2026-10-24T22:00:00.000Z');
+  assert.equal(p.get('before'), '2026-10-25T23:00:00.000Z');
+  assert.equal(Date.parse(p.get('before')), f.untilMs);
+  assert.equal(p.get('device'), 'a+b c');
+  assert.deepEqual([...p.keys()], ['from', 'before', 'device', 'mtype', 'status', 'gateway', 'malformed']);
+
+  // `before` alone, and with only the lower bound.
+  assert.equal(H.historyParams({ ...ANY, untilMs: f.untilMs }), 'before=2026-10-25T23%3A00%3A00.000Z');
+  assert.equal(H.historyParams({ ...ANY, fromMs: f.fromMs }), 'from=2026-10-24T22%3A00%3A00.000Z');
+  assert.equal(H.historyParams({ ...ANY, untilMs: f.untilMs, device: 'x' }), 'before=2026-10-25T23%3A00%3A00.000Z&device=x');
+  assert.equal(H.historyParams(ANY), '');
+
+  // The whole query keeps the filters in front of the paging parameters.
+  assert.equal(
+    H.loadQuery({ ...ANY, fromMs: f.fromMs, untilMs: f.untilMs }),
+    'from=2026-10-24T22%3A00%3A00.000Z&before=2026-10-25T23%3A00%3A00.000Z' +
+    '&newest=true&count=true&settle=true&limit=5000',
+  );
+});
+
+test('historyParams: a day under a time zone sends the two midnights as UTC instants', () => {
+  withTimeZone('Europe/Madrid', () => {
+    const f = H.toHistoryFilter(fstate({ timePreset: 'day', day: '2026-10-25', showMalformed: true }), NOW);
+    assert.equal(
+      H.historyParams(f),
+      'from=2026-10-24T22%3A00%3A00.000Z&before=2026-10-25T23%3A00%3A00.000Z',
+    );
+    // Whole milliseconds with a Z, as the server parses them.
+    for (const v of new URLSearchParams(H.historyParams(f)).values()) {
+      assert.match(v, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+    }
+  });
+});
+
+test('rangeWords: every preset, a day, and a range that cannot be used', () => {
+  assert.equal(H.rangeWords(fstate({ timePreset: '5m' })), 'the last 5 min');
+  assert.equal(H.rangeWords(fstate({ timePreset: '15m' })), 'the last 15 min');
+  assert.equal(H.rangeWords(fstate({ timePreset: '1h' })), 'the last hour');
+  assert.equal(H.rangeWords(fstate({ timePreset: '24h' })), 'the last 24 h');
+  assert.equal(H.rangeWords(fstate({ timePreset: 'day', day: '2026-11-01' })), 'on 2026-11-01');
+  assert.equal(H.rangeWords(fstate({ timePreset: 'day', day: '2026-10-25' })), 'on 2026-10-25');
+  // A span ignores a day left in the state.
+  assert.equal(H.rangeWords(fstate({ timePreset: '1h', day: '2026-11-01' })), 'the last hour');
+  // What cannot be used reads as the range that is loaded for it: the default span.
+  assert.equal(H.rangeWords(fstate({ timePreset: 'all' })), 'the last 5 min');
+  assert.equal(H.rangeWords(fstate({ timePreset: 'day', day: null })), 'the last 5 min');
+  assert.equal(H.rangeWords(fstate({ timePreset: 'day', day: '2026-02-30' })), 'the last 5 min');
+  assert.equal(H.rangeWords(fstate({ timePreset: 'toString' })), 'the last 5 min', 'not an inherited property');
+});
+
+test('matchesFilter: the end of a day is exclusive, the start inclusive, to the nanosecond', () => {
+  withTimeZone('Europe/Madrid', () => {
+    const f = H.toHistoryFilter(fstate({ timePreset: 'day', day: '2026-10-25' }), NOW);
+    assert.equal(iso(f.untilMs), '2026-10-25T23:00:00.000Z');
+    const inDay = ts => H.matchesFilter({ ...rec('x', 0), timestamp: ts }, f, {});
+
+    // The end.
+    assert.equal(inDay('2026-10-25T22:59:59.999Z'), true, '1 ms before the end');
+    assert.equal(inDay('2026-10-25T22:59:59.999999999Z'), true, 'a nanosecond before the end');
+    assert.equal(inDay('2026-10-25T23:00:00.000Z'), false, 'exactly at the end');
+    assert.equal(inDay('2026-10-25T23:00:00Z'), false, 'exactly at the end, no fraction');
+    assert.equal(inDay('2026-10-25T23:00:00.000000000Z'), false, 'exactly at the end, nine digits');
+    assert.equal(inDay('2026-10-25T23:00:00.000000001Z'), false, 'a nanosecond after the end');
+    assert.equal(inDay('2026-10-25T23:00:00.001Z'), false, '1 ms after the end');
+    // The start.
+    assert.equal(inDay('2026-10-24T21:59:59.999Z'), false, '1 ms before the start');
+    assert.equal(inDay('2026-10-24T21:59:59.999999999Z'), false, 'a nanosecond before the start');
+    assert.equal(inDay('2026-10-24T22:00:00.000Z'), true, 'exactly at the start');
+    assert.equal(inDay('2026-10-24T22:00:00.000000001Z'), true, 'a nanosecond after the start');
+    // The middle, and the neighbours.
+    assert.equal(inDay('2026-10-25T12:00:00.000Z'), true);
+    assert.equal(inDay('2026-10-25T00:30:00.000Z'), true, 'the repeated hour of the change is inside');
+    assert.equal(inDay('2026-10-24T12:00:00.000Z'), false);
+    assert.equal(inDay('2026-10-26T12:00:00.000Z'), false);
+    assert.equal(inDay('not a time'), false);
+  });
+});
+
+test('matchesFilter: a span has no end, so a record from the future still matches', () => {
+  const f = H.toHistoryFilter(fstate({ timePreset: '5m' }), NOW);
+  const future = { ...rec('x', 0), timestamp: iso(NOW + 365 * 24 * HOUR) };
+  assert.equal(H.matchesFilter(future, f, {}), true);
+});
+
+test('matchesFilter: the end bound combines with the other filters', () => {
+  const f = { ...ANY, untilMs: BASE + 10_000, status: 'Blocked' };
+  assert.equal(H.matchesFilter(rec('a', 9, { status: 'Blocked' }), f, {}), true);
+  assert.equal(H.matchesFilter(rec('b', 10, { status: 'Blocked' }), f, {}), false, 'at the end');
+  assert.equal(H.matchesFilter(rec('c', 9), f, {}), false, 'inside, wrong status');
+  // The malformed figure respects the window too.
+  const bad = ts => ({ ...rec('m', 0, { malformed: 'crc', dev_addr: null }), timestamp: ts });
+  assert.equal(H.countsAsMalformed(bad(at(9)), f, {}), false, 'status is still a filter');
+  const win = { ...ANY, untilMs: BASE + 10_000 };
+  assert.equal(H.countsAsMalformed(bad(at(9)), win, {}), true);
+  assert.equal(H.countsAsMalformed(bad(at(10)), win, {}), false, 'at the end');
 });
 
 // ===========================================================================
@@ -738,6 +1100,84 @@ test('presets: one nowMs gives both the request and the carry-over check', () =>
   assert.deepEqual(ids(merged.records), ['in']);
 });
 
+// The rows of a day, with live records. In the hook, a live record is checked
+// against `toHistoryFilter(filter, now)` before it is added, and a load carries
+// over only the live records that pass the same check.
+
+const MADRID_NOW = Date.parse('2026-10-30T14:00:00.000Z'); // a Friday afternoon in Madrid, after the change of the 25th
+
+/** A record stamped `timestamp`. */
+const recAt = (id, timestamp, o = {}) => ({ ...rec(id, 0, o), timestamp });
+
+test('days: a past day takes no live record', () => {
+  withTimeZone('Europe/Madrid', () => {
+    const h = new Hook({ filter: fstate({ timePreset: 'day', day: '2026-10-25' }), nowMs: MADRID_NOW });
+    h.dispatch(open);
+    const query = h.lastSend().load.query;
+    assert.ok(
+      query.startsWith('from=2026-10-24T22%3A00%3A00.000Z&before=2026-10-25T23%3A00%3A00.000Z&'),
+      query,
+    );
+    h.respond(1, { records: [recAt('stored', '2026-10-25T10:00:00.000Z')], total: 1 });
+    assert.deepEqual(ids(h.rows), ['stored']);
+
+    // Live traffic now, and a stamp just after the day's end.
+    h.onRecord(recAt('now', iso(MADRID_NOW)));
+    h.onRecord(recAt('next-day', '2026-10-25T23:00:00.001Z'));
+    assert.deepEqual(ids(h.rows), ['stored'], 'nothing was added');
+    assert.deepEqual(ids(h.shown()), ['stored']);
+    assert.equal(h.matching(), 1);
+  });
+});
+
+test('days: today takes live records up to its end, not past it', () => {
+  withTimeZone('Europe/Madrid', () => {
+    // 2026-10-30 is a 24-hour day in CET: it ends at 23:00 UTC.
+    const h = new Hook({ filter: fstate({ timePreset: 'day', day: '2026-10-30' }), nowMs: MADRID_NOW });
+    h.dispatch(open);
+    h.respond(1, { records: [recAt('stored', '2026-10-30T08:00:00.000Z')], total: 1 });
+
+    h.onRecord(recAt('now', iso(MADRID_NOW)));
+    h.onRecord(recAt('last', '2026-10-30T22:59:59.999Z'));
+    h.onRecord(recAt('midnight', '2026-10-30T23:00:00.000Z'));
+    h.onRecord(recAt('yesterday', '2026-10-29T22:59:59.999Z'));
+    assert.deepEqual(ids(h.rows), ['stored', 'now', 'last']);
+    assert.deepEqual(ids(h.shown()), ['stored', 'now', 'last']);
+    assert.equal(h.matching(), 3, 'one stored row and two live ones; nothing older');
+  });
+});
+
+test('days: a load carries over only the live records that are inside the day', () => {
+  withTimeZone('Europe/Madrid', () => {
+    const h = new Hook({ filter: fstate({ timePreset: 'day', day: '2026-10-30' }), nowMs: MADRID_NOW });
+    h.dispatch(open);
+    // Received after the load was sent, before it answers.
+    h.onRecord(recAt('in', iso(MADRID_NOW)));
+    h.onRecord(recAt('past', '2026-10-29T12:00:00.000Z'));
+    h.onRecord(recAt('end', '2026-10-30T23:00:00.000Z'));
+    h.respond(1, { records: [], total: 0 });
+    assert.deepEqual(ids(h.rows), ['in']);
+
+    // Going to another day replaces the rows and drops the live record held for today.
+    h.dispatch({ kind: 'filter', filter: fstate({ timePreset: 'day', day: '2026-10-29' }) });
+    h.respond(2, { records: [recAt('old', '2026-10-29T09:00:00.000Z')], total: 1 });
+    assert.deepEqual(ids(h.rows), ['old']);
+    assert.equal(h.lastSend().load.filter.untilMs, Date.parse('2026-10-29T23:00:00.000Z'));
+  });
+});
+
+test('days: the clock moving on does not move a day, so a record on its last millisecond stays', () => {
+  withTimeZone('Europe/Madrid', () => {
+    const filter = fstate({ timePreset: 'day', day: '2026-10-30' });
+    const early = new Hook({ filter, nowMs: Date.parse('2026-10-30T09:00:00.000Z') });
+    const late = new Hook({ filter, nowMs: Date.parse('2026-10-30T22:59:59.000Z') });
+    const record = recAt('r', '2026-10-30T22:59:59.999Z');
+    assert.equal(H.matchesFilter(record, early.currentFilter(), {}), true);
+    assert.equal(H.matchesFilter(record, late.currentFilter(), {}), true);
+    assert.deepEqual(early.currentFilter(), late.currentFilter());
+  });
+});
+
 // ===========================================================================
 // Counts against an oracle
 // ===========================================================================
@@ -940,7 +1380,7 @@ test('counts: a live record whose insert failed is carried and stays until the n
   assert.equal(h.matching(), 2, 'high by the unsaved row, never low');
   // Later answers that do not carry it again drop it. A load sent after the
   // row was received finds it in neither the result nor its own live records.
-  h.dispatch({ kind: 'filter', filter: fstate({ timePreset: 'all', gateway: '' }) });
+  h.dispatch({ kind: 'filter', filter: fstate() });
   h.respond(2, { records: [stored], total: 1, failures: '1' });
   assert.deepEqual(ids(h.rows), ['stored']);
   assert.equal(h.matching(), 1);
@@ -1145,6 +1585,29 @@ test('filterChangeEvent: only the device text is debounced', () => {
   }
   // The device text changing together with another filter loads at once.
   assert.equal(H.filterChangeEvent(base, { ...base, device: 'a', status: 'Blocked' }).kind, 'filter');
+});
+
+test('filterChangeEvent: a change of day loads at once', () => {
+  const a = fstate({ timePreset: 'day', day: '2026-10-24' });
+  const b = fstate({ timePreset: 'day', day: '2026-10-25' });
+  assert.equal(H.filterChangeEvent(a, { ...a }), null, 'the same day is no change');
+  assert.deepEqual(H.filterChangeEvent(a, b), { kind: 'filter', filter: b });
+  // From a span to a day and back: the preset changes too.
+  assert.equal(H.filterChangeEvent(fstate(), a).kind, 'filter');
+  assert.equal(H.filterChangeEvent(a, fstate()).kind, 'filter');
+  // The day alone is enough, whatever the preset says.
+  assert.equal(H.filterChangeEvent(fstate({ day: null }), fstate({ day: '2026-10-24' })).kind, 'filter');
+  // A day change together with typing is not debounced.
+  assert.equal(H.filterChangeEvent(a, { ...b, device: 'x' }).kind, 'filter');
+
+  const h = new Hook({ filter: a });
+  h.dispatch(open);
+  h.respond(1);
+  const actions = h.dispatch(H.filterChangeEvent(a, b));
+  assert.ok(kinds(actions).includes('send'), kinds(actions).join());
+  assert.ok(!kinds(actions).includes('startTimer:typing'));
+  assert.ok(h.lastSend().load.query.startsWith('from='), h.lastSend().load.query);
+  assert.ok(h.lastSend().load.query.includes('&before='), h.lastSend().load.query);
 });
 
 // ===========================================================================
