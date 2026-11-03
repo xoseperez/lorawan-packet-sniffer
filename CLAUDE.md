@@ -37,6 +37,11 @@ make build-all                          # both x86_64 and aarch64 musl
 make build-x86_64-unknown-linux-musl
 make build-aarch64-unknown-linux-musl
 
+# Release assets in dist/ (DIST_DIR): both archives, both Debian packages and SHA256SUMS
+make dist
+make deb                                # only the .deb files, from the archives already in DIST_DIR
+make deb-check                          # the maintainer scripts against debhelper 13.11.4's own output (Docker)
+
 # Docker
 make docker-build
 DOCKER_IMAGE=ghcr.io/yourname/lorawan-sniffer DOCKER_TAG=latest make docker-buildx
@@ -53,6 +58,9 @@ This is a Cargo workspace with a single crate:
   - **`src/cmd/`** — run loop and `configfile` subcommand.
   - **`src/config/`** — TOML configuration structs and loader.
 - **`webui/`** — React 19 + TypeScript SPA (Vite). Built output at `webui/dist/` is embedded into the Rust binary at compile time via `rust-embed`.
+- **`packaging/`** — what a release ships besides the binary: the systemd unit, `install.sh`, the sample `sniffer.toml`, `sniffer.env` and `concentratord.conf`; `package.sh` (the release archive) and `package-deb.sh` (a `.deb` built from that archive with `dpkg-deb`, wrapping its binary byte for byte). `packaging/deb/` holds the control files and the four maintainer scripts; their systemd parts come from debhelper 13.11.4's autoscript templates, vendored unchanged in `deb/autoscripts/` with `SHA256SUMS`, and `make deb-check` compares the assembled scripts with a real `dh` run. The package has two conffiles (`sniffer.toml`, `sniffer.env`), refuses a first install next to an `install.sh` install or a custom unit in `/etc/systemd/system` (`preinst`), and deletes the database on purge (`postrm`). Change anything in `packaging/deb/` or the assembly in `package-deb.sh`, then run `make deb-check`.
+
+Release builds are reproducible: every timestamp is the commit's time (`SOURCE_DATE_EPOCH`, exported by the `Makefile` and the release workflow, passed into the cross container by `Cross.toml`), including the WebUI files' timestamps that `rust-embed` stores in the binary. `.github/workflows/release.yml` runs on a `vX.Y.Z` tag: it checks the tag against `lorawan-sniffer/Cargo.toml`, takes the release notes from the CHANGELOG section, builds and packages both targets, and publishes the archives, the `.deb` files, `SHA256SUMS` and the multi-arch image.
 
 ## Architecture
 
@@ -71,7 +79,7 @@ Gateway ──UDP/ZMQ──▶  Sniffer proxy  ──UDP/ZMQ──▶  LNS / Gat
 
 ### Data flow
 
-1. A proxy backend (`proxy/udp.rs` or `proxy/concentratord.rs`) receives raw packets.
+1. A proxy backend (`proxy/udp/` or `proxy/concentratord.rs`) receives raw packets.
 2. Each packet is decoded by `core::decoder` into a `DecodedFrame` (MType, DevAddr/DevEUI, FCnt, FPort). The decoder also takes the gateway's CRC status and classifies the frame: CRC failed (`crc`), then reserved or Major MHDR bits (`mhdr`), then a length that does not fit the type (`length`). A malformed frame comes back with only its type, size and reason, so no fake identifier or header field exists downstream; the backends' record builders just copy the fields. Type rules see no type for a malformed frame (`filter::evaluate` gets `None`).
 3. `core::filter::evaluate()` checks compiled `FilterRule`s — first match wins; no match = forward.
 4. Results are assembled into a `MessageRecord` (the canonical cross-protocol representation defined in `core::metadata`).
@@ -83,7 +91,7 @@ Gateway ──UDP/ZMQ──▶  Sniffer proxy  ──UDP/ZMQ──▶  LNS / Gat
 
 ### Proxy backends
 
-- **UDP** (`proxy/udp.rs`): Implements the Semtech UDP Packet Forwarder protocol (PUSH_DATA, PULL_DATA, PULL_RESP, etc.). Runs entirely in async tokio tasks.
+- **UDP** (`proxy/udp/`): Implements the Semtech UDP Packet Forwarder protocol (PUSH_DATA, PULL_DATA, PULL_RESP, etc.). Runs entirely in async tokio tasks.
 - **Concentratord** (`proxy/concentratord.rs`): Implements ChirpStack Concentratord via ZeroMQ IPC + Protobuf. ZMQ calls are dispatched to `spawn_blocking` because the `zmq` crate is synchronous.
 
 ### Key types (`core/`)

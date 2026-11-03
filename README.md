@@ -52,7 +52,7 @@ The WebUI asks for nothing unless you turn on the [login](#webui-login) (`SNIFFE
 Each release has a Debian package for amd64 and one for arm64, for Debian 12 and Ubuntu 22.04 and 24.04. It holds the same static binary and the same systemd service as the [archive](#install-from-the-archive-other-linux-systems), and it works like any other service package: `apt` installs it, enables and starts the service, and later upgrades, removes and purges it. Pick the file that matches `dpkg --print-architecture`:
 
 ```bash
-VERSION=X.Y.Z                         # a release that has .deb files
+VERSION=2.2.0                         # 2.2.0 is the first release with .deb files
 ARCH=$(dpkg --print-architecture)     # amd64 or arm64
 BASE=https://github.com/xoseperez/lorawan-packet-sniffer/releases/download/v$VERSION
 curl -LO $BASE/lorawan-sniffer_$VERSION-1_$ARCH.deb
@@ -157,7 +157,7 @@ A host installed from the archive can move to the package and keep its configura
 4. **Install the package** over them:
 
    ```bash
-   VERSION=X.Y.Z                         # the package you downloaded
+   VERSION=2.2.0                         # the package you downloaded
    ARCH=$(dpkg --print-architecture)     # amd64 or arm64
    sudo apt install -o Dpkg::Options::=--force-confold ./lorawan-sniffer_$VERSION-1_$ARCH.deb
    ```
@@ -186,7 +186,7 @@ sudo systemctl enable --now lorawan-sniffer
 Each release has an archive for x86_64 and one for aarch64 (arm64) Linux, holding the static binary, a systemd service and an install script. This suits running the sniffer on the same machine as the LNS, and any Linux system with systemd; on Debian and Ubuntu the [package](#install-on-debian-or-ubuntu-deb) is the simpler way. Pick the archive that matches `uname -m` on the target:
 
 ```bash
-VERSION=2.1.0
+VERSION=2.2.0
 ARCH=$(uname -m)    # x86_64 or aarch64
 BASE=https://github.com/xoseperez/lorawan-packet-sniffer/releases/download/v$VERSION
 curl -LO $BASE/lorawan-sniffer-$VERSION-linux-$ARCH.tar.gz
@@ -301,7 +301,15 @@ In proxy mode the sniffer refuses to start if the upstream address is its own ga
 
 Multi-gateway routing follows the behavior of the Semtech reference packet forwarder (PUSH_DATA sent from one socket, PULL_DATA and TX_ACK from another); other packet forwarders have not been tested.
 
-<!-- Gateway models, firmware and LNS used in field validation go here. -->
+Field runs with real radio traffic:
+
+- **RAK7391** (Raspberry Pi Compute Module 4, RAK Connect OS 4.12.0, SX1302 concentrator, EU868), with ChirpStack Concentratord 4.7.1 and the ChirpStack UDP Forwarder 4.3.0:
+  - [Concentratord mode](#concentratord-mode-zmq-ipc) on the gateway, between Concentratord and the UDP Forwarder;
+  - UDP proxy mode on the gateway, between the UDP Forwarder and the network server;
+  - in both, every uplink and downlink matched what a second sniffer in front of the network server recorded.
+- **ChirpStack** on Debian 12, with this sniffer in front of it in UDP proxy mode for four gateways, installed from the [archive](#install-from-the-archive-other-linux-systems).
+
+The Debian package is tested on Debian 12 and Ubuntu 22.04 and 24.04 (amd64): install, upgrade, remove, purge and the move from `install.sh`.
 
 ## Building from Source
 

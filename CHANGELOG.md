@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-11-03
+
 ### Added
 
 - WebUI login: optional shared token (`[sniffer.api] login`, `token`), login page, signed session cookies, Bearer tokens for scripts, lockout after 10 wrong tokens a minute.
@@ -119,6 +121,7 @@ Complete rewrite of the Python v1 sniffer in Rust, as a MITM proxy for both dire
 - Static musl builds for x86_64 and aarch64.
 - Docker support.
 
-[Unreleased]: https://github.com/xoseperez/lorawan-packet-sniffer/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/xoseperez/lorawan-packet-sniffer/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/xoseperez/lorawan-packet-sniffer/releases/tag/v2.2.0
 [2.1.0]: https://github.com/xoseperez/lorawan-packet-sniffer/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/xoseperez/lorawan-packet-sniffer/releases/tag/v2.0.0

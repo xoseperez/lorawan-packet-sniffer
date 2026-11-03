@@ -211,7 +211,7 @@ use crate::core::{
 // ---------------------------------------------------------------------------
 
 /// Embed the contents of `../webui/dist/` into the binary at compile time.
-/// Build the webui first: `cd v2/webui && npm run build`
+/// Build the webui first: `cd webui && npm run build`
 #[derive(RustEmbed)]
 #[folder = "../webui/dist"]
 struct Frontend;

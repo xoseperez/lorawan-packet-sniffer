@@ -1,6 +1,6 @@
 [package]
   name = "lorawan-sniffer"
-  version = "2.1.0"
+  version = "2.2.0"
   authors = []
   edition = "2021"
   publish = false
