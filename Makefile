@@ -6,11 +6,20 @@ DOCKER_TAG   ?= latest
 
 DIST_DIR := dist
 
+# The commit's time, so that release builds are reproducible: the binary embeds
+# the WebUI's files with a timestamp, and the archives and packages record file
+# times. With this set they are all the commit's time. Set it yourself to
+# override it, for example when building from a tree without git history.
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct 2>/dev/null)
+ifneq ($(SOURCE_DATE_EPOCH),)
+export SOURCE_DATE_EPOCH
+endif
+
 .PHONY: build build-full run fmt clippy test \
 	webui-install webui-build webui-dev webui-test \
 	build-x86_64-unknown-linux-musl \
 	build-aarch64-unknown-linux-musl \
-	build-all dist \
+	build-all dist deb deb-check \
 	docker-build docker-build-release docker-buildx
 
 # ── WebUI ───────────────────────────────────────────────────────────────────
@@ -74,13 +83,46 @@ build-all: webui-build
 
 # ── Release archives ────────────────────────────────────────────────────────
 
-# Release archives for both targets plus SHA256SUMS in dist/, and the
-# binaries laid out for docker/Dockerfile.release.
+# Release archives and Debian packages for both targets plus SHA256SUMS in
+# dist/, and the binaries laid out for docker/Dockerfile.release.
 dist: build-all
 	rm -rf $(DIST_DIR)
 	packaging/package.sh x86_64-unknown-linux-musl $(DIST_DIR)
 	packaging/package.sh aarch64-unknown-linux-musl $(DIST_DIR)
-	cd $(DIST_DIR) && sha256sum *.tar.gz > SHA256SUMS
+	$(MAKE) deb
+	cd $(DIST_DIR) && sha256sum *.tar.gz *.deb > SHA256SUMS
+
+# ── Debian packages ─────────────────────────────────────────────────────────
+
+# A .deb for every release archive in dist/ (make dist runs this; run it on its
+# own to build the packages from archives that are already there). The .deb is
+# written next to its archive, and wraps the archive's binary unchanged.
+deb:
+	@set -e; found=no; \
+	for archive in $(DIST_DIR)/lorawan-sniffer-*-linux-*.tar.gz; do \
+		[ -f "$$archive" ] || continue; \
+		found=yes; \
+		packaging/package-deb.sh "$$archive" $(DIST_DIR); \
+	done; \
+	[ "$$found" = yes ] || { echo "no release archive in $(DIST_DIR); run make dist, or set DIST_DIR" >&2; exit 1; }
+
+# Check, against debhelper 13.11.4 itself, that the maintainer scripts
+# package-deb.sh assembles are the ones dh_installsystemd generates (see
+# packaging/deb/check-autoscripts.sh). Needs Docker and network access; run it
+# after any change in packaging/deb/ or in package-deb.sh. It checks the x86_64
+# archive in dist/ that sorts last by name, or the one in DEB_CHECK_ARCHIVE, a
+# path relative to the repository. The mounts are read-only; :z is for SELinux
+# hosts.
+DEB_CHECK_ARCHIVE ?= $(lastword $(sort $(wildcard $(DIST_DIR)/lorawan-sniffer-*-linux-x86_64.tar.gz)))
+DEB_CHECK_IMAGE   ?= debian:12
+
+deb-check:
+	@test -f "$(DEB_CHECK_ARCHIVE)" || { echo "no archive to check; run make dist, or set DEB_CHECK_ARCHIVE=path/to/lorawan-sniffer-VERSION-linux-x86_64.tar.gz" >&2; exit 1; }
+	docker run --rm --name lorawan-sniffer-deb-check-$$$$ \
+		-v "$(CURDIR)/packaging:/src/packaging:ro,z" \
+		-v "$(abspath $(dir $(DEB_CHECK_ARCHIVE))):/archive:ro,z" \
+		$(DEB_CHECK_IMAGE) \
+		sh /src/packaging/deb/check-autoscripts.sh "/archive/$(notdir $(DEB_CHECK_ARCHIVE))"
 
 # ── Docker ───────────────────────────────────────────────────────────────────
 

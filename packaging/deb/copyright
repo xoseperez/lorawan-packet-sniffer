@@ -1,0 +1,54 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: lorawan-sniffer
+Upstream-Contact: Xose Pérez <xose.perez@gmail.com>
+Source: https://github.com/xoseperez/lorawan-packet-sniffer
+
+Files: *
+Copyright: 2024-2026 Xose Pérez
+License: Expat
+Comment: The files of this project are under the MIT licence (called Expat
+ here, as in the copyright format). The program, usr/bin/lorawan-sniffer, is
+ one statically linked executable that also contains code by other authors,
+ under their own licences and not the one above: the Rust standard library and
+ the Rust crates listed in Cargo.lock in the source (mostly MIT and Apache-2.0,
+ some BSD, ISC, MPL-2.0 and similar permissive licences), SQLite (public
+ domain), ZeroMQ's libzmq (MPL-2.0; its source is at
+ https://github.com/zeromq/libzmq), the musl C library (MIT), and the npm
+ packages bundled into the web interface (React and others, mostly MIT).
+ Their sources and licence texts are available through the Cargo.lock and
+ package-lock.json files in the source repository.
+
+Files: packaging/deb/autoscripts/*
+Copyright: 1997-2011 Joey Hess <joeyh@debian.org>
+License: public-domain
+Comment: These are debhelper's templates for the systemd parts of the
+ maintainer scripts (version 13.11.4). The postinst, prerm and postrm of this
+ package contain them, filled in for lorawan-sniffer.service.
+
+License: Expat
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+
+License: public-domain
+ These files are in the public domain.
+ .
+ Pedants who believe I cannot legally say that code I have written is in
+ the public domain may consider them instead to be licensed as follows:
+ .
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted under any circumstances. No warranty.

@@ -1,0 +1,9 @@
+# Settings for cross (https://github.com/cross-rs/cross), which builds the
+# release binaries inside a container.
+#
+# The binary embeds the WebUI's files together with their timestamps. With
+# SOURCE_DATE_EPOCH set, those timestamps are that time instead of the moment
+# the WebUI was built, so two builds of the same commit give the same binary.
+# cross hands the container only the variables listed here.
+[build.env]
+passthrough = ["SOURCE_DATE_EPOCH"]

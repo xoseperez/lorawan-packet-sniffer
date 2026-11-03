@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stops the service when the package is removed, with the snippet that
+# debhelper's dh_installsystemd generates for a systemd unit. An upgrade does
+# not stop it here: postinst restarts it once the new files are in place.
+
+set -e
+
+#DEBHELPER#
+
+exit 0

@@ -1,13 +1,15 @@
 # Release pipeline.
 #
 # Pushing a tag vX.Y.Z (on a commit that is already on the default branch)
-# builds the static Linux binaries for x86_64 and aarch64, publishes them as a
-# GitHub Release with a SHA256SUMS file, and pushes a multi-arch image
-# (amd64 + arm64) to ghcr.io.
+# builds the static Linux binaries for x86_64 and aarch64, packages each one as
+# a .tar.gz archive and as a Debian package, publishes them as a GitHub Release
+# with a SHA256SUMS file, and pushes a multi-arch image (amd64 + arm64) to
+# ghcr.io.
 #
 # Run manually (Actions tab > Release > Run workflow) for a dry run: everything
 # is built and packaged, the image is built but not pushed, and the archives
-# are kept as a workflow artifact. Nothing is released or pushed.
+# and Debian packages are kept as a workflow artifact. Nothing is released or
+# pushed.
 
 name: Release
 
@@ -41,6 +43,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
+      debversion: ${{ steps.debversion.outputs.debversion }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -68,6 +71,27 @@ jobs:
             echo "version=$version"
             echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
+
+      # 2.1.0 becomes 2.1.0-1, and 2.2.0-rc.1 becomes 2.2.0~rc.1-1, which sorts
+      # before 2.2.0-1 (a plain hyphen would sort after it). dpkg is asked as
+      # well, so that a version it would reject stops the run here and not
+      # after both builds.
+      - name: Work out the Debian version
+        id: debversion
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          debversion=$(packaging/package-deb.sh --version "$VERSION") || {
+            echo "::error::Cannot work out a Debian version for $VERSION"
+            exit 1
+          }
+          if ! dpkg --validate-version "$debversion"; then
+            echo "::error::dpkg does not accept '$debversion' (from version $VERSION) as a version"
+            exit 1
+          fi
+          echo "Debian version $debversion"
+          echo "debversion=$debversion" >> "$GITHUB_OUTPUT"
 
       - name: Check the tag matches the version
         if: github.event_name == 'push'
@@ -200,9 +224,9 @@ jobs:
         with:
           persist-credentials: false
 
-      # The release flags (static linking, stripping) live in this file. If it
-      # is missing the build still succeeds, but produces a different binary
-      # from the one built locally.
+      # The static-linking flags live in this file. If it is missing the build
+      # still succeeds, but produces a different binary from the one built
+      # locally.
       - name: Check the build configuration is in the checkout
         run: |
           if [[ ! -f .cargo/config.toml ]]; then
@@ -239,19 +263,79 @@ jobs:
         if: steps.cross-cache.outputs.cache-hit != 'true'
         run: cargo install cross --git https://github.com/cross-rs/cross --rev "$CROSS_REV" --locked
 
+      # The binary embeds the WebUI's files with a timestamp. The commit's time
+      # in its place makes two builds of the same commit identical; Cross.toml
+      # passes the variable into the build container.
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
-        run: cross build --release --locked --target "$TARGET"
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          cross build --release --locked --target "$TARGET"
 
+      # The Debian package is made from the archive, not from the binary, so
+      # that the two can only ever hold the same file. The archive's name is
+      # checked first because the publish job looks for exactly that name: a
+      # package built from some other file would not be the one the release
+      # says it is.
       - name: Package
         env:
           TARGET: ${{ matrix.target }}
-        run: packaging/package.sh "$TARGET" dist
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          # x86_64 or aarch64, as the archive's name has it.
+          arch=${TARGET%%-*}
+          archive="dist/lorawan-sniffer-$VERSION-linux-$arch.tar.gz"
+          packaging/package.sh "$TARGET" dist
+          if [[ ! -f $archive ]]; then
+            echo "::error::package.sh did not write $archive"
+            exit 1
+          fi
+          packaging/package-deb.sh "$archive" dist
+
+      # Reads the fields back from the finished file. Trusting the build is
+      # not enough here: a package of the wrong architecture or version would
+      # install nowhere, or look like a different release, and nothing else
+      # before the publish job would notice.
+      - name: Check the Debian package
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.check.outputs.version }}
+          DEBVERSION: ${{ needs.check.outputs.debversion }}
+        run: |
+          set -euo pipefail
+          case $TARGET in
+            x86_64-unknown-linux-musl) debarch=amd64 ;;
+            aarch64-unknown-linux-musl) debarch=arm64 ;;
+            *)
+              echo "::error::No Debian architecture for $TARGET"
+              exit 1
+              ;;
+          esac
+          deb="dist/lorawan-sniffer_$VERSION-1_$debarch.deb"
+          if [[ ! -f $deb ]]; then
+            echo "::error::Missing $deb"
+            exit 1
+          fi
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          version=$(dpkg-deb --field "$deb" Version)
+          architecture=$(dpkg-deb --field "$deb" Architecture)
+          if [[ $version != "$DEBVERSION" ]]; then
+            echo "::error::$deb has Version '$version', expected '$DEBVERSION'"
+            exit 1
+          fi
+          if [[ $architecture != "$debarch" ]]; then
+            echo "::error::$deb has Architecture '$architecture', expected '$debarch'"
+            exit 1
+          fi
 
       # File permissions are lost in an artifact. That is harmless: the
-      # archive keeps its own, and docker/Dockerfile.release sets the mode of
-      # the binary it copies.
+      # archive and the package keep their own, and docker/Dockerfile.release
+      # sets the mode of the binary it copies.
       - name: Keep the packages for the publish job
         uses: actions/upload-artifact@v7
         with:
@@ -270,6 +354,7 @@ jobs:
       packages: write
     env:
       VERSION: ${{ needs.check.outputs.version }}
+      DEBVERSION: ${{ needs.check.outputs.debversion }}
       PRERELEASE: ${{ needs.check.outputs.prerelease }}
     steps:
       # For docker/Dockerfile.release and the files it copies.
@@ -302,7 +387,34 @@ jobs:
               exit 1
             fi
           done
-          sha256sum -- *.tar.gz > SHA256SUMS
+          # Exactly one package per architecture, named for the release
+          # version (GitHub rewrites "~" in asset names, so the file name
+          # cannot carry the Debian version). The name is only a name: the
+          # fields inside are what apt and dpkg go by, so they are read too.
+          shopt -s nullglob
+          debs=(*.deb)
+          if [[ ${#debs[@]} -ne 2 ]]; then
+            echo "::error::Expected 2 Debian packages in the build artifacts, found ${#debs[@]}: ${debs[*]:-none}"
+            exit 1
+          fi
+          for debarch in amd64 arm64; do
+            deb="lorawan-sniffer_$VERSION-1_$debarch.deb"
+            if [[ ! -f $deb ]]; then
+              echo "::error::Missing $deb in the build artifacts"
+              exit 1
+            fi
+            version=$(dpkg-deb --field "$deb" Version)
+            architecture=$(dpkg-deb --field "$deb" Architecture)
+            if [[ $version != "$DEBVERSION" ]]; then
+              echo "::error::$deb has Version '$version', expected '$DEBVERSION'"
+              exit 1
+            fi
+            if [[ $architecture != "$debarch" ]]; then
+              echo "::error::$deb has Architecture '$architecture', expected '$debarch'"
+              exit 1
+            fi
+          done
+          sha256sum -- *.tar.gz *.deb > SHA256SUMS
           cat SHA256SUMS
 
       # The image only copies the binaries built above, so there is nothing
@@ -355,7 +467,7 @@ jobs:
           # --verify-tag: without it, a tag that has disappeared from the
           # remote would be recreated by gh from the default branch head, and
           # the release would point at a commit nobody tagged.
-          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.deb dist/SHA256SUMS \
             --title "v$VERSION" \
             --notes-file "$RUNNER_TEMP/release-notes.md" \
             --verify-tag \
@@ -368,6 +480,7 @@ jobs:
           name: release-files
           path: |
             dist/*.tar.gz
+            dist/*.deb
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 7

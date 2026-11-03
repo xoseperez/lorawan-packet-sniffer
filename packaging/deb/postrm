@@ -1,0 +1,28 @@
+#!/bin/sh
+# Reloads systemd after a removal and clears the enablement state on purge,
+# with the snippets that debhelper's dh_installsystemd generates for a systemd
+# unit; then, on purge only, deletes the database.
+#
+# dpkg removes only the files it installed, so the database the service
+# created would survive a purge. Purge is the command that means "forget this
+# package entirely", so it deletes it. A plain removal keeps it.
+#
+# With DynamicUser, systemd keeps the data in /var/lib/private/lorawan-sniffer
+# and makes /var/lib/lorawan-sniffer a symlink to it; with a drop-in that turns
+# DynamicUser off (Concentratord mode), /var/lib/lorawan-sniffer is an ordinary
+# directory. Both paths are named because either can be the real one; rm -rf
+# deletes a symlink itself and does not follow it.
+#
+# The generated part runs first, so a failed deletion cannot skip the systemd
+# cleanup. The failure still fails the purge, because of set -e, and dpkg
+# reports it.
+
+set -e
+
+#DEBHELPER#
+
+if [ "$1" = purge ]; then
+    rm -rf /var/lib/private/lorawan-sniffer /var/lib/lorawan-sniffer
+fi
+
+exit 0

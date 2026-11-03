@@ -1,0 +1,18 @@
+Package: lorawan-sniffer
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: Xose Pérez <xose.perez@gmail.com>
+Installed-Size: @INSTALLED_SIZE@
+Section: net
+Priority: optional
+Homepage: @HOMEPAGE@
+Description: transparent proxy that captures LoRaWAN gateway traffic
+ Sits between LoRaWAN gateways and a network server, decoding every uplink
+ and downlink in real time, and can block selected messages. It speaks the
+ Semtech UDP packet forwarder protocol and ChirpStack Concentratord, stores
+ what it sees in a SQLite database and serves a web interface and an HTTP
+ API from the same program.
+ .
+ The program is one static binary with no dependencies on other packages. It
+ runs as a sandboxed systemd service and is configured in
+ /etc/lorawan-sniffer/sniffer.toml.

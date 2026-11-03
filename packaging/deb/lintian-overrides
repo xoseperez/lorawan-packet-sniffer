@@ -1,0 +1,9 @@
+# The program is one static binary on purpose: SQLite and ZeroMQ are compiled
+# in, so the same file runs on every Debian and Ubuntu release and needs no
+# library from the host. Lintian says so on arm64.
+lorawan-sniffer [arm64]: statically-linked-binary [usr/bin/lorawan-sniffer]
+
+# On amd64 the static binary is a position-independent executable, which has
+# the same ELF type as a shared library, so lintian takes it for a library that
+# forgot to list what it needs. It is an executable and needs nothing.
+lorawan-sniffer [amd64]: shared-library-lacks-prerequisites [usr/bin/lorawan-sniffer]

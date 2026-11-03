@@ -1,0 +1,54 @@
+#!/bin/sh
+# Refuse to install next to a copy of the sniffer that install.sh put on this
+# machine, or next to a unit file somebody wrote by hand.
+#
+# install.sh puts the program in /usr/local/bin and its unit in
+# /etc/systemd/system. A unit in /etc/systemd/system takes precedence over the
+# one this package installs in /lib/systemd/system, so the service would keep
+# running the old program under the old unit while the packaged files sat
+# unused beside it. It is safer to stop before anything is unpacked and say
+# what to do.
+#
+# A unit that is a symlink to /dev/null is a mask: it is how an administrator
+# keeps a service from starting. Installing over one is allowed, and nothing
+# is started.
+#
+# Only "install" is checked, which is what dpkg passes for a first install and
+# for an install over a package that was removed but not purged. An upgrade is
+# left alone.
+#
+# The checks only look. They write nothing, and they read where a symlink
+# points without opening what it points at.
+
+set -e
+
+if [ "$1" = install ]; then
+    bin=/usr/local/bin/lorawan-sniffer
+    unit=/etc/systemd/system/lorawan-sniffer.service
+    found=
+
+    if [ -e "$bin" ] || [ -L "$bin" ]; then
+        found=$bin
+    fi
+    if [ -e "$unit" ] || [ -L "$unit" ]; then
+        if [ "$(readlink "$unit" 2>/dev/null || true)" != /dev/null ]; then
+            found=${found:+$found and }$unit
+        fi
+    fi
+
+    if [ -n "$found" ]; then
+        cat >&2 <<MESSAGE
+lorawan-sniffer: found $found, from an install.sh install or a custom unit.
+For an install.sh install, run "sudo ./install.sh --uninstall" from its release
+folder first (it keeps /etc/lorawan-sniffer and the database).
+For a custom unit, move it aside or turn it into a drop-in in
+/etc/systemd/system/lorawan-sniffer.service.d/, then "systemctl daemon-reload".
+Then install this package again.
+MESSAGE
+        exit 1
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

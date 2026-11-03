@@ -1,0 +1,9 @@
+#!/bin/sh
+# Enables and starts the service, and restarts it after an upgrade, with the
+# snippets that debhelper's dh_installsystemd generates for a systemd unit.
+
+set -e
+
+#DEBHELPER#
+
+exit 0

@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Malformed-frame detection (`crc`, `mhdr`, `length`), with a `malformed` field on every record and a "Show malformed" option in the WebUI.
 - Device labels: Label column and dialog, label API (`/api/labels`) and live label feed (`/ws/labels`).
 - `allowed_hosts` setting against DNS rebinding.
+- Debian packages (`.deb`) for amd64 and arm64 in every release.
+- `LICENSE` file (MIT).
 - Release archives for x86_64 and aarch64 Linux (`make dist`), with `SHA256SUMS`.
 - systemd service and `install.sh` (install, upgrade, `--uninstall`).
 - Release Docker image built from the release binaries.
@@ -60,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SIGTERM stops the sniffer cleanly.
 - Records waiting to be written are saved at shutdown.
 - `make docker-buildx` builds a working arm64 image.
+- Release binaries are stripped.
 
 ## [2.1.0] - 2026-10-31
 

@@ -47,9 +47,143 @@ Point your LoRaWAN gateway at `<host>:1700` instead of the LNS directly. Set `GA
 
 The WebUI asks for nothing unless you turn on the [login](#webui-login) (`SNIFFER_API_LOGIN` and `SNIFFER_API_TOKEN`).
 
-## Install as a service (bare metal)
+## Install on Debian or Ubuntu (.deb)
 
-Each release has an archive for x86_64 and one for aarch64 (arm64) Linux, holding the static binary, a systemd service and an install script. This suits running the sniffer on the same machine as the LNS. Pick the archive that matches `uname -m` on the target:
+Each release has a Debian package for amd64 and one for arm64, for Debian 12 and Ubuntu 22.04 and 24.04. It holds the same static binary and the same systemd service as the [archive](#install-from-the-archive-other-linux-systems), and it works like any other service package: `apt` installs it, enables and starts the service, and later upgrades, removes and purges it. Pick the file that matches `dpkg --print-architecture`:
+
+```bash
+VERSION=X.Y.Z                         # a release that has .deb files
+ARCH=$(dpkg --print-architecture)     # amd64 or arm64
+BASE=https://github.com/xoseperez/lorawan-packet-sniffer/releases/download/v$VERSION
+curl -LO $BASE/lorawan-sniffer_$VERSION-1_$ARCH.deb
+curl -LO $BASE/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+
+sudo apt install ./lorawan-sniffer_$VERSION-1_$ARCH.deb
+```
+
+The `./` makes `apt` read the file instead of looking for a package of that name. `make dist` builds the same packages locally, in `dist/`.
+
+The package puts these files in place:
+
+| Path | Contents |
+|---|---|
+| `/usr/bin/lorawan-sniffer` | the program |
+| `/lib/systemd/system/lorawan-sniffer.service` | the service, with the same sandbox as the archive's |
+| `/etc/lorawan-sniffer/sniffer.toml` | configuration, mode `0644`; the login is off and there is no token |
+| `/etc/lorawan-sniffer/sniffer.env` | secrets, mode `0600`, readable by root only |
+| `/usr/share/doc/lorawan-sniffer/` | README, changelog, copyright and `examples/concentratord.conf` |
+| `/var/lib/lorawan-sniffer/` | the database, created by the service |
+
+Unlike `install.sh`, the package also enables and starts the service, with the configuration it ships, and restarts it after an upgrade. That configuration is the one described under [Next to the LNS on the same machine](#next-to-the-lns-on-the-same-machine), so the sniffer is listening on UDP port 1702 and forwarding to `127.0.0.1:1700` as soon as the install ends. [Secrets](#secrets) and [About the service](#about-the-service) apply as they are, except that the Concentratord override is `/usr/share/doc/lorawan-sniffer/examples/concentratord.conf` (minimal images that leave out `/usr/share/doc`, such as Docker's Ubuntu images, do not have it; take `concentratord.conf` from the release archive instead). The WebUI is at `http://<host>:8888` and, until you [turn the login on](#turning-the-login-on), asks for nothing: on a machine reachable from untrusted networks, do that or set `bind = "127.0.0.1:8888"` before you point a gateway at it.
+
+A service that fails to start, for example on an invalid configuration, does not fail the install, so look at `systemctl status lorawan-sniffer` and `journalctl -u lorawan-sniffer -f` when it ends.
+
+Chrootless installs (`dpkg --force-script-chrootless`) are not supported.
+
+### Configuration files and upgrades
+
+To upgrade, install the new package the same way (`sudo apt install ./lorawan-sniffer_…deb`); the service is restarted after the files are unpacked. The two files in `/etc/lorawan-sniffer` are ordinary dpkg configuration files:
+
+- A file you did not edit follows the new package.
+- A file you edited is kept.
+- When you edited a file and the new package ships a different version of it, dpkg asks what to do. If you keep yours, the package's version is written next to it as `sniffer.toml.dpkg-dist` (or `sniffer.env.dpkg-dist`) to compare and copy from.
+
+`dpkg -V lorawan-sniffer` lists the files you changed. Where nobody can answer dpkg's question (a script, a provisioning tool), tell it what to do. This keeps your edits and follows the package for the files you did not touch:
+
+```bash
+sudo apt install -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold ./lorawan-sniffer_$VERSION-1_$ARCH.deb
+```
+
+An upgrade run without a terminal and without these options stops at dpkg's question and leaves the package half-installed, with the old service still running. Run the command above with `-y` added to finish it.
+
+### Remove and purge
+
+```bash
+sudo apt remove lorawan-sniffer    # stops the service and removes the program
+sudo apt purge lorawan-sniffer     # the same, and deletes the configuration and the database
+```
+
+`remove` keeps the two configuration files and the database, so installing the package again picks up where it stopped. **`purge` deletes the database:** the records, the [device labels](#device-labels) and, with the login on, the session secret (every browser has to log in again). It also deletes the two configuration files, together with the copies dpkg and editors leave next to them (`*.dpkg-dist`, `*.dpkg-old`, `*.dpkg-new`, `*~`, `*.bak`), and `/etc/lorawan-sniffer` when nothing else is in it. Other files you put there stay, and so does a drop-in in `/etc/systemd/system/lorawan-sniffer.service.d/`. Back up what you want to keep before you purge.
+
+### Turning the login on
+
+The package generates no token. To turn the [login](#webui-login) on, make one, put it in `sniffer.toml` and restart:
+
+```bash
+openssl rand -hex 16        # or: lorawan-sniffer configfile | grep '^ *token'
+sudoedit /etc/lorawan-sniffer/sniffer.toml    # in [sniffer.api]: login = true and token = "<the token>"
+sudo systemctl restart lorawan-sniffer
+```
+
+Your edit makes `sniffer.toml` a file dpkg keeps on upgrades (see above). Every local user can read `sniffer.toml`; to keep the token out of it, see [Who can read the token](#who-can-read-the-token).
+
+### If install.sh or a custom unit is already there
+
+The package refuses to install over an [archive install](#install-from-the-archive-other-linux-systems), because a unit in `/etc/systemd/system` would override the packaged one and the `install.sh` program would keep running. It stops when `/usr/local/bin/lorawan-sniffer` exists, or when `/etc/systemd/system/lorawan-sniffer.service` exists and is not a mask (a link to `/dev/null`). Nothing is unpacked or changed, and a running service is left alone:
+
+```text
+lorawan-sniffer: found /usr/local/bin/lorawan-sniffer, from an install.sh install or a custom unit.
+For an install.sh install, run "sudo ./install.sh --uninstall" from its release
+folder first (it keeps /etc/lorawan-sniffer and the database).
+For a custom unit, move it aside or turn it into a drop-in in
+/etc/systemd/system/lorawan-sniffer.service.d/, then "systemctl daemon-reload".
+Then install this package again.
+```
+
+The message names every path it found. Only a first install is checked, not an upgrade. A mask is allowed, so you can keep the service from starting: run `sudo systemctl mask lorawan-sniffer` before the install. The install then says the unit is masked (`Failed to preset unit … is masked`, which is expected) and leaves the service disabled; when you want it to run, `sudo systemctl unmask lorawan-sniffer && sudo systemctl enable --now lorawan-sniffer`.
+
+### Moving from install.sh
+
+A host installed from the archive can move to the package and keep its configuration, its database (the labels with it) and its drop-ins. Download and check the `.deb` first, since forwarding stops during the move.
+
+1. **Back up** the configuration and the database (this needs the `sqlite3` tool, `sudo apt install sqlite3`; its `.backup` is safe while the service runs):
+
+   ```bash
+   sudo cp -a /etc/lorawan-sniffer /root/lorawan-sniffer-etc.bak
+   sudo sqlite3 /var/lib/lorawan-sniffer/sniffer.db ".backup /root/sniffer.db.bak"
+   ```
+
+2. **Save edits to the unit.** The next step deletes `/etc/systemd/system/lorawan-sniffer.service`, and the package installs the archive's unit under `/lib/systemd/system`, so changes made to that file would be lost. If you made any, put them in a drop-in, which stays and keeps applying (`sudo systemctl edit lorawan-sniffer` makes one in `/etc/systemd/system/lorawan-sniffer.service.d/`). The Concentratord override already is one.
+
+3. **Uninstall** from the release folder you installed from:
+
+   ```bash
+   sudo ./install.sh --uninstall
+   ```
+
+   It stops and disables the service and deletes the program and the unit. It keeps `/etc/lorawan-sniffer`, the database and the drop-ins.
+
+4. **Install the package** over them:
+
+   ```bash
+   VERSION=X.Y.Z                         # the package you downloaded
+   ARCH=$(dpkg --print-architecture)     # amd64 or arm64
+   sudo apt install -o Dpkg::Options::=--force-confold ./lorawan-sniffer_$VERSION-1_$ARCH.deb
+   ```
+
+Your configuration files now exist but belong to no package, so dpkg would ask what to do with each, and fails when there is no terminal to answer. `--force-confold` answers "keep mine": the existing `sniffer.toml` and `sniffer.env` stay as they are, with their own modes, and the package's versions land next to them as `sniffer.toml.dpkg-dist` and `sniffer.env.dpkg-dist`, with the same modes as your files. (The modes in the table above apply to a fresh install; `install.sh` creates the same ones.) Compare them with `diff` for options you may want. From then on the two files are ordinary [configuration files](#configuration-files-and-upgrades).
+
+Forwarding stops at step 3 and resumes when the package starts the service at the end of step 4, so run the two commands one after the other. The service finds its database where it was, because the packaged unit has the same state directory, and the drop-ins apply to it. `systemctl status lorawan-sniffer` should now show the unit loaded from `/lib/systemd/system/` (`/usr/lib/systemd/system/` where `/lib` is a link to it, as on Ubuntu 24.04) and the program `/usr/bin/lorawan-sniffer`.
+
+#### Rolling back
+
+To go back to the archive install, in this order:
+
+```bash
+sudo apt remove lorawan-sniffer
+sudo rm /etc/systemd/system/multi-user.target.wants/lorawan-sniffer.service
+sudo ./install.sh                                  # from the old release folder
+sudo systemctl enable --now lorawan-sniffer
+```
+
+`apt remove` leaves the link that enabled the package's service, and `systemctl enable` can succeed and leave it pointing at the removed unit in `/lib` (seen on Debian 12 and Ubuntu 24.04); deleting it first makes `enable` link the unit `install.sh` put in `/etc/systemd/system`. The configuration and the database are still there, so the old install picks them up as before. A mask that an administrator put on the unit also survives `apt remove`; `install.sh` replaces it with its own unit.
+
+**Never purge** on the way back: it deletes the configuration and the database. If the older release cannot open a database that the newer one migrated, restore the backup from step 1.
+
+## Install from the archive (other Linux systems)
+
+Each release has an archive for x86_64 and one for aarch64 (arm64) Linux, holding the static binary, a systemd service and an install script. This suits running the sniffer on the same machine as the LNS, and any Linux system with systemd; on Debian and Ubuntu the [package](#install-on-debian-or-ubuntu-deb) is the simpler way. Pick the archive that matches `uname -m` on the target:
 
 ```bash
 VERSION=2.1.0
@@ -202,11 +336,23 @@ Output: `target/<triple>/release/lorawan-sniffer`
 Binaries are statically linked against musl libc. ZeroMQ and SQLite are compiled from source and embedded; the binary has no runtime dependencies.
 
 ```bash
-# Release archives for both targets, plus SHA256SUMS, in dist/
+# Release archives and Debian packages for both targets, plus SHA256SUMS, in dist/
 make dist
 ```
 
-`make dist` builds the WebUI and both binaries, then packs each binary with the systemd service, the install script and the configuration templates from `packaging/` (see [Install as a service](#install-as-a-service-bare-metal)). The archives are reproducible: building the same commit twice gives identical files.
+`make dist` builds the WebUI and both binaries, then packs each binary with the systemd service, the install script and the configuration templates from `packaging/` (see [Install from the archive](#install-from-the-archive-other-linux-systems)), and builds a Debian package from each archive (see [Install on Debian or Ubuntu](#install-on-debian-or-ubuntu-deb)). The archives are reproducible: building the same commit twice gives identical files, and so are the packages when the same `dpkg-deb` builds them. Every timestamp they hold, including those of the WebUI files inside the binary, is the commit's time (`SOURCE_DATE_EPOCH`, which the Makefile takes from git; set it yourself when building from a tree without git history).
+
+The packages have their own targets:
+
+```bash
+# Both Debian packages, from the archives already in dist/ (needs dpkg-deb)
+make deb
+
+# Compare the systemd parts of the packages' maintainer scripts with debhelper's own output (needs Docker)
+make deb-check
+```
+
+`make deb` rebuilds nothing else: it takes the archives in `DIST_DIR` (`dist/` by default) and writes `lorawan-sniffer_<version>-1_amd64.deb` and `lorawan-sniffer_<version>-1_arm64.deb` next to them. The systemd parts of the scripts that run at install, upgrade, remove and purge are meant to be what debhelper's `dh_installsystemd` generates, and `make deb-check` checks that: in a `debian:12` container it installs debhelper 13.11.4, builds a scratch package with the real `dh`, and fails on any difference from the scripts `make deb` assembles. Run it after changing anything in `packaging/deb/`.
 
 ## Docker
 
@@ -233,10 +379,12 @@ Releases are built by GitHub Actions (`.github/workflows/release.yml`) when a ve
 
 The workflow refuses to release if the tag is not exactly `v` plus the version in `Cargo.toml`, if the tagged commit is not on `master`, if `CHANGELOG.md` has no section for the version, or if the tests fail. It then publishes:
 
-- a GitHub Release `vX.Y.Z` whose notes are the changelog section, with `lorawan-sniffer-X.Y.Z-linux-x86_64.tar.gz`, `lorawan-sniffer-X.Y.Z-linux-aarch64.tar.gz` and `SHA256SUMS`;
+- a GitHub Release `vX.Y.Z` whose notes are the changelog section, with `lorawan-sniffer-X.Y.Z-linux-x86_64.tar.gz`, `lorawan-sniffer-X.Y.Z-linux-aarch64.tar.gz`, the Debian packages `lorawan-sniffer_X.Y.Z-1_amd64.deb` and `lorawan-sniffer_X.Y.Z-1_arm64.deb`, and `SHA256SUMS`, which lists the four files;
 - the multi-arch (amd64 + arm64) image `ghcr.io/xoseperez/lorawan-packet-sniffer` tagged `X.Y.Z`, `X.Y` and `latest`.
 
-A version with a suffix (`2.2.0-rc.1`) is published as a pre-release and only gets its full-version image tag. To test the pipeline without releasing anything, run the workflow by hand (Actions > Release > Run workflow): it builds and packages everything, builds the image without pushing it, and keeps the archives as the `release-files` artifact of the run.
+A version with a suffix (`2.2.0-rc.1`) is published as a pre-release and only gets its full-version image tag. To test the pipeline without releasing anything, run the workflow by hand (Actions > Release > Run workflow): it builds and packages everything, builds the image without pushing it, and keeps the archives and the Debian packages as the `release-files` artifact of the run.
+
+The package version is the release version plus `-1`: `2.1.0` becomes `2.1.0-1`. For a pre-release the suffix is written with a tilde so that it sorts before the final release: `2.2.0-rc.1` becomes `2.2.0~rc.1-1`, which is older than `2.2.0-1`. The file name keeps the release version (`lorawan-sniffer_2.2.0-rc.1-1_amd64.deb`), because GitHub rewrites `~` in asset names; dpkg reads the version from inside the package, not from the name.
 
 ## Docker Environment Variables
 
@@ -722,7 +870,7 @@ lorawan-sniffer configfile | grep '^ *token'
 - **An `install.sh` upgrade:** your `sniffer.toml` is kept and never edited. The template `sniffer.toml.new` next to it carries a freshly generated token (a new one on every run) that you can copy into `[sniffer.api]` together with `login = true`.
 - **`lorawan-sniffer configfile`** prints the template with a freshly generated token, for manual and Docker set-ups. Two runs print two tokens.
 - **Docker:** you generate it and set `SNIFFER_API_TOKEN`.
-- **The Debian package (not released yet).** It will install `/etc/lorawan-sniffer/sniffer.toml` and `sniffer.env` as ordinary conffiles with the login off and `token = ""`, and it will generate no token. To turn the login on, edit the conffile: set `login = true` and a token from one of the commands above, or put `SNIFFER_API_TOKEN=…` in `sniffer.env` and write `token = "$SNIFFER_API_TOKEN"` in `sniffer.toml`. As for any edited conffile, dpkg keeps your version on upgrades and asks what to do when the package's own version changed too (or follows `--force-confold` / `--force-confnew`). `apt remove` keeps the database, so the sessions; a purge deletes it, and every browser has to log in again.
+- **The Debian package.** It installs `/etc/lorawan-sniffer/sniffer.toml` and `sniffer.env` as ordinary conffiles with the login off and `token = ""`, and it generates no token. To turn the login on, edit the conffile: set `login = true` and a token from one of the commands above, or put `SNIFFER_API_TOKEN=…` in `sniffer.env` and write `token = "$SNIFFER_API_TOKEN"` in `sniffer.toml`. As for any edited conffile, dpkg keeps your version on upgrades and asks what to do when the package's own version changed too (or follows `--force-confold` / `--force-confnew`). `apt remove` keeps the database, so the sessions; a purge deletes it, and every browser has to log in again. See [Install on Debian or Ubuntu](#install-on-debian-or-ubuntu-deb).
 
 After the install the token is yours: the sniffer reads it and never writes it.
 
@@ -781,7 +929,7 @@ If the session ends while the WebUI is open (the token was changed, the database
 - **The cookie** is called `lorawan_sniffer_session`, with `HttpOnly`, `SameSite=Strict` and `Path=/`, and no expiry date, so it ends when the browser closes. A browser set to restore its previous session may keep it longer; that is the browser's choice. It is not `Secure` (see [Plain HTTP and reverse proxies](#plain-http-and-reverse-proxies)).
 - **The sniffer keeps nothing per session.** The cookie carries the time it was made and a random value, signed with a key made from two things: the token and a random 32-byte secret stored in the database. So memory does not grow with logins, and there is no server-side limit on a session's age: it ends when the browser closes, the token changes or the database is replaced.
 - **They survive a restart** of the sniffer, as long as the database is kept.
-- **A new token logs every browser out** (at the restart that reads it), and so does **a new database**: deleting or replacing it. `install.sh --uninstall` keeps the database, and with it the sessions.
+- **A new token logs every browser out** (at the restart that reads it), and so does **a new database**: deleting or replacing it. `install.sh --uninstall` and `apt remove` keep the database, and with it the sessions; `apt purge` deletes it.
 - **The secret** is in the `session_secret` table of the database, never in the configuration or the log. It is made once, at the first start with the login on, and only read at every later start, so a sniffer with the login off never writes it. If it cannot be made, the sniffer does not start and says why: no random bytes, a database that cannot be written (read-only, or full) at the first start, or another process holding the database's write lock for more than 5 seconds. A stored secret that is damaged (only editing the database by hand does that) also stops it, with the instruction to delete its row, which logs every browser out. The first start of this version adds the empty table, schema version 4, whether or not the login is on.
 - **Without the secret, a cookie cannot be forged, and a guessed token is not enough to build one,** so trying tokens by building cookies gets nowhere.
 
@@ -1163,4 +1311,4 @@ Two helper scripts live in `tools/`:
 
 ## License
 
-MIT
+MIT; the text is in the [`LICENSE`](LICENSE) file, which every release archive carries too.
