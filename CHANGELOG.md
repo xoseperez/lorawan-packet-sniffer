@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Docker image published on Docker Hub as `xoseperez/lorawan-packet-sniffer` instead of GHCR; its `latest` tag, which pointed to version 1, now points to version 2.
+
 ## [2.2.0] - 2026-11-03
 
 ### Added

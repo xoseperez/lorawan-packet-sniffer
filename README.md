@@ -372,7 +372,7 @@ make docker-build
 make docker-build-release
 
 # Build and push the multi-arch release image (amd64 + arm64) to a registry
-DOCKER_IMAGE=ghcr.io/yourname/lorawan-sniffer DOCKER_TAG=latest make docker-buildx
+DOCKER_IMAGE=yourname/lorawan-sniffer DOCKER_TAG=latest make docker-buildx
 ```
 
 The release image (`docker/Dockerfile.release`) contains the same binaries as the release archives. It compiles nothing, so building the arm64 image on an x86_64 machine needs no emulation. `docker stop` stops the sniffer cleanly within a second or so.
@@ -388,7 +388,9 @@ Releases are built by GitHub Actions (`.github/workflows/release.yml`) when a ve
 The workflow refuses to release if the tag is not exactly `v` plus the version in `Cargo.toml`, if the tagged commit is not on `master`, if `CHANGELOG.md` has no section for the version, or if the tests fail. It then publishes:
 
 - a GitHub Release `vX.Y.Z` whose notes are the changelog section, with `lorawan-sniffer-X.Y.Z-linux-x86_64.tar.gz`, `lorawan-sniffer-X.Y.Z-linux-aarch64.tar.gz`, the Debian packages `lorawan-sniffer_X.Y.Z-1_amd64.deb` and `lorawan-sniffer_X.Y.Z-1_arm64.deb`, and `SHA256SUMS`, which lists the four files;
-- the multi-arch (amd64 + arm64) image `ghcr.io/xoseperez/lorawan-packet-sniffer` tagged `X.Y.Z`, `X.Y` and `latest`.
+- the multi-arch (amd64 + arm64) image `xoseperez/lorawan-packet-sniffer` on Docker Hub, tagged `X.Y.Z`, `X.Y` and `latest`.
+
+Pushing the image needs two repository secrets (Settings > Secrets and variables > Actions): `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`, a Docker Hub personal access token with Read & Write permission.
 
 A version with a suffix (`2.2.0-rc.1`) is published as a pre-release and only gets its full-version image tag. To test the pipeline without releasing anything, run the workflow by hand (Actions > Release > Run workflow): it builds and packages everything, builds the image without pushing it, and keeps the archives and the Debian packages as the `release-files` artifact of the run.
 

@@ -44,7 +44,7 @@ make deb-check                          # the maintainer scripts against debhelp
 
 # Docker
 make docker-build
-DOCKER_IMAGE=ghcr.io/yourname/lorawan-sniffer DOCKER_TAG=latest make docker-buildx
+DOCKER_IMAGE=yourname/lorawan-sniffer DOCKER_TAG=latest make docker-buildx
 ```
 
 ## Workspace Structure

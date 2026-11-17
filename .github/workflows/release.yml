@@ -4,7 +4,8 @@
 # builds the static Linux binaries for x86_64 and aarch64, packages each one as
 # a .tar.gz archive and as a Debian package, publishes them as a GitHub Release
 # with a SHA256SUMS file, and pushes a multi-arch image (amd64 + arm64) to
-# ghcr.io.
+# Docker Hub. The push needs two repository secrets: DOCKERHUB_USERNAME and
+# DOCKERHUB_TOKEN (a Docker Hub access token with Read & Write permission).
 #
 # Run manually (Actions tab > Release > Run workflow) for a dry run: everything
 # is built and packaged, the image is built but not pushed, and the archives
@@ -351,7 +352,6 @@ jobs:
     # The only job that can write anything outside the run.
     permissions:
       contents: write
-      packages: write
     env:
       VERSION: ${{ needs.check.outputs.version }}
       DEBVERSION: ${{ needs.check.outputs.debversion }}
@@ -421,19 +421,21 @@ jobs:
       # to run for the other architecture and no need for QEMU.
       - uses: docker/setup-buildx-action@v4
 
-      - name: Log in to ghcr.io
+      # Before the image is pushed and before the release exists: missing or
+      # wrong credentials stop the run with nothing published, and re-running
+      # the failed job after fixing the secrets finishes the release.
+      - name: Log in to Docker Hub
         if: github.event_name == 'push'
         uses: docker/login-action@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Image tags and labels
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: docker.io/xoseperez/lorawan-packet-sniffer
           # "latest" is added explicitly below, only for final releases.
           flavor: latest=false
           # The version comes from Cargo.toml (already checked against the tag)
